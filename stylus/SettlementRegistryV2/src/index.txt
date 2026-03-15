@@ -1,0 +1,338 @@
+/**
+ * settlement-client.ts
+ *
+ * Full two-phase settlement flow for Fangorn Network.
+ *
+ * Phase 1 — register(): pay + add identity commitment to resource group
+ * Phase 2 — settle():   prove membership + trigger hook (NFT mint, timelock, etc.)
+ *
+ * Dependencies:
+ *   @semaphore-protocol/identity    identity creation
+ *   @semaphore-protocol/group       group fetching / membership management
+ *   @semaphore-protocol/proof       ZK proof generation
+ *   viem                            contract interaction
+ *   @erc5564/core (or stealth-address-sdk)  stealth address derivation
+ */
+
+import { Identity } from "@semaphore-protocol/identity";
+import { Group } from "@semaphore-protocol/group";
+import { generateProof, SemaphoreProof } from "@semaphore-protocol/proof";
+import { createWalletClient, createPublicClient, http, encodePacked, keccak256, encodeAbiParameters, parseAbiParameters } from "viem";
+import { arbitrum } from "viem/chains";
+import { privateKeyToAccount } from "viem/accounts";
+
+// ─── Contract Addresses ───────────────────────────────────────────────────────
+
+const SETTLEMENT_REGISTRY = "0x..." as `0x${string}`; // your deployed contract
+const SEMAPHORE_ADDRESS    = "0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D" as `0x${string}`;
+const USDC_ADDRESS         = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831" as `0x${string}`; // Arbitrum USDC
+
+// ─── ABIs (abbreviated) ───────────────────────────────────────────────────────
+
+const REGISTRY_ABI = [
+  {
+    name: "createResource",
+    type: "function",
+    inputs: [{ name: "resourceId", type: "bytes32" }],
+    outputs: [{ name: "groupId", type: "uint256" }],
+    stateMutability: "nonpayable",
+  },
+  {
+    name: "register",
+    type: "function",
+    inputs: [
+      { name: "resourceId",         type: "bytes32" },
+      { name: "identityCommitment", type: "uint256" },
+      { name: "from",               type: "address" },
+      { name: "to",                 type: "address" },
+      { name: "amount",             type: "uint256" },
+      { name: "validAfter",         type: "uint256" },
+      { name: "validBefore",        type: "uint256" },
+      { name: "nonce",              type: "bytes32" },
+      { name: "v",                  type: "uint8"   },
+      { name: "r",                  type: "bytes32" },
+      { name: "s",                  type: "bytes32" },
+    ],
+    outputs: [],
+    stateMutability: "payable",
+  },
+  {
+    name: "settle",
+    type: "function",
+    inputs: [
+      { name: "resourceId",    type: "bytes32"    },
+      { name: "nullifierHash", type: "uint256"    },
+      { name: "message",       type: "uint256"    },
+      { name: "merkleRoot",    type: "uint256"    },
+      { name: "proof",         type: "uint256[8]" },
+      { name: "hookData",      type: "bytes"      },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    name: "getGroupId",
+    type: "function",
+    inputs: [{ name: "resourceId", type: "bytes32" }],
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+  },
+  {
+    name: "isSettled",
+    type: "function",
+    inputs: [{ name: "nullifierHash", type: "uint256" }],
+    outputs: [{ name: "", type: "bool" }],
+    stateMutability: "view",
+  },
+] as const;
+
+// ─── Identity Management ──────────────────────────────────────────────────────
+
+/**
+ * Create or restore a Semaphore identity.
+ *
+ * The identity secret NEVER leaves the client. Store the exported string
+ * encrypted (e.g. in localStorage, encrypted with the user's wallet signature).
+ *
+ * identity.commitment — safe to share publicly; goes on-chain
+ * identity.export()   — secret; must stay client-side
+ */
+export function createIdentity(): Identity {
+  return new Identity();
+}
+
+export function restoreIdentity(exported: string): Identity {
+  return new Identity(exported);
+}
+
+// ─── Phase 1: Pay & Register ──────────────────────────────────────────────────
+
+export interface RegisterParams {
+  resourceId:          `0x${string}`;  // keccak256(owner ++ schemaId ++ tag)
+  identity:            Identity;
+  burnerPrivateKey:    `0x${string}`;  // burner wallet that holds USDC
+  paymentRecipient:    `0x${string}`;  // where USDC goes (schema owner treasury)
+  amount:              bigint;
+  relayerPrivateKey?:  `0x${string}`;  // if using a relayer to submit
+}
+
+export async function register(params: RegisterParams): Promise<`0x${string}`> {
+  const {
+    resourceId,
+    identity,
+    burnerPrivateKey,
+    paymentRecipient,
+    amount,
+  } = params;
+
+  const burner = privateKeyToAccount(burnerPrivateKey);
+  const publicClient = createPublicClient({ chain: arbitrum, transport: http() });
+
+  // 1. Build ERC-3009 transferWithAuthorization signature
+  //    The burner signs off-chain — they never need to send a transaction.
+  const validAfter  = 0n;
+  const validBefore = BigInt(Math.floor(Date.now() / 1000) + 3600); // 1hr window
+  const nonce       = `0x${crypto.randomUUID().replace(/-/g, "")}` as `0x${string}`;
+
+  // EIP-712 domain for USDC on Arbitrum (check USDC contract for exact values)
+  const usdcDomain = {
+    name:              "USD Coin",
+    version:           "2",
+    chainId:           42161, // Arbitrum
+    verifyingContract: USDC_ADDRESS,
+  };
+
+  const transferWithAuthType = {
+    TransferWithAuthorization: [
+      { name: "from",        type: "address" },
+      { name: "to",          type: "address" },
+      { name: "value",       type: "uint256" },
+      { name: "validAfter",  type: "uint256" },
+      { name: "validBefore", type: "uint256" },
+      { name: "nonce",       type: "bytes32" },
+    ],
+  };
+
+  const burnerWallet = createWalletClient({
+    account: burner,
+    chain: arbitrum,
+    transport: http(),
+  });
+
+  const sig = await burnerWallet.signTypedData({
+    domain: usdcDomain,
+    types:  transferWithAuthType,
+    primaryType: "TransferWithAuthorization",
+    message: {
+      from:        burner.address,
+      to:          paymentRecipient,
+      value:       amount,
+      validAfter,
+      validBefore,
+      nonce,
+    },
+  });
+
+  // Split signature into v, r, s
+  const r = sig.slice(0, 66)  as `0x${string}`;
+  const s = `0x${sig.slice(66, 130)}` as `0x${string}`;
+  const v = parseInt(sig.slice(130, 132), 16);
+
+  // 2. Submit register() — can be sent by burner, relayer, or user's main wallet.
+  //    The tx sender doesn't matter; only `from` (in the ERC-3009 sig) and
+  //    `identityCommitment` are meaningful for privacy.
+  const submitter = createWalletClient({
+    account: privateKeyToAccount(params.relayerPrivateKey ?? burnerPrivateKey),
+    chain: arbitrum,
+    transport: http(),
+  });
+
+  const txHash = await submitter.writeContract({
+    address: SETTLEMENT_REGISTRY,
+    abi:     REGISTRY_ABI,
+    functionName: "register",
+    args: [
+      resourceId,
+      identity.commitment,
+      burner.address,
+      paymentRecipient,
+      amount,
+      validAfter,
+      validBefore,
+      nonce,
+      v,
+      r,
+      s,
+    ],
+  });
+
+  console.log(`[register] tx: ${txHash}`);
+  return txHash;
+}
+
+// ─── Phase 2: Prove & Settle ──────────────────────────────────────────────────
+
+export interface SettleParams {
+  resourceId:     `0x${string}`;
+  identity:       Identity;
+  stealthAddress: `0x${string}`;  // EIP-5564 stealth address to receive NFT/access
+  hookData?:      `0x${string}`;  // extra data for hook (defaults to encoded stealthAddress)
+  callerKey:      `0x${string}`;  // any wallet — not linked to identity
+}
+
+export async function settle(params: SettleParams): Promise<`0x${string}`> {
+  const { resourceId, identity, stealthAddress, callerKey } = params;
+
+  const publicClient = createPublicClient({ chain: arbitrum, transport: http() });
+
+  // 1. Get the group_id for this resource
+  const groupId = await publicClient.readContract({
+    address: SETTLEMENT_REGISTRY,
+    abi:     REGISTRY_ABI,
+    functionName: "getGroupId",
+    args: [resourceId],
+  });
+
+  // 2. Reconstruct the Semaphore group from on-chain MemberRegistered events.
+  //    In production, fetch from the Semaphore subgraph for efficiency.
+  const group = await fetchGroup(groupId);
+
+  // 3. Encode the signal: stealth address as uint256
+  //    The hook interprets this as the NFT recipient.
+  const message = BigInt(stealthAddress);
+
+  // 4. Generate ZK proof
+  //    scope = groupId (scopes the proof to this resource — cannot be replayed elsewhere)
+  const proof: SemaphoreProof = await generateProof(
+    identity,
+    group,
+    message,
+    groupId,  // scope = external nullifier
+  );
+
+  // 5. Build hookData
+  const hookData = params.hookData ?? encodeAbiParameters(
+    parseAbiParameters("address, string"),
+    [stealthAddress, `ipfs://...`], // metadata URI for the NFT
+  );
+
+  // 6. Submit settle() — can be any wallet
+  const caller = createWalletClient({
+    account: privateKeyToAccount(callerKey),
+    chain: arbitrum,
+    transport: http(),
+  });
+
+  const txHash = await caller.writeContract({
+    address: SETTLEMENT_REGISTRY,
+    abi:     REGISTRY_ABI,
+    functionName: "settle",
+    args: [
+      resourceId,
+      proof.nullifier,
+      proof.message,
+      proof.merkleTreeRoot,
+      proof.proof as [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint],
+      hookData,
+    ],
+  });
+
+  console.log(`[settle] tx: ${txHash}`);
+  return txHash;
+}
+
+// ─── Group Fetching ───────────────────────────────────────────────────────────
+
+/**
+ * Fetch the Semaphore group for a given group_id.
+ *
+ * In production: use the Semaphore subgraph (faster, no RPC spam)
+ * https://thegraph.com/hosted-service/subgraph/semaphore-protocol/arbitrum
+ *
+ * Here we reconstruct from MemberRegistered events (simple, works for small groups).
+ */
+async function fetchGroup(groupId: bigint): Promise<Group> {
+  const publicClient = createPublicClient({ chain: arbitrum, transport: http() });
+
+  const logs = await publicClient.getLogs({
+    address: SETTLEMENT_REGISTRY,
+    event: {
+      name: "MemberRegistered",
+      type: "event",
+      inputs: [
+        { name: "resourceId",         type: "bytes32", indexed: true },
+        { name: "groupId",            type: "uint256", indexed: true },
+        { name: "identityCommitment", type: "uint256", indexed: false },
+      ],
+    },
+    args: { groupId },
+    fromBlock: 0n,
+  });
+
+  const group = new Group();
+  for (const log of logs) {
+    group.addMember(log.args.identityCommitment!);
+  }
+  return group;
+}
+
+// ─── Convenience: Derive Resource ID ─────────────────────────────────────────
+
+/**
+ * Compute resource_id = keccak256(ownerAddress ++ schemaId ++ tag)
+ * Matches the Rust hash_concat() logic in the contract.
+ */
+export function deriveResourceId(
+  ownerAddress: `0x${string}`,
+  schemaId:     `0x${string}`,
+  tag:          string,
+): `0x${string}` {
+  const tagBytes = new TextEncoder().encode(tag);
+  const tagHex = Buffer.from(tagBytes).toString("hex");
+  return keccak256(
+    encodePacked(
+      ["address", "bytes32", "bytes"],
+      [ownerAddress, schemaId, `0x${tagHex}`],
+    )
+  );
+}
