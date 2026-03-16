@@ -1,4 +1,4 @@
-# data registry contract
+# Stylus Contracts
 
 ## Build
 
@@ -29,7 +29,7 @@ Install Nitro (blockchain)
 ```sh
 git clone -b release --recurse-submodules https://github.com/OffchainLabs/nitro-testnode.git
 cd nitro-testnode
-# initialize (first run)
+# initialize (first run) - requires docker
 ./test-node.bash --init
 # on subsequent startups, run without init
 ./test-node.bash

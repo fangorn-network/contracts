@@ -1,3 +1,5 @@
 **/target
 cache/
 out/
+nitro-testnode/
+**/node_modules

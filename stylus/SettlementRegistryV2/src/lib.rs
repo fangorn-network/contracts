@@ -116,7 +116,7 @@ impl SettlementRegistry {
     #[constructor]
     pub fn init(
         &mut self,
-        usdc_address:      Address,
+        usdc_address:      Address, // 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d
         semaphore_address: Address, // 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D
         verifier_address:  Address, // 0x4DeC9E3784EcC1eE002001BfE91deEf4A48931f8
     ) {
