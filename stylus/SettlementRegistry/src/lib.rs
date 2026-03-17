@@ -352,9 +352,11 @@ impl SettlementRegistry {
         let depth = decode_u256(&depth_ret)
             .ok_or(SettlementError::VerificationFailed(VerificationFailed {}))?;
 
-        // verifyProof(...) — static call, reverts on invalid proof (no bool return).
-        // scope = group_id: binds this proof to exactly this resource.
-        // A valid proof for resource A cannot be replayed against resource B.
+        // LeanIMT returns depth 0 for a single-member tree, but the Groth16
+        // verifier circuit requires a minimum depth of 1. Clamp here so the
+        // on-chain verifier and client-side proof generation always agree.
+        let depth = if depth == U256::ZERO { U256::from(1u64) } else { depth };
+
         let verify_calldata = calldata_verify_proof(
             depth, merkle_root, nullifier_hash, message, group_id, &proof,
         );

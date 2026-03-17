@@ -7,7 +7,9 @@
 pragma solidity ^0.8.23;
 
 interface ISettlementRegistry {
-    function createResource(bytes32 resource_id) external returns (uint256);
+    function createResource(bytes32 resource_id, uint256 price) external returns (uint256);
+
+    function updatePrice(bytes32 resource_id, uint256 price) external;
 
     function registerHook(bytes32 resource_id, address hook) external;
 
@@ -28,6 +30,8 @@ interface ISettlementRegistry {
     error AlreadyRegistered();
 
     error AlreadySettled();
+
+    error IncorrectPaymentAmount();
 
     error TransferFailed();
 
