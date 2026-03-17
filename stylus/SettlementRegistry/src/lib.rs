@@ -53,7 +53,8 @@ sol! {
     );
 
     event HookRegistered(bytes32 indexed resourceId, address hook);
-    event ResourceCreated(bytes32 indexed resourceId, uint256 groupId, address owner);
+    event ResourceCreated(bytes32 indexed resourceId, uint256 groupId, address owner, uint256 price);
+    event PriceUpdated(bytes32 indexed resourceId, address owner, uint256 price);
 
     // identity already registered for this resource
     error AlreadyRegistered();   
@@ -165,11 +166,38 @@ impl SettlementRegistry {
 
         self.vm().log(ResourceCreated {
             resourceId: resource_id,
-            groupId:    group_id,
-            owner:      caller,
+            groupId: group_id,
+            owner: caller,
+            price: price
         });
 
         Ok(group_id)
+    }
+
+    /// Update the registered price for accessing the resource
+    pub fn update_price(
+         &mut self,
+        resource_id: FixedBytes<32>,
+        price: U256,
+    ) -> Result<(), SettlementError> {
+        let owner = self.resource_owners.get(resource_id);
+        if owner == Address::ZERO {
+            return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
+        }
+        if self.vm().msg_sender() != owner {
+            return Err(SettlementError::NotResourceOwner(NotResourceOwner {}));
+        }
+
+        // update price
+        self.resource_price.setter(resource_id).set(price);
+
+        self.vm().log(PriceUpdated {
+            resourceId: resource_id,
+            owner: owner,
+            price: price
+        });
+
+        Ok(())
     }
 
     /// Register or replace the settlement hook for a resource.
