@@ -45,8 +45,7 @@ sol! {
         uint256 identityCommitment
     );
 
-    // Phase 2 completion. nullifier_hash is the sole on-chain record — no wallet,
-    // no payment address, no identity linkage is exposed.
+    // Phase 2 completion. nullifier_hash is the sole on-chain record
     event SettlementFinalized(
         bytes32 indexed resourceId,
         uint256 indexed nullifierHash,
@@ -56,20 +55,31 @@ sol! {
     event HookRegistered(bytes32 indexed resourceId, address hook);
     event ResourceCreated(bytes32 indexed resourceId, uint256 groupId, address owner);
 
-    error AlreadyRegistered();   // identity already registered for this resource
-    error AlreadySettled();      // this nullifier has already been used
-    error TransferFailed();      // ERC-3009 call reverted
-    error VerificationFailed();  // ZK proof rejected by Semaphore verifier
-    error NotResourceOwner();    // caller != resource owner
-    error ResourceNotFound();    // resource_id has no associated group
-    error HookFailed();          // afterSettle() reverted
-    error GroupCreationFailed(); // Semaphore createGroup() failed
+    // identity already registered for this resource
+    error AlreadyRegistered();   
+    // this nullifier has already been used
+    error AlreadySettled();
+    // The payment amount is incorrect
+    error IncorrectPaymentAmount();
+    // ERC-3009 call reverted
+    error TransferFailed();      
+    // ZK proof rejected by Semaphore verifier
+    error VerificationFailed(); 
+    // caller != resource owner 
+    error NotResourceOwner();
+    // resource_id has no associated group   
+    error ResourceNotFound();
+    // afterSettle() reverted
+    error HookFailed();          
+    // Semaphore createGroup() failed
+    error GroupCreationFailed(); 
 }
 
 #[derive(SolidityError)]
 pub enum SettlementError {
     AlreadyRegistered(AlreadyRegistered),
     AlreadySettled(AlreadySettled),
+    IncorrectPaymentAmount(IncorrectPaymentAmount),
     TransferFailed(TransferFailed),
     VerificationFailed(VerificationFailed),
     NotResourceOwner(NotResourceOwner),
@@ -77,8 +87,6 @@ pub enum SettlementError {
     HookFailed(HookFailed),
     GroupCreationFailed(GroupCreationFailed),
 }
-
-// ─── Storage ──────────────────────────────────────────────────────────────────
 
 #[storage]
 #[entrypoint]
@@ -90,6 +98,9 @@ pub struct SettlementRegistry {
 
     // resource_id => Semaphore group_id (0 = resource not created)
     resource_groups: StorageMap<FixedBytes<32>, StorageU256>,
+
+    // resource_id => price (in USDC)
+    resource_price: StorageMap<FixedBytes<32>, StorageU256>,
 
     // resource_id => owner (only owner can set hooks)
     resource_owners: StorageMap<FixedBytes<32>, StorageAddress>,
@@ -106,26 +117,20 @@ pub struct SettlementRegistry {
     registrations: StorageMap<FixedBytes<32>, StorageBool>,
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
-
 #[public]
 impl SettlementRegistry {
-
-    // ── Init ──────────────────────────────────────────────────────────────────
 
     #[constructor]
     pub fn init(
         &mut self,
-        usdc_address:      Address, // 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d
-        semaphore_address: Address, // 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D
-        verifier_address:  Address, // 0x4DeC9E3784EcC1eE002001BfE91deEf4A48931f8
+        usdc_address:      Address, // arb sep 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d
+        semaphore_address: Address, // arb sep 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D
+        verifier_address:  Address, // arb sep 0x4DeC9E3784EcC1eE002001BfE91deEf4A48931f8
     ) {
         self.usdc_address.set(usdc_address);
         self.semaphore_address.set(semaphore_address);
         self.verifier_address.set(verifier_address);
     }
-
-    // ── Resource & Hook Management ────────────────────────────────────────────
 
     /// Create a new resource and its Semaphore group.
     /// Caller becomes the resource owner.
@@ -135,12 +140,13 @@ impl SettlementRegistry {
     pub fn create_resource(
         &mut self,
         resource_id: FixedBytes<32>,
+        price: U256,
     ) -> Result<U256, SettlementError> {
         if self.resource_groups.get(resource_id) != U256::ZERO {
             return Err(SettlementError::AlreadyRegistered(AlreadyRegistered {}));
         }
 
-        // createGroup() — no args, returns uint256 group_id.
+        // createGroup() (no args) returns uint256 group_id.
         // This contract becomes the Semaphore group admin, so only this contract
         // can call addMember() for this group going forward.
         let ret = unsafe {
@@ -155,6 +161,7 @@ impl SettlementRegistry {
         self.resource_groups.setter(resource_id).set(group_id);
         let caller = self.vm().msg_sender();
         self.resource_owners.setter(resource_id).set(caller);
+        self.resource_price.setter(resource_id).set(price);
 
         self.vm().log(ResourceCreated {
             resourceId: resource_id,
@@ -186,8 +193,6 @@ impl SettlementRegistry {
         Ok(())
     }
 
-    // ── Phase 1: Pay & Register ───────────────────────────────────────────────
-
     /// Pay for access and register a Semaphore identity in the resource's group.
     ///
     /// Privacy model:
@@ -217,6 +222,7 @@ impl SettlementRegistry {
         r: FixedBytes<32>,
         s: FixedBytes<32>,
     ) -> Result<(), SettlementError> {
+        // check if the group exists
         let group_id = self.resource_groups.get(resource_id);
         if group_id == U256::ZERO {
             return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
@@ -229,6 +235,12 @@ impl SettlementRegistry {
         );
         if self.registrations.get(reg_key) {
             return Err(SettlementError::AlreadyRegistered(AlreadyRegistered {}));
+        }
+
+        // Ensure payment amount is exact
+        let expected_price = self.resource_price.get(resource_id);
+        if amount != expected_price {
+            return Err(SettlementError::IncorrectPaymentAmount(IncorrectPaymentAmount {}));
         }
 
         // transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32)
@@ -261,8 +273,6 @@ impl SettlementRegistry {
 
         Ok(())
     }
-
-    // ── Phase 2: Prove & Settle ───────────────────────────────────────────────
 
     /// Claim access by presenting a valid Semaphore ZK proof.
     ///

@@ -31,30 +31,25 @@ import {
   type SettleParams,
 } from "./utils";
 
-// ─── Config ───────────────────────────────────────────────────────────────────
-
+// Config
 const RPC_URL = "https://sepolia-rollup.arbitrum.io/rpc";
 const CHAIN   = arbitrumSepolia;
-
-// Replace with real funded private keys (these are dummy values)
 const OWNER_KEY  = (process.env.OWNER_KEY  ?? "0xde0e6c1c331fcd8692463d6ffcf20f9f2e1847264f7a3f578cf54f62f05196cb") as `0x${string}`;
 const BURNER_KEY = (process.env.BURNER_KEY ?? "0xde0e6c1c331fcd8692463d6ffcf20f9f2e1847264f7a3f578cf54f62f05196cb") as `0x${string}`;
 const CALLER_KEY = (process.env.CALLER_KEY ?? OWNER_KEY) as `0x${string}`;
-
 // Stealth address: in production derive this via EIP-5564 from the user's spend key.
 // For the demo it's just any address that will receive the soulbound NFT (or timelock entry).
 const STEALTH_ADDRESS = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" as `0x${string}`;
-
 // setup payment params (smallest USDC amt > 0 we can send)
 const USDC_ADDRESS = "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d" as `0x${string}`;
 const AMOUNT       = 1n;
 
 // Derive a deterministic resource_id
 //
-// In Fangorn this is keccak256(ownerAddress ++ schemaId ++ tag).
+// In Fangorn this is keccak256(ownerAddress || schemaId || tag).
 // Using a fixed schemaId and tag here so the resource_id is stable across runs
 // (re-running the demo with the same OWNER_KEY will hit AlreadyRegistered on
-// createResource — that's fine, just comment it out after the first run).
+// createResource).
 
 import { privateKeyToAccount } from "viem/accounts";
 
@@ -62,9 +57,6 @@ const ownerAddress = privateKeyToAccount(OWNER_KEY).address;
 const SCHEMA_ID    = "0x0000000000000000000000000000000000000000000000000000000000000001" as `0x${string}`;
 const TAG          = "demo-track-001";
 const RESOURCE_ID  = deriveResourceId(ownerAddress, SCHEMA_ID, TAG);
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
-
 const publicClient = createPublicClient({ chain: CHAIN, transport: http(RPC_URL) });
 
 async function main() {

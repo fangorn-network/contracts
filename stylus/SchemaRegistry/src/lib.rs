@@ -136,6 +136,7 @@ pub fn schema_id_from_name(name: String) -> FixedBytes<32> {
     use alloy_sol_types::SolValue;
     keccak256(name.abi_encode())
 }
+
 #[cfg(test)]
 mod test {
     use super::*;
