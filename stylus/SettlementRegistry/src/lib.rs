@@ -12,17 +12,39 @@
 // │                                                                         │
 // │  Phase 2 — settle()                                                     │
 // │    User presents a Groth16 ZK proof of group membership.               │
-// │    Nullifier recorded (prevents double-claim).                          │
+// │    Semaphore.validateProof() handles verification + nullifier.          │
 // │    Registered hook fires with the proof's signal (e.g. stealth addr).  │
 // └─────────────────────────────────────────────────────────────────────────┘
 //
 // Semaphore V4 — same addresses on Arbitrum mainnet + Arbitrum Sepolia:
-//   SemaphoreVerifier : 0x4DeC9E3784EcC1eE002001BfE91deEf4A48931f8
-//   Semaphore         : 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D
+//   Semaphore : 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D
 //
-// External calls use RawCall + manual ABI encoding throughout (no sol_interface!).
-// This matches the pattern established in DataSourceRegistry and avoids the
-// Call::new(self) + self.vm() dual-arg issue in Stylus SDK 0.6.x.
+// Verified from @semaphore-protocol/contracts@4.14.2:
+//
+//   createGroup() → uint256
+//     No args. msg.sender becomes admin. groupCounter starts at 0.
+//
+//   addMember(uint256 groupId, uint256 identityCommitment)
+//     Only callable by group admin (this contract).
+//     Called in register() for real members.
+//     Called in add_seed_member() once after create_resource().
+//
+//   validateProof(uint256 groupId, SemaphoreProof proof)
+//     Reverts on: invalid proof, expired root, double-spend nullifier.
+//     SemaphoreProof struct field order (verified from ISemaphore.sol):
+//       uint256 merkleTreeDepth
+//       uint256 merkleTreeRoot
+//       uint256 nullifier
+//       uint256 message
+//       uint256 scope        ← must equal groupId
+//       uint256[8] points
+//
+// NOTE ON SEED MEMBER:
+//   LeanIMT depth 0 (1 member) cannot generate a valid Groth16 proof.
+//   A seed member must be added after create_resource() so depth >= 1.
+//   add_seed_member() is called once by the resource owner after creation.
+//   Seed commitment = keccak256(resource_id) — deterministic, unspendable.
+//   The seed is emitted as MemberRegistered so fetchGroup picks it up.
 
 #![cfg_attr(not(any(test, feature = "export-abi")), no_main)]
 extern crate alloc;
@@ -35,17 +57,13 @@ use stylus_sdk::{
     storage::*,
 };
 
-// ─── Events & Errors ──────────────────────────────────────────────────────────
-
 sol! {
-    // Phase 1 completion. identity_commitment is public but not wallet-linked.
     event MemberRegistered(
         bytes32 indexed resourceId,
         uint256 indexed groupId,
         uint256 identityCommitment
     );
 
-    // Phase 2 completion. nullifier_hash is the sole on-chain record
     event SettlementFinalized(
         bytes32 indexed resourceId,
         uint256 indexed nullifierHash,
@@ -56,24 +74,15 @@ sol! {
     event ResourceCreated(bytes32 indexed resourceId, uint256 groupId, address owner, uint256 price);
     event PriceUpdated(bytes32 indexed resourceId, address owner, uint256 price);
 
-    // identity already registered for this resource
-    error AlreadyRegistered();   
-    // this nullifier has already been used
+    error AlreadyRegistered();
     error AlreadySettled();
-    // The payment amount is incorrect
     error IncorrectPaymentAmount();
-    // ERC-3009 call reverted
-    error TransferFailed();      
-    // ZK proof rejected by Semaphore verifier
-    error VerificationFailed(); 
-    // caller != resource owner 
+    error TransferFailed();
+    error VerificationFailed();
     error NotResourceOwner();
-    // resource_id has no associated group   
     error ResourceNotFound();
-    // afterSettle() reverted
-    error HookFailed();          
-    // Semaphore createGroup() failed
-    error GroupCreationFailed(); 
+    error HookFailed();
+    error GroupCreationFailed();
 }
 
 #[derive(SolidityError)]
@@ -92,30 +101,26 @@ pub enum SettlementError {
 #[storage]
 #[entrypoint]
 pub struct SettlementRegistry {
-    // Protocol addresses (immutable after init)
     usdc_address:      StorageAddress,
     semaphore_address: StorageAddress,
-    verifier_address:  StorageAddress,
 
-    // resource_id => Semaphore group_id (0 = resource not created)
-    resource_groups: StorageMap<FixedBytes<32>, StorageU256>,
+    // resource_id => Semaphore group_id
+    // WARNING: group_id 0 is valid. Use resource_owners != ZERO as existence check.
+    resource_groups:  StorageMap<FixedBytes<32>, StorageU256>,
+    resource_price:   StorageMap<FixedBytes<32>, StorageU256>,
+    resource_owners:  StorageMap<FixedBytes<32>, StorageAddress>,
+    resource_hooks:   StorageMap<FixedBytes<32>, StorageAddress>,
 
-    // resource_id => price (in USDC)
-    resource_price: StorageMap<FixedBytes<32>, StorageU256>,
+    // Local nullifier tracking for is_settled() view queries.
+    // Semaphore also tracks nullifiers internally via validateProof().
+    nullifiers:       StorageMap<U256, StorageBool>,
 
-    // resource_id => owner (only owner can set hooks)
-    resource_owners: StorageMap<FixedBytes<32>, StorageAddress>,
-
-    // resource_id => hook contract (Address::ZERO = no hook)
-    resource_hooks: StorageMap<FixedBytes<32>, StorageAddress>,
-
-    // Semaphore nullifier_hash => claimed
-    // Prevents double-claim regardless of which wallet submits the proof.
-    nullifiers: StorageMap<U256, StorageBool>,
+    // settlement tracking using burner addresses
+    // hash(burner address|| resourceId) => true/false
+    settlements: StorageMap<FixedBytes<32>, StorageBool>,
 
     // keccak256(resource_id ++ identity_commitment) => registered
-    // Prevents the same Semaphore identity from paying twice per resource.
-    registrations: StorageMap<FixedBytes<32>, StorageBool>,
+    registrations:    StorageMap<FixedBytes<32>, StorageBool>,
 }
 
 #[public]
@@ -124,59 +129,99 @@ impl SettlementRegistry {
     #[constructor]
     pub fn init(
         &mut self,
-        usdc_address:      Address, // arb sep 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d
-        semaphore_address: Address, // arb sep 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D
-        verifier_address:  Address, // arb sep 0x4DeC9E3784EcC1eE002001BfE91deEf4A48931f8
+        usdc_address:      Address,
+        semaphore_address: Address,
     ) {
         self.usdc_address.set(usdc_address);
         self.semaphore_address.set(semaphore_address);
-        self.verifier_address.set(verifier_address);
     }
 
     /// Create a new resource and its Semaphore group.
-    /// Caller becomes the resource owner.
-    ///
-    /// In Fangorn: resource_id = keccak256(owner_addr ++ schema_id ++ tag)
-    /// Schema owners call this once when publishing a content asset or data stream.
+    /// After calling this, call add_seed_member() once to enable single-member proofs.
     pub fn create_resource(
         &mut self,
         resource_id: FixedBytes<32>,
         price: U256,
     ) -> Result<U256, SettlementError> {
-        if self.resource_groups.get(resource_id) != U256::ZERO {
+        if self.resource_owners.get(resource_id) != Address::ZERO {
             return Err(SettlementError::AlreadyRegistered(AlreadyRegistered {}));
         }
 
-        // createGroup() (no args) returns uint256 group_id.
-        // This contract becomes the Semaphore group admin, so only this contract
-        // can call addMember() for this group going forward.
+        let this = self.vm().contract_address();
         let ret = unsafe {
             RawCall::new(self.vm())
-                .call(self.semaphore_address.get(), &calldata_create_group())
+                .call(
+                    self.semaphore_address.get(), 
+                    &calldata_create_group_with_admin(this)
+                )
         }
         .map_err(|_| SettlementError::GroupCreationFailed(GroupCreationFailed {}))?;
 
         let group_id = decode_u256(&ret)
             .ok_or(SettlementError::GroupCreationFailed(GroupCreationFailed {}))?;
 
-        self.resource_groups.setter(resource_id).set(group_id);
         let caller = self.vm().msg_sender();
+        self.resource_groups.setter(resource_id).set(group_id);
         self.resource_owners.setter(resource_id).set(caller);
         self.resource_price.setter(resource_id).set(price);
 
         self.vm().log(ResourceCreated {
             resourceId: resource_id,
-            groupId: group_id,
-            owner: caller,
-            price: price
+            groupId:    group_id,
+            owner:      caller,
+            price,
         });
 
         Ok(group_id)
     }
 
-    /// Update the registered price for accessing the resource
+    /// Add a deterministic seed member to the group so LeanIMT depth >= 1.
+    /// Must be called once by resource owner after create_resource().
+    /// Seed commitment = keccak256(resource_id) — auditable but unspendable.
+    /// Emits MemberRegistered so fetchGroup picks it up alongside real members.
+    pub fn add_seed_member(
+        &mut self,
+        resource_id: FixedBytes<32>,
+    ) -> Result<(), SettlementError> {
+        let owner = self.resource_owners.get(resource_id);
+        if owner == Address::ZERO {
+            return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
+        }
+        if self.vm().msg_sender() != owner {
+            return Err(SettlementError::NotResourceOwner(NotResourceOwner {}));
+        }
+
+        let group_id = self.resource_groups.get(resource_id);
+        // let seed = U256::from_be_bytes(*keccak256(resource_id.as_slice()));
+         let raw = U256::from_be_bytes(*keccak256(resource_id.as_slice()));
+        // BN254 scalar field modulus
+        const BN254_FIELD_MOD: U256 = U256::from_be_bytes([
+            0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29,
+            0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
+            0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91,
+            0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00, 0x00, 0x01,
+        ]);
+        let seed = raw % BN254_FIELD_MOD;
+
+        let add_calldata = calldata_add_member(group_id, seed);
+        unsafe {
+            RawCall::new(self.vm())
+                .call(self.semaphore_address.get(), &add_calldata)
+        }
+        .map_err(|_| SettlementError::GroupCreationFailed(GroupCreationFailed {}))?;
+
+        self.vm().log(MemberRegistered {
+            resourceId:         resource_id,
+            groupId:            group_id,
+            identityCommitment: seed,
+        });
+
+        Ok(())
+    }
+
+    /// Update the price of the resource
     pub fn update_price(
-         &mut self,
+        &mut self,
         resource_id: FixedBytes<32>,
         price: U256,
     ) -> Result<(), SettlementError> {
@@ -187,26 +232,16 @@ impl SettlementRegistry {
         if self.vm().msg_sender() != owner {
             return Err(SettlementError::NotResourceOwner(NotResourceOwner {}));
         }
-
-        // update price
         self.resource_price.setter(resource_id).set(price);
-
-        self.vm().log(PriceUpdated {
-            resourceId: resource_id,
-            owner: owner,
-            price: price
-        });
-
+        self.vm().log(PriceUpdated { resourceId: resource_id, owner, price });
         Ok(())
     }
 
-    /// Register or replace the settlement hook for a resource.
-    /// Only callable by the resource owner.
-    /// Pass Address::ZERO to remove the hook (settlements still record nullifiers).
+    /// Register a hook address for the resource
     pub fn register_hook(
         &mut self,
         resource_id: FixedBytes<32>,
-        hook:        Address,
+        hook: Address,
     ) -> Result<(), SettlementError> {
         let owner = self.resource_owners.get(resource_id);
         if owner == Address::ZERO {
@@ -215,48 +250,32 @@ impl SettlementRegistry {
         if self.vm().msg_sender() != owner {
             return Err(SettlementError::NotResourceOwner(NotResourceOwner {}));
         }
-
         self.resource_hooks.setter(resource_id).set(hook);
         self.vm().log(HookRegistered { resourceId: resource_id, hook });
         Ok(())
     }
 
-    /// Pay for access and register a Semaphore identity in the resource's group.
-    ///
-    /// Privacy model:
-    ///   - `from` is a burner/stealth wallet that holds USDC and has signed the
-    ///     ERC-3009 authorization off-chain. It never calls any contract directly.
-    ///   - `identity_commitment` is derived from the user's Semaphore secret, which
-    ///     never leaves the client. It appears on-chain but is unlinkable to `from`.
-    ///   - The transaction sender (msg.sender) can be a relayer — also unlinkable.
-    ///
-    /// Off-chain setup (@semaphore-protocol/identity):
-    ///   const identity = new Identity()
-    ///   const commitment = identity.commitment   // pass as identity_commitment
-    ///   // Persist identity.export() encrypted client-side — NEVER transmit secret
-    ///
+    /// Phase 1. Pay => register a Semaphore identity in the group.
     #[payable]
     pub fn register(
         &mut self,
         resource_id:         FixedBytes<32>,
         identity_commitment: U256,
-        from:        Address,
-        to:          Address,         // recipient of USDC (e.g. schema owner treasury)
-        amount:      U256,
-        valid_after: U256,
-        valid_before:U256,
-        nonce:       FixedBytes<32>,
-        v: u8,
-        r: FixedBytes<32>,
-        s: FixedBytes<32>,
+        from:                Address,
+        to:                  Address,
+        amount:              U256,
+        valid_after:         U256,
+        valid_before:        U256,
+        nonce:               FixedBytes<32>,
+        v:                   u8,
+        r:                   FixedBytes<32>,
+        s:                   FixedBytes<32>,
     ) -> Result<(), SettlementError> {
-        // check if the group exists
-        let group_id = self.resource_groups.get(resource_id);
-        if group_id == U256::ZERO {
+        let owner = self.resource_owners.get(resource_id);
+        if owner == Address::ZERO {
             return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
         }
 
-        // Prevent double-registration for this (resource, identity) pair
         let reg_key = hash_concat(
             resource_id.as_slice(),
             &identity_commitment.to_be_bytes::<32>(),
@@ -265,14 +284,11 @@ impl SettlementRegistry {
             return Err(SettlementError::AlreadyRegistered(AlreadyRegistered {}));
         }
 
-        // Ensure payment amount is exact
         let expected_price = self.resource_price.get(resource_id);
         if amount != expected_price {
             return Err(SettlementError::IncorrectPaymentAmount(IncorrectPaymentAmount {}));
         }
 
-        // transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32)
-        // All static params — straightforward ABI encoding, no dynamic slots needed.
         let payment_calldata = calldata_transfer_with_authorization(
             from, to, amount, valid_after, valid_before, nonce, v, r, s,
         );
@@ -282,8 +298,7 @@ impl SettlementRegistry {
         }
         .map_err(|_| SettlementError::TransferFailed(TransferFailed {}))?;
 
-        // addMember(uint256 groupId, uint256 identityCommitment)
-        // This is the only on-chain entitlement record — no wallet, no amount.
+        let group_id = self.resource_groups.get(resource_id);
         let add_calldata = calldata_add_member(group_id, identity_commitment);
         unsafe {
             RawCall::new(self.vm())
@@ -302,86 +317,71 @@ impl SettlementRegistry {
         Ok(())
     }
 
-    /// Claim access by presenting a valid Semaphore ZK proof.
+    /// Phase 2 — Prove membership and claim access.
     ///
-    /// The caller can be ANY address — the proof cryptographically ties the claim
-    /// to the identity commitment without revealing which commitment, which wallet
-    /// paid, or which wallet is claiming. A relayer can submit on the user's behalf.
-    ///
-    /// Proof generation (@semaphore-protocol/proof):
-    ///   const proof = await generateProof(
-    ///     identity,      // kept client-side
-    ///     group,         // fetched from Semaphore subgraph or MemberRegistered events
-    ///     message,       // your signal: encode stealth address, token id, etc. as U256
-    ///     scope,         // MUST equal the group_id for this resource_id
-    ///   )
-    ///   // Submit: proof.nullifier, proof.merkleTreeRoot, proof.message, proof.proof[8]
-    ///
-    /// hook_data interpretation by hook type:
-    ///   AccessNFTHook  — abi.encode(stealthAddress, metadataUri)
-    ///   TimelockHook   — abi.encode(durationSeconds)
-    ///   (no hook)      — only nullifier recorded; off-chain check via is_settled()
-    ///
+    /// Client generates proof via @semaphore-protocol/proof:
+    ///   const proof = await generateProof(identity, group, message, groupId)
+    ///   scope = groupId (4th arg to generateProof)
     pub fn settle(
         &mut self,
-        resource_id:    FixedBytes<32>,
-        nullifier_hash: U256,
-        message:        U256,       // Semaphore signal — passed to hook
-        merkle_root:    U256,       // Must match current group root
-        proof:          [U256; 8],  // Groth16 proof
-        hook_data:      Vec<u8>,    // Forwarded verbatim to afterSettle()
+        resource_id:       FixedBytes<32>,
+        // for anonymous settlement tracking
+        stealth_address:   Address,
+        merkle_tree_depth: U256,
+        merkle_tree_root:  U256,
+        nullifier:         U256,
+        message:           U256,
+        points:            [U256; 8],
+        hook_data:         Vec<u8>,
     ) -> Result<(), SettlementError> {
-        let group_id = self.resource_groups.get(resource_id);
-        if group_id == U256::ZERO {
+        let owner = self.resource_owners.get(resource_id);
+        if owner == Address::ZERO {
             return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
         }
 
-        // Nullifier check before any external calls (checks-effects-interactions)
-        if self.nullifiers.get(nullifier_hash) {
+        if self.nullifiers.get(nullifier) {
             return Err(SettlementError::AlreadySettled(AlreadySettled {}));
         }
 
-        // getMerkleTreeDepth(uint256) — static call, returns uint256
-        let depth_calldata = calldata_get_merkle_tree_depth(group_id);
-        let depth_ret = unsafe {
-            RawCall::new_static(self.vm())
-                .call(self.semaphore_address.get(), &depth_calldata)
-        }
-        .map_err(|_| SettlementError::VerificationFailed(VerificationFailed {}))?;
+        let group_id = self.resource_groups.get(resource_id);
 
-        let depth = decode_u256(&depth_ret)
-            .ok_or(SettlementError::VerificationFailed(VerificationFailed {}))?;
-
-        // LeanIMT returns depth 0 for a single-member tree, but the Groth16
-        // verifier circuit requires a minimum depth of 1. Clamp here so the
-        // on-chain verifier and client-side proof generation always agree.
-        let depth = if depth == U256::ZERO { U256::from(1u64) } else { depth };
-
-        let verify_calldata = calldata_verify_proof(
-            depth, merkle_root, nullifier_hash, message, group_id, &proof,
+        let validate_calldata = calldata_validate_proof(
+            group_id,
+            merkle_tree_depth,
+            merkle_tree_root,
+            nullifier,
+            message,
+            group_id, // scope = groupId
+            &points,
         );
         unsafe {
-            RawCall::new_static(self.vm())
-                .call(self.verifier_address.get(), &verify_calldata)
+            RawCall::new(self.vm())
+                .call(
+                    self.semaphore_address.get(), 
+                    &validate_calldata
+                )
         }
         .map_err(|_| SettlementError::VerificationFailed(VerificationFailed {}))?;
 
-        // Commit nullifier BEFORE hook call (reentrancy protection)
-        self.nullifiers.setter(nullifier_hash).set(true);
+        self.nullifiers.setter(nullifier).set(true);
+
+        // for settlement tracking, map: hash(stealth || resourceId) => true
+        let settlement_key = hash_concat(
+            stealth_address.as_slice(),
+            resource_id.as_slice(),
+        );
+        self.settlements.setter(settlement_key).set(true);
 
         self.vm().log(SettlementFinalized {
             resourceId:    resource_id,
-            nullifierHash: nullifier_hash,
+            nullifierHash: nullifier,
             message,
         });
 
-        // Dispatch hook atomically (hook revert = settle revert)
         let hook_addr = self.resource_hooks.get(resource_id);
         if hook_addr != Address::ZERO {
-            // afterSettle(bytes32,uint256,uint256,bytes) — `bytes` is dynamic,
-            // so we use the full ABI dynamic encoding helper.
             let hook_calldata = calldata_after_settle(
-                resource_id, nullifier_hash, message, &hook_data,
+                resource_id, nullifier, message, &hook_data,
             );
             unsafe {
                 RawCall::new(self.vm())
@@ -393,10 +393,12 @@ impl SettlementRegistry {
         Ok(())
     }
 
-    // ── View ──────────────────────────────────────────────────────────────────
-
-    pub fn is_settled(&self, nullifier_hash: U256) -> bool {
-        self.nullifiers.get(nullifier_hash)
+    pub fn is_settled(&self, stealth_address: Address, resource_id: FixedBytes<32>) -> bool {
+        let key = hash_concat(
+            stealth_address.as_slice(),
+            resource_id.as_slice(),
+        );
+        self.settlements.get(key)
     }
 
     pub fn get_group_id(&self, resource_id: FixedBytes<32>) -> U256 {
@@ -421,22 +423,25 @@ impl SettlementRegistry {
 }
 
 // ─── ABI Calldata Builders ────────────────────────────────────────────────────
-//
-// Manual ABI encoding following the Ethereum ABI spec.
-// Static types (uint256, address, bytes32, uint8, fixed arrays) are encoded
-// inline as 32-byte slots. Dynamic types (bytes) use a head/tail layout with
-// an offset pointer in the head followed by length + padded data in the tail.
-//
-// All selectors are the first 4 bytes of keccak256("functionName(argTypes,...)").
+// All verified against @semaphore-protocol/contracts@4.14.2
 
 /// createGroup() → uint256
 fn calldata_create_group() -> Vec<u8> {
-    // keccak256("createGroup()")
-    let selector = &keccak256(b"createGroup()")[..4];
-    selector.to_vec()
+    keccak256(b"createGroup()")[..4].to_vec()
 }
 
-/// addMember(uint256 groupId, uint256 identityCommitment)
+/// createGroup() with the contract as the admin
+fn calldata_create_group_with_admin(admin: Address) -> Vec<u8> {
+    // createGroup(address) selector
+    let selector = &keccak256(b"createGroup(address)")[..4];
+    let mut calldata = selector.to_vec();
+    // ABI encode address (padded to 32 bytes)
+    calldata.extend_from_slice(&[0u8; 12]);
+    calldata.extend_from_slice(admin.as_slice());
+    calldata
+}
+
+/// addMember(uint256,uint256)
 fn calldata_add_member(group_id: U256, identity_commitment: U256) -> Vec<u8> {
     let selector = &keccak256(b"addMember(uint256,uint256)")[..4];
     let mut cd = selector.to_vec();
@@ -445,46 +450,36 @@ fn calldata_add_member(group_id: U256, identity_commitment: U256) -> Vec<u8> {
     cd
 }
 
-/// getMerkleTreeDepth(uint256 groupId) → uint256
-fn calldata_get_merkle_tree_depth(group_id: U256) -> Vec<u8> {
-    let selector = &keccak256(b"getMerkleTreeDepth(uint256)")[..4];
-    let mut cd = selector.to_vec();
-    cd.extend_from_slice(&encode_u256(group_id));
-    cd
-}
-
-/// verifyProof(uint256,uint256,uint256,uint256,uint256,uint256[8])
-///
-/// uint256[8] is a fixed-size array — it is a static type under the ABI spec,
-/// so all 8 elements are encoded inline (no offset pointer).
-fn calldata_verify_proof(
-    depth:          U256,
-    merkle_root:    U256,
-    nullifier_hash: U256,
-    message:        U256,
-    scope:          U256,
-    proof:          &[U256; 8],
+/// validateProof(uint256,(uint256,uint256,uint256,uint256,uint256,uint256[8]))
+/// SemaphoreProof struct fields inline (all static, no offset pointer needed):
+///   merkleTreeDepth, merkleTreeRoot, nullifier, message, scope, points[8]
+fn calldata_validate_proof(
+    group_id:          U256,
+    merkle_tree_depth: U256,
+    merkle_tree_root:  U256,
+    nullifier:         U256,
+    message:           U256,
+    scope:             U256,
+    points:            &[U256; 8],
 ) -> Vec<u8> {
-    let selector = &keccak256(
-        b"verifyProof(uint256,uint256,uint256,uint256,uint256,uint256[8])"
+        let selector = &keccak256(
+        b"validateProof(uint256,(uint256,uint256,uint256,uint256,uint256,uint256[8]))"
     )[..4];
     let mut cd = selector.to_vec();
-    cd.extend_from_slice(&encode_u256(depth));
-    cd.extend_from_slice(&encode_u256(merkle_root));
-    cd.extend_from_slice(&encode_u256(nullifier_hash));
+    cd.extend_from_slice(&encode_u256(group_id));
+    // NO offset pointer — struct is fully static (uint256[8] is fixed-size)
+    cd.extend_from_slice(&encode_u256(merkle_tree_depth));
+    cd.extend_from_slice(&encode_u256(merkle_tree_root));
+    cd.extend_from_slice(&encode_u256(nullifier));
     cd.extend_from_slice(&encode_u256(message));
     cd.extend_from_slice(&encode_u256(scope));
-    // Inline the 8 proof elements — no offset needed for fixed arrays
-    for p in proof {
+    for p in points {
         cd.extend_from_slice(&encode_u256(*p));
     }
     cd
 }
 
 /// transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32)
-///
-/// All params are static — address and uint8 are both ABI-encoded as 32-byte
-/// slots (left-padded with zeros for address, right-padded for none).
 fn calldata_transfer_with_authorization(
     from:         Address,
     to:           Address,
@@ -505,24 +500,14 @@ fn calldata_transfer_with_authorization(
     cd.extend_from_slice(&encode_u256(value));
     cd.extend_from_slice(&encode_u256(valid_after));
     cd.extend_from_slice(&encode_u256(valid_before));
-    cd.extend_from_slice(nonce.as_slice());         // bytes32: already 32 bytes
+    cd.extend_from_slice(nonce.as_slice());
     cd.extend_from_slice(&encode_u8(v));
-    cd.extend_from_slice(r.as_slice());             // bytes32: already 32 bytes
-    cd.extend_from_slice(s.as_slice());             // bytes32: already 32 bytes
+    cd.extend_from_slice(r.as_slice());
+    cd.extend_from_slice(s.as_slice());
     cd
 }
 
 /// afterSettle(bytes32,uint256,uint256,bytes)
-///
-/// `bytes` is a dynamic type. ABI encoding for (bytes32, uint256, uint256, bytes):
-///
-///   slot 0 : resourceId           [bytes32, 32 bytes]
-///   slot 1 : nullifierHash        [uint256, 32 bytes]
-///   slot 2 : message              [uint256, 32 bytes]
-///   slot 3 : offset to bytes data [uint256 = 0x80 = 4 * 32]
-///   slot 4 : bytes length         [uint256]
-///   slot 5+: bytes data           [padded to 32-byte boundary]
-///
 fn calldata_after_settle(
     resource_id:    FixedBytes<32>,
     nullifier_hash: U256,
@@ -531,64 +516,162 @@ fn calldata_after_settle(
 ) -> Vec<u8> {
     let selector = &keccak256(b"afterSettle(bytes32,uint256,uint256,bytes)")[..4];
     let mut cd = selector.to_vec();
-
-    // Head: 3 static slots + 1 offset slot = 4 slots = 128 bytes
     cd.extend_from_slice(resource_id.as_slice());
     cd.extend_from_slice(&encode_u256(nullifier_hash));
     cd.extend_from_slice(&encode_u256(message));
-    // Offset to the bytes value: starts after the 4 head slots (4 * 32 = 128 = 0x80)
     cd.extend_from_slice(&encode_u256(U256::from(0x80u64)));
-
-    // Tail: length then data padded to 32-byte multiple
     let len = hook_data.len();
     cd.extend_from_slice(&encode_u256(U256::from(len)));
     cd.extend_from_slice(hook_data);
-    // Pad to 32-byte boundary
     let rem = len % 32;
     if rem != 0 {
         cd.extend(core::iter::repeat(0u8).take(32 - rem));
     }
-
     cd
 }
 
-// ─── ABI Encoding Primitives ──────────────────────────────────────────────────
+fn encode_u256(v: U256) -> [u8; 32] { v.to_be_bytes() }
 
-/// Encode a U256 as a 32-byte big-endian slot.
-fn encode_u256(v: U256) -> [u8; 32] {
-    v.to_be_bytes()
-}
-
-/// Encode an address as a 32-byte ABI slot (12 zero bytes + 20 address bytes).
 fn encode_address(addr: Address) -> [u8; 32] {
     let mut slot = [0u8; 32];
     slot[12..].copy_from_slice(addr.as_slice());
     slot
 }
 
-/// Encode a uint8 as a 32-byte ABI slot (left-padded with zeros).
 fn encode_u8(v: u8) -> [u8; 32] {
     let mut slot = [0u8; 32];
     slot[31] = v;
     slot
 }
 
-// ─── Return Value Decoder ─────────────────────────────────────────────────────
-
-/// Decode the first 32 bytes of a raw return buffer as a U256.
-/// Returns None if the buffer is shorter than 32 bytes.
 fn decode_u256(ret: &[u8]) -> Option<U256> {
-    if ret.len() < 32 {
-        return None;
-    }
+    if ret.len() < 32 { return None; }
     Some(U256::from_be_slice(&ret[..32]))
 }
-
-// ─── Internal Helpers ─────────────────────────────────────────────────────────
 
 fn hash_concat(a: &[u8], b: &[u8]) -> FixedBytes<32> {
     let mut data = Vec::with_capacity(a.len() + b.len());
     data.extend_from_slice(a);
     data.extend_from_slice(b);
     keccak256(&data)
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stylus_sdk::alloy_primitives::{keccak256, FixedBytes, U256};
+
+    fn resource_id() -> FixedBytes<32> { keccak256(b"test-resource-v1") }
+    fn seed(rid: FixedBytes<32>) -> U256 { U256::from_be_bytes(*keccak256(rid.as_slice())) }
+
+    #[test]
+    fn test_seed_nonzero() {
+        assert_ne!(seed(resource_id()), U256::ZERO);
+    }
+
+    #[test]
+    fn test_seed_deterministic() {
+        assert_eq!(seed(resource_id()), seed(resource_id()));
+    }
+
+    #[test]
+    fn test_seed_unique_per_resource() {
+        let r1 = keccak256(b"resource-a");
+        let r2 = keccak256(b"resource-b");
+        assert_ne!(seed(r1), seed(r2));
+    }
+
+    #[test]
+    fn test_selector_create_group() {
+        let cd = calldata_create_group();
+        assert_eq!(cd.len(), 4);
+        assert_eq!(&cd[..4], &keccak256(b"createGroup()")[..4]);
+    }
+
+    #[test]
+    fn test_selector_add_member() {
+        let cd = calldata_add_member(U256::ZERO, U256::ZERO);
+        assert_eq!(&cd[..4], &keccak256(b"addMember(uint256,uint256)")[..4]);
+        assert_eq!(cd.len(), 68);
+    }
+
+    #[test]
+    fn test_selector_validate_proof() {
+        let cd = calldata_validate_proof(
+            U256::ZERO, U256::ZERO, U256::ZERO,
+            U256::ZERO, U256::ZERO, U256::ZERO,
+            &[U256::ZERO; 8],
+        );
+        assert_eq!(
+            &cd[..4],
+            &keccak256(b"validateProof(uint256,(uint256,uint256,uint256,uint256,uint256,uint256[8]))")[..4]
+        );
+        // selector(4) + groupId(32) + 5 struct fields(160) + points[8](256) = 452
+        assert_eq!(cd.len(), 452);
+    }
+
+    #[test]
+    fn test_validate_proof_field_order() {
+        let group_id  = U256::from(1u64);
+        let depth     = U256::from(2u64);
+        let root      = U256::from(3u64);
+        let nullifier = U256::from(4u64);
+        let message   = U256::from(5u64);
+        let scope     = U256::from(6u64);
+        let points    = [U256::from(7u64); 8];
+
+        let cd = calldata_validate_proof(
+            group_id, depth, root, nullifier, message, scope, &points,
+        );
+
+        assert_eq!(U256::from_be_slice(&cd[4..36]),   group_id,  "groupId");
+        assert_eq!(U256::from_be_slice(&cd[36..68]),  depth,     "merkleTreeDepth");
+        assert_eq!(U256::from_be_slice(&cd[68..100]), root,      "merkleTreeRoot");
+        assert_eq!(U256::from_be_slice(&cd[100..132]),nullifier, "nullifier");
+        assert_eq!(U256::from_be_slice(&cd[132..164]),message,   "message");
+        assert_eq!(U256::from_be_slice(&cd[164..196]),scope,     "scope");
+        assert_eq!(U256::from_be_slice(&cd[196..228]),points[0], "points[0]");
+    }
+
+    #[test]
+    fn test_validate_proof_scope_equals_group_id() {
+        let group_id = U256::from(42u64);
+        let cd = calldata_validate_proof(
+            group_id, U256::ZERO, U256::ZERO,
+            U256::ZERO, U256::ZERO, group_id,
+            &[U256::ZERO; 8],
+        );
+        assert_eq!(
+            U256::from_be_slice(&cd[4..36]),
+            U256::from_be_slice(&cd[164..196]),
+            "scope must equal group_id"
+        );
+    }
+
+    #[test]
+    fn test_after_settle_offset_and_length() {
+        let cd = calldata_after_settle(resource_id(), U256::ZERO, U256::ZERO, &[]);
+        let offset = U256::from_be_slice(&cd[100..132]);
+        let length = U256::from_be_slice(&cd[132..164]);
+        assert_eq!(offset, U256::from(0x80u64));
+        assert_eq!(length, U256::ZERO);
+    }
+
+    #[test]
+    fn test_reg_key_unique_per_identity() {
+        let rid = resource_id();
+        let k1 = hash_concat(rid.as_slice(), &U256::from(1u64).to_be_bytes::<32>());
+        let k2 = hash_concat(rid.as_slice(), &U256::from(2u64).to_be_bytes::<32>());
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_reg_key_unique_per_resource() {
+        let ic = U256::from(1u64);
+        let k1 = hash_concat(keccak256(b"a").as_slice(), &ic.to_be_bytes::<32>());
+        let k2 = hash_concat(keccak256(b"b").as_slice(), &ic.to_be_bytes::<32>());
+        assert_ne!(k1, k2);
+    }
 }
