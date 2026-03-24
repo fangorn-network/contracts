@@ -43,7 +43,7 @@
 //   LeanIMT depth 0 (1 member) cannot generate a valid Groth16 proof.
 //   A seed member must be added after create_resource() so depth >= 1.
 //   add_seed_member() is called once by the resource owner after creation.
-//   Seed commitment = keccak256(resource_id) — deterministic, unspendable.
+//   Seed commitment = keccak256(resource_id)
 //   The seed is emitted as MemberRegistered so fetchGroup picks it up.
 
 #![cfg_attr(not(any(test, feature = "export-abi")), no_main)]
@@ -105,10 +105,12 @@ pub struct SettlementRegistry {
     semaphore_address: StorageAddress,
 
     // resource_id => Semaphore group_id
-    // WARNING: group_id 0 is valid. Use resource_owners != ZERO as existence check.
     resource_groups:  StorageMap<FixedBytes<32>, StorageU256>,
+    // resource_id => USDC price
     resource_price:   StorageMap<FixedBytes<32>, StorageU256>,
+    // resource_id => owner
     resource_owners:  StorageMap<FixedBytes<32>, StorageAddress>,
+    // resource_id => hook data
     resource_hooks:   StorageMap<FixedBytes<32>, StorageAddress>,
 
     // Local nullifier tracking for is_settled() view queries.
@@ -195,11 +197,11 @@ impl SettlementRegistry {
         // let seed = U256::from_be_bytes(*keccak256(resource_id.as_slice()));
          let raw = U256::from_be_bytes(*keccak256(resource_id.as_slice()));
         // BN254 scalar field modulus
-        const BN254_FIELD_MOD: U256 = U256::from_be_bytes([
-            0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29,
-            0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
-            0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91,
-            0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00, 0x00, 0x01,
+        const BN254_FIELD_MOD: U256 = U256::from_limbs([
+            0x43e1f593f0000001,
+            0x2833e84879b97091,
+            0xb85045b68181585d,
+            0x30644e72e131a029,
         ]);
         let seed = raw % BN254_FIELD_MOD;
 
@@ -401,6 +403,10 @@ impl SettlementRegistry {
         self.settlements.get(key)
     }
 
+    pub fn get_price(&self, resource_id: FixedBytes<32>) -> U256 {
+        self.resource_price.get(resource_id)
+    }
+
     pub fn get_group_id(&self, resource_id: FixedBytes<32>) -> U256 {
         self.resource_groups.get(resource_id)
     }
@@ -422,13 +428,7 @@ impl SettlementRegistry {
     }
 }
 
-// ─── ABI Calldata Builders ────────────────────────────────────────────────────
-// All verified against @semaphore-protocol/contracts@4.14.2
-
-/// createGroup() → uint256
-fn calldata_create_group() -> Vec<u8> {
-    keccak256(b"createGroup()")[..4].to_vec()
-}
+// ABI Calldata Builders
 
 /// createGroup() with the contract as the admin
 fn calldata_create_group_with_admin(admin: Address) -> Vec<u8> {
@@ -581,13 +581,6 @@ mod tests {
         let r1 = keccak256(b"resource-a");
         let r2 = keccak256(b"resource-b");
         assert_ne!(seed(r1), seed(r2));
-    }
-
-    #[test]
-    fn test_selector_create_group() {
-        let cd = calldata_create_group();
-        assert_eq!(cd.len(), 4);
-        assert_eq!(&cd[..4], &keccak256(b"createGroup()")[..4]);
     }
 
     #[test]

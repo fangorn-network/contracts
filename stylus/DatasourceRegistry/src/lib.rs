@@ -19,6 +19,13 @@ sol! {
         uint64 version
     );
 
+    event ManifestUpdated(
+        address indexed owner,
+        bytes32 indexed schema_id,
+        string manifest_cid,
+        uint64 version
+    );
+
     error DataSourceNotFound();
     error SchemaNotFound();
     error SchemaRequired();
@@ -86,12 +93,22 @@ impl DataSourceRegistry {
         ds.version.set(new_version);
         ds.manifest_cid.set_str(&manifest_cid);
 
-        self.vm().log(ManifestPublished {
-            owner: sender,
-            schema_id,
-            manifest_cid,
-            version: new_version.to::<u64>(),
-        });
+        // we are updating an already published manifest
+        if new_version != U64::from(1) {
+            self.vm().log(ManifestUpdated {
+                owner: sender,
+                schema_id,
+                manifest_cid,
+                version: new_version.to::<u64>(),
+            });
+        } else {
+            self.vm().log(ManifestPublished {
+                owner: sender,
+                schema_id,
+                manifest_cid,
+                version: new_version.to::<u64>(),
+            });
+        }
 
         Ok(())
     }
