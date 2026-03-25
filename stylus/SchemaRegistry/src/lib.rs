@@ -127,7 +127,8 @@ impl SchemaRegistry {
     }
 
     /// Check whether a schema exists by its bytes32 id (used by DataSourceRegistry).
-    pub fn schema_exists(&self, id: FixedBytes<32>) -> bool {
+    pub fn schema_exists(&self, name: String) -> bool {
+        let id = schema_id_from_name(name);
         self.schemas.getter(id).owner.get() != Address::ZERO
     }
 }
@@ -163,7 +164,7 @@ mod test {
             "agent_id".to_string(),
         ) {
             Ok(id) => {
-                assert!(contract.schema_exists(id));
+                assert!(contract.schema_exists("fangorn.music.v1"));
                 match contract.get_schema_spec("fangorn.music.v1".to_string()) {
                     Ok(spec) => assert_eq!(spec, "bafy...schema"),
                     Err(_) => panic!("get_schema_spec should not fail"),
