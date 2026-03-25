@@ -54,7 +54,12 @@ pub struct SchemaRegistry {
 #[public]
 impl SchemaRegistry {
 
-    /// Register a new schema. ID is derived from the name so it's deterministic.
+    /// Expose id derivation as a pure view so callers can cache it.
+    pub fn schema_id(&self, name: String) -> FixedBytes<32> {
+        schema_id_from_name(name)
+    }
+
+    /// Register a new schema. ID is derived from name so it's deterministic.
     pub fn register_schema(
         &mut self,
         name: String,
@@ -82,12 +87,11 @@ impl SchemaRegistry {
     /// Update the spec CID and agent ID of an existing schema (owner only).
     pub fn update_schema(
         &mut self,
-        name: String,
+        id: FixedBytes<32>,
         new_spec_cid: String,
         new_agent_id: String,
     ) -> Result<(), RegistryError> {
         let sender = self.vm().msg_sender();
-        let id = schema_id_from_name(name);
 
         let owner = self.schemas.getter(id).owner.get();
 
@@ -108,18 +112,16 @@ impl SchemaRegistry {
         Ok(())
     }
 
-    /// Get the spec CID for a schema by name.
-    pub fn get_schema_spec(&self, name: String) -> Result<String, RegistryError> {
-        let id = schema_id_from_name(name);
+    /// Get the spec CID for a schema by id.
+    pub fn get_schema_spec(&self, id: FixedBytes<32>) -> Result<String, RegistryError> {
         if self.schemas.getter(id).owner.get() == Address::ZERO {
             return Err(RegistryError::SchemaNotFound(SchemaNotFound {}));
         }
         Ok(self.schemas.getter(id).spec_cid.get_string())
     }
 
-    /// Get the agent ID for a schema by name.
-    pub fn get_schema_agent(&self, name: String) -> Result<String, RegistryError> {
-        let id = schema_id_from_name(name);
+    /// Get the agent ID for a schema by id.
+    pub fn get_schema_agent(&self, id: FixedBytes<32>) -> Result<String, RegistryError> {
         if self.schemas.getter(id).owner.get() == Address::ZERO {
             return Err(RegistryError::SchemaNotFound(SchemaNotFound {}));
         }
@@ -127,8 +129,7 @@ impl SchemaRegistry {
     }
 
     /// Check whether a schema exists by its bytes32 id (used by DataSourceRegistry).
-    pub fn schema_exists(&self, name: String) -> bool {
-        let id = schema_id_from_name(name);
+    pub fn schema_exists(&self, id: FixedBytes<32>) -> bool {
         self.schemas.getter(id).owner.get() != Address::ZERO
     }
 }
@@ -157,19 +158,21 @@ mod test {
     #[test]
     fn test_schema_registration_works() {
         let (_, mut contract) = setup();
+        let id = schema_id_from_name("fangorn.music.v1".to_string());
 
         match contract.register_schema(
             "fangorn.music.v1".to_string(),
             "bafy...schema".to_string(),
             "agent_id".to_string(),
         ) {
-            Ok(id) => {
-                assert!(contract.schema_exists("fangorn.music.v1"));
-                match contract.get_schema_spec("fangorn.music.v1".to_string()) {
+            Ok(returned_id) => {
+                assert_eq!(returned_id, id);
+                assert!(contract.schema_exists(id));
+                match contract.get_schema_spec(id) {
                     Ok(spec) => assert_eq!(spec, "bafy...schema"),
                     Err(_) => panic!("get_schema_spec should not fail"),
                 }
-                match contract.get_schema_agent("fangorn.music.v1".to_string()) {
+                match contract.get_schema_agent(id) {
                     Ok(agent) => assert_eq!(agent, "agent_id"),
                     Err(_) => panic!("get_schema_agent should not fail"),
                 }
@@ -203,6 +206,7 @@ mod test {
     #[test]
     fn test_schema_update_not_owner_fails() {
         let (vm, mut contract) = setup();
+        let id = schema_id_from_name("fangorn.music.v1".to_string());
 
         match contract.register_schema(
             "fangorn.music.v1".to_string(),
@@ -213,7 +217,7 @@ mod test {
                 vm.set_sender(OTHER);
                 assert!(contract
                     .update_schema(
-                        "fangorn.music.v1".to_string(),
+                        id,
                         "bafy...new".to_string(),
                         "agent-new".to_string(),
                     )
@@ -226,6 +230,7 @@ mod test {
     #[test]
     fn test_schema_update_owner_succeeds() {
         let (_, mut contract) = setup();
+        let id = schema_id_from_name("fangorn.music.v1".to_string());
 
         match contract.register_schema(
             "fangorn.music.v1".to_string(),
@@ -234,16 +239,16 @@ mod test {
         ) {
             Ok(_) => {
                 match contract.update_schema(
-                    "fangorn.music.v1".to_string(),
+                    id,
                     "bafy...new".to_string(),
                     "agent-new".to_string(),
                 ) {
                     Ok(_) => {
-                        match contract.get_schema_spec("fangorn.music.v1".to_string()) {
+                        match contract.get_schema_spec(id) {
                             Ok(spec) => assert_eq!(spec, "bafy...new"),
                             Err(_) => panic!("get_schema_spec should not fail"),
                         }
-                        match contract.get_schema_agent("fangorn.music.v1".to_string()) {
+                        match contract.get_schema_agent(id) {
                             Ok(agent) => assert_eq!(agent, "agent-new"),
                             Err(_) => panic!("get_schema_agent should not fail"),
                         }
