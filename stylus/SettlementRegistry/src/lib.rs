@@ -145,6 +145,7 @@ impl SettlementRegistry {
         resource_id: FixedBytes<32>,
         price: U256,
     ) -> Result<U256, SettlementError> {
+        
         if self.resource_owners.get(resource_id) != Address::ZERO {
             return Err(SettlementError::AlreadyRegistered(AlreadyRegistered {}));
         }
