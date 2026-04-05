@@ -168,6 +168,9 @@ impl SettlementRegistry {
         self.resource_owners.setter(resource_id).set(caller);
         self.resource_price.setter(resource_id).set(price);
 
+        // add the seed member now
+        let _ = self.add_seed_member(resource_id);
+
         self.vm().log(ResourceCreated {
             resourceId: resource_id,
             groupId:    group_id,
