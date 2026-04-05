@@ -67,18 +67,13 @@ pub struct SchemaRegistry {
     /// schema_id => comma-separated lowercase hex publisher addresses
     /// e.g. "0xabc...,0xdef..."
     publishers: StorageMap<FixedBytes<32>, StorageString>,
-    /// The data source registry contract address
-    /// add_publisher can only be called from this context
-    data_source_registry: StorageAddress,
 }
 
 #[public]
 impl SchemaRegistry {
 
     #[constructor]
-    pub fn initialize(&mut self, data_source_registry: Address) {
-        self.data_source_registry.set(data_source_registry);
-    }
+    pub fn initialize(&mut self) { }
 
     /// Expose id derivation as a pure view so callers can cache it.
     pub fn schema_id(&self, name: String) -> FixedBytes<32> {
@@ -138,51 +133,6 @@ impl SchemaRegistry {
         schema.agent_id.set_str(&new_agent_id);
 
         self.vm().log(SchemaUpdated { id, new_spec_cid, new_agent_id });
-
-        Ok(())
-    }
-
-    /// Called by DataSourceRegistry.publish() to register a publisher under a schema.
-    /// **Only** the registered DataSourceRegistry address may call this.
-    /// Skips silently if the publisher is already registered.
-    pub fn add_publisher(
-        &mut self,
-        schema_id: FixedBytes<32>,
-        publisher: Address,
-    ) -> Result<(), RegistryError> {
-        if self.vm().msg_sender() != self.data_source_registry.get() {
-            return Err(RegistryError::NotDataSourceRegistry(NotDataSourceRegistry {}));
-        }
-
-        if self.schemas.getter(schema_id).owner.get() == Address::ZERO {
-            return Err(RegistryError::SchemaNotFound(SchemaNotFound {}));
-        }
-
-        let publisher_hex = address_to_hex(publisher);
-
-        let existing_raw = {
-            let binding = self.publishers.getter(schema_id);
-            binding.get_string()
-        };
-
-        // skip if already registered
-        if !existing_raw.is_empty() {
-            for entry in existing_raw.split(',') {
-                if entry == publisher_hex {
-                    return Ok(());
-                }
-            }
-        }
-
-        let new_raw = if existing_raw.is_empty() {
-            publisher_hex.clone()
-        } else {
-            alloc::format!("{},{}", existing_raw, publisher_hex)
-        };
-
-        self.publishers.setter(schema_id).set_str(&new_raw);
-
-        self.vm().log(PublisherAdded { schema_id, publisher });
 
         Ok(())
     }
