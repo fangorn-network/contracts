@@ -117,6 +117,8 @@ impl DataSourceRegistry {
         for tag in tags.split(',').filter(|t| !t.is_empty()) {
             let resource_id = derive_resource_id(sender, schema_id, tag);
 
+            // if the (owner / schema / tag) combo is fresh, create a new resource
+            // otherwise we just need to update the price in the settlement registry
             let newly_created = unsafe {
                 RawCall::new(self.vm()).call(settlement, &sel_create_resource(resource_id, price))
             }
@@ -141,7 +143,7 @@ impl DataSourceRegistry {
             }
         }
 
-        // Append packed tags to the index — dedup is handled client-side
+        // Append packed tags to the index (dedup is handled client-side)
         {
             let existing_raw = {
                 let owner_getter = self.data_source_tags.getter(sender);
@@ -160,7 +162,6 @@ impl DataSourceRegistry {
                 .set_str(&new_raw);
         }
 
-        // Bump version, store CID, emit event
         let new_version = {
             let mut owner_binding = self.data_sources.setter(sender);
             let mut ds = owner_binding.setter(schema_id);
