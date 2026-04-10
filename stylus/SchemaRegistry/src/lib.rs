@@ -3,10 +3,10 @@
 
 extern crate alloc;
 
-use alloy_sol_types::sol;
 use alloc::fmt;
+use alloy_sol_types::sol;
 use stylus_sdk::{
-    alloy_primitives::{Address, FixedBytes, keccak256},
+    alloy_primitives::{keccak256, Address, FixedBytes, U256},
     prelude::*,
     storage::*,
 };
@@ -34,6 +34,7 @@ sol! {
     error NotOwner();
     error SchemaNotFound();
     error SchemaAlreadyExists();
+    error SchemaInUse();
     error NotDataSourceRegistry();
 }
 
@@ -42,10 +43,10 @@ pub enum RegistryError {
     NotOwner(NotOwner),
     SchemaNotFound(SchemaNotFound),
     SchemaAlreadyExists(SchemaAlreadyExists),
+    SchemaInUse(SchemaInUse),
     NotDataSourceRegistry(NotDataSourceRegistry),
 }
 
-// for testing
 impl fmt::Debug for RegistryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "RegistryError")
@@ -63,30 +64,37 @@ pub struct StorageSchema {
 #[storage]
 #[entrypoint]
 pub struct SchemaRegistry {
+    admin: StorageAddress,
     schemas: StorageMap<FixedBytes<32>, StorageSchema>,
-    /// schema_id => comma-separated lowercase hex publisher addresses
-    /// e.g. "0xabc...,0xdef..."
-    publishers: StorageMap<FixedBytes<32>, StorageString>,
+    publisher_count: StorageMap<FixedBytes<32>, StorageU256>,
+    publisher_set: StorageMap<FixedBytes<32>, StorageMap<Address, StorageBool>>,
+    data_source_registry: StorageAddress,
 }
 
 #[public]
 impl SchemaRegistry {
-
     #[constructor]
-    pub fn initialize(&mut self) { }
+    pub fn initialize(&mut self, admin: Address) {
+        self.admin.set(admin);
+    }
 
-    /// Expose id derivation as a pure view so callers can cache it.
+    pub fn set_data_source_registry(&mut self, registry: Address) -> Result<(), RegistryError> {
+        if self.vm().msg_sender() != self.admin.get() {
+            return Err(RegistryError::NotOwner(NotOwner {}));
+        }
+        // only allow setting once
+        if self.data_source_registry.get() != Address::ZERO {
+            return Err(RegistryError::SchemaAlreadyExists(SchemaAlreadyExists {}));
+            // reuse or add a new error
+        }
+        self.data_source_registry.set(registry);
+        Ok(())
+    }
+
     pub fn schema_id(&self, name: String) -> FixedBytes<32> {
         schema_id_from_name(name)
     }
 
-    /// Register a new schema. ID is derived from name so it's deterministic.
-    /// Note: all schemas must have unique names!
-    ///
-    /// * `name`:     The human-readable schema name
-    /// * `spec_cid`: The CID of the schema json
-    /// * `agent_id`: The option agent Id
-    ///
     pub fn register_schema(
         &mut self,
         name: String,
@@ -106,12 +114,16 @@ impl SchemaRegistry {
         schema.agent_id.set_str(&agent_id);
         schema.owner.set(sender);
 
-        self.vm().log(SchemaRegistered { id, owner: sender, name, spec_cid, agent_id });
-
+        self.vm().log(SchemaRegistered {
+            id,
+            owner: sender,
+            name,
+            spec_cid,
+            agent_id,
+        });
         Ok(id)
     }
 
-    /// Update the spec CID and agent ID of an existing schema (owner only).
     pub fn update_schema(
         &mut self,
         id: FixedBytes<32>,
@@ -132,24 +144,93 @@ impl SchemaRegistry {
         schema.spec_cid.set_str(&new_spec_cid);
         schema.agent_id.set_str(&new_agent_id);
 
-        self.vm().log(SchemaUpdated { id, new_spec_cid, new_agent_id });
+        self.vm().log(SchemaUpdated {
+            id,
+            new_spec_cid,
+            new_agent_id,
+        });
+        Ok(())
+    }
+
+    pub fn delete_schema(&mut self, id: FixedBytes<32>) -> Result<(), RegistryError> {
+        let sender = self.vm().msg_sender();
+        let owner = self.schemas.getter(id).owner.get();
+
+        if owner == Address::ZERO {
+            return Err(RegistryError::SchemaNotFound(SchemaNotFound {}));
+        }
+        if owner != sender {
+            return Err(RegistryError::NotOwner(NotOwner {}));
+        }
+        if self.publisher_count.get(id) > U256::ZERO {
+            return Err(RegistryError::SchemaInUse(SchemaInUse {}));
+        }
+
+        let mut schema = self.schemas.setter(id);
+        schema.name.set_str("");
+        schema.spec_cid.set_str("");
+        schema.agent_id.set_str("");
+        schema.owner.set(Address::ZERO);
 
         Ok(())
     }
 
-    /// Return all publisher addresses for a schema.
-    pub fn get_publishers(&self, schema_id: FixedBytes<32>) -> Vec<Address> {
-        let binding = self.publishers.getter(schema_id);
-        let raw = binding.get_string();
-        if raw.is_empty() {
-            return alloc::vec::Vec::new();
+    /// Called by the authorized DataSourceRegistry on first publish.
+    /// Idempotent — duplicate calls for the same publisher are no-ops.
+    pub fn add_publisher(
+        &mut self,
+        schema_id: FixedBytes<32>,
+        publisher: Address,
+    ) -> Result<(), RegistryError> {
+        if self.vm().msg_sender() != self.data_source_registry.get() {
+            return Err(RegistryError::NotDataSourceRegistry(
+                NotDataSourceRegistry {},
+            ));
         }
-        raw.split(',')
-            .filter_map(|s| hex_to_address(s))
-            .collect()
+        if self.schemas.getter(schema_id).owner.get() == Address::ZERO {
+            return Err(RegistryError::SchemaNotFound(SchemaNotFound {}));
+        }
+        if !self.publisher_set.getter(schema_id).get(publisher) {
+            self.publisher_set
+                .setter(schema_id)
+                .setter(publisher)
+                .set(true);
+            let count = self.publisher_count.get(schema_id);
+            self.publisher_count
+                .setter(schema_id)
+                .set(count + U256::from(1u8));
+            self.vm().log(PublisherAdded {
+                schema_id,
+                publisher,
+            });
+        }
+        Ok(())
     }
 
-    /// Get the spec CID for a schema by id.
+    pub fn get_admin(&self) -> Address {
+        self.admin.get()
+    }
+
+    pub fn get_data_source_registry(&self) -> Address {
+        self.data_source_registry.get()
+    }
+
+    pub fn schema_exists(&self, id: FixedBytes<32>) -> bool {
+        self.schemas.getter(id).owner.get() != Address::ZERO
+    }
+
+    pub fn has_publishers(&self, schema_id: FixedBytes<32>) -> bool {
+        self.publisher_count.get(schema_id) > U256::ZERO
+    }
+
+    pub fn is_publisher(&self, schema_id: FixedBytes<32>, publisher: Address) -> bool {
+        self.publisher_set.getter(schema_id).get(publisher)
+    }
+
+    pub fn get_publisher_count(&self, schema_id: FixedBytes<32>) -> U256 {
+        self.publisher_count.get(schema_id)
+    }
+
     pub fn get_schema_spec(&self, id: FixedBytes<32>) -> Result<String, RegistryError> {
         if self.schemas.getter(id).owner.get() == Address::ZERO {
             return Err(RegistryError::SchemaNotFound(SchemaNotFound {}));
@@ -157,7 +238,6 @@ impl SchemaRegistry {
         Ok(self.schemas.getter(id).spec_cid.get_string())
     }
 
-    /// Get the agent ID for a schema by id.
     pub fn get_schema_agent(&self, id: FixedBytes<32>) -> Result<String, RegistryError> {
         if self.schemas.getter(id).owner.get() == Address::ZERO {
             return Err(RegistryError::SchemaNotFound(SchemaNotFound {}));
@@ -165,64 +245,26 @@ impl SchemaRegistry {
         Ok(self.schemas.getter(id).agent_id.get_string())
     }
 
-    /// Check whether a schema exists by its bytes32 id (used by DataSourceRegistry).
-    pub fn schema_exists(&self, id: FixedBytes<32>) -> bool {
-        self.schemas.getter(id).owner.get() != Address::ZERO
+    pub fn get_schema_name(&self, id: FixedBytes<32>) -> Result<String, RegistryError> {
+        if self.schemas.getter(id).owner.get() == Address::ZERO {
+            return Err(RegistryError::SchemaNotFound(SchemaNotFound {}));
+        }
+        Ok(self.schemas.getter(id).name.get_string())
+    }
+
+    pub fn get_schema_owner(&self, id: FixedBytes<32>) -> Result<Address, RegistryError> {
+        let owner = self.schemas.getter(id).owner.get();
+        if owner == Address::ZERO {
+            return Err(RegistryError::SchemaNotFound(SchemaNotFound {}));
+        }
+        Ok(owner)
     }
 }
-
-// helper functions
 
 pub fn schema_id_from_name(name: String) -> FixedBytes<32> {
     use alloy_sol_types::SolValue;
     keccak256(name.abi_encode())
 }
-
-/// Encode an Address as a lowercase hex string with 0x prefix.
-/// Used as the storage representation in the publishers packed string.
-fn address_to_hex(addr: Address) -> alloc::string::String {
-    let bytes = addr.as_slice();
-    let mut s = alloc::string::String::with_capacity(42);
-    s.push_str("0x");
-    for b in bytes {
-        let hi = (b >> 4) as usize;
-        let lo = (b & 0xf) as usize;
-        s.push(HEX_CHARS[hi]);
-        s.push(HEX_CHARS[lo]);
-    }
-    s
-}
-
-const HEX_CHARS: [char; 16] = [
-    '0', '1', '2', '3', '4', '5', '6', '7',
-    '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
-];
-
-/// Parse a 0x-prefixed hex string back into an Address. Returns None on malformed input.
-fn hex_to_address(s: &str) -> Option<Address> {
-    let hex = s.strip_prefix("0x")?;
-    if hex.len() != 40 {
-        return None;
-    }
-    let mut bytes = [0u8; 20];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        bytes[i] = (hi << 4) | lo;
-    }
-    Some(Address::from(bytes))
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod test {
@@ -230,7 +272,7 @@ mod test {
     use alloy_primitives::address;
     use stylus_sdk::testing::*;
 
-    const USER: Address  = address!("0xCDC41bff86a62716f050622325CC17a317f99404");
+    const USER: Address = address!("0xCDC41bff86a62716f050622325CC17a317f99404");
     const OTHER: Address = address!("0xDEADbeefdEAdbeefdEadbEEFdeadbeEFdEADbeeF");
     const DS_REGISTRY: Address = address!("0x1111111111111111111111111111111111111111");
 
@@ -243,104 +285,149 @@ mod test {
     }
 
     fn register(contract: &mut SchemaRegistry) -> FixedBytes<32> {
-        contract.register_schema(
-            "fangorn.music.v1".to_string(),
-            "bafy...schema".to_string(),
-            "agent_id".to_string(),
-        ).unwrap()
+        contract
+            .register_schema(
+                "fangorn.music.v1".into(),
+                "bafy...schema".into(),
+                "agent_id".into(),
+            )
+            .unwrap()
     }
 
     #[test]
     fn test_schema_registration_works() {
-        let (_, mut contract) = setup();
-        let id = register(&mut contract);
-        assert!(contract.schema_exists(id));
-        assert_eq!(contract.get_schema_spec(id).unwrap(), "bafy...schema");
-        assert_eq!(contract.get_schema_agent(id).unwrap(), "agent_id");
+        let (_, mut c) = setup();
+        let id = register(&mut c);
+        assert!(c.schema_exists(id));
+        assert_eq!(c.get_schema_spec(id).unwrap(), "bafy...schema");
+        assert_eq!(c.get_schema_agent(id).unwrap(), "agent_id");
+        assert_eq!(c.get_schema_name(id).unwrap(), "fangorn.music.v1");
     }
 
     #[test]
     fn test_duplicate_schema_fails() {
-        let (_, mut contract) = setup();
-        register(&mut contract);
-        assert!(contract.register_schema(
-            "fangorn.music.v1".to_string(),
-            "bafy...schema2".to_string(),
-            "agent_id2".to_string(),
-        ).is_err());
+        let (_, mut c) = setup();
+        register(&mut c);
+        assert!(c
+            .register_schema("fangorn.music.v1".into(), "x".into(), "y".into())
+            .is_err());
     }
 
     #[test]
-    fn test_schema_update_not_owner_fails() {
-        let (vm, mut contract) = setup();
-        let id = register(&mut contract);
+    fn test_update_not_owner_fails() {
+        let (vm, mut c) = setup();
+        let id = register(&mut c);
         vm.set_sender(OTHER);
-        assert!(contract.update_schema(id, "bafy...new".to_string(), "agent-new".to_string()).is_err());
+        assert!(matches!(
+            c.update_schema(id, "new".into(), "new".into()),
+            Err(RegistryError::NotOwner(_))
+        ));
     }
 
     #[test]
-    fn test_schema_update_owner_succeeds() {
-        let (_, mut contract) = setup();
-        let id = register(&mut contract);
-        contract.update_schema(id, "bafy...new".to_string(), "agent-new".to_string()).unwrap();
-        assert_eq!(contract.get_schema_spec(id).unwrap(), "bafy...new");
-        assert_eq!(contract.get_schema_agent(id).unwrap(), "agent-new");
+    fn test_update_owner_succeeds() {
+        let (_, mut c) = setup();
+        let id = register(&mut c);
+        c.update_schema(id, "bafy...new".into(), "agent-new".into())
+            .unwrap();
+        assert_eq!(c.get_schema_spec(id).unwrap(), "bafy...new");
+        assert_eq!(c.get_schema_agent(id).unwrap(), "agent-new");
+    }
+
+    #[test]
+    fn test_delete_no_publishers() {
+        let (_, mut c) = setup();
+        let id = register(&mut c);
+        c.delete_schema(id).unwrap();
+        assert!(!c.schema_exists(id));
+    }
+
+    #[test]
+    fn test_delete_blocked_when_in_use() {
+        let (vm, mut c) = setup();
+        let id = register(&mut c);
+        vm.set_sender(DS_REGISTRY);
+        // set datasource registry
+        c.set_data_source_registry(DS_REGISTRY);
+        c.add_publisher(id, USER).unwrap();
+        vm.set_sender(USER);
+        assert!(matches!(
+            c.delete_schema(id),
+            Err(RegistryError::SchemaInUse(_))
+        ));
+    }
+
+    #[test]
+    fn test_delete_not_owner_fails() {
+        let (vm, mut c) = setup();
+        let id = register(&mut c);
+        vm.set_sender(OTHER);
+        assert!(matches!(
+            c.delete_schema(id),
+            Err(RegistryError::NotOwner(_))
+        ));
     }
 
     #[test]
     fn test_add_publisher_requires_ds_registry() {
-        let (_, mut contract) = setup();
-        let id = register(&mut contract);
-        // USER is not the DS registry — must fail
-        assert!(contract.add_publisher(id, OTHER).is_err());
+        let (_, mut c) = setup();
+        let id = register(&mut c);
+        assert!(matches!(
+            c.add_publisher(id, OTHER),
+            Err(RegistryError::NotDataSourceRegistry(_))
+        ));
     }
 
     #[test]
-    fn test_add_publisher_succeeds_from_ds_registry() {
-        let (vm, mut contract) = setup();
-        let id = register(&mut contract);
+    fn test_add_publisher_succeeds() {
+        let (vm, mut c) = setup();
+        let id = register(&mut c);
         vm.set_sender(DS_REGISTRY);
-        contract.add_publisher(id, USER).unwrap();
-        let publishers = contract.get_publishers(id);
-        assert_eq!(publishers.len(), 1);
-        assert_eq!(publishers[0], USER);
+        c.set_data_source_registry(DS_REGISTRY);
+        c.add_publisher(id, USER).unwrap();
+        assert!(c.is_publisher(id, USER));
+        assert_eq!(c.get_publisher_count(id), U256::from(1u8));
     }
 
     #[test]
-    fn test_add_publisher_deduplicates() {
-        let (vm, mut contract) = setup();
-        let id = register(&mut contract);
+    fn test_add_publisher_idempotent() {
+        let (vm, mut c) = setup();
+        let id = register(&mut c);
         vm.set_sender(DS_REGISTRY);
-        contract.add_publisher(id, USER).unwrap();
-        contract.add_publisher(id, USER).unwrap();
-        assert_eq!(contract.get_publishers(id).len(), 1);
+        c.set_data_source_registry(DS_REGISTRY);
+        c.add_publisher(id, USER).unwrap();
+        c.add_publisher(id, USER).unwrap();
+        assert_eq!(c.get_publisher_count(id), U256::from(1u8));
     }
 
     #[test]
     fn test_add_multiple_publishers() {
-        let (vm, mut contract) = setup();
-        let id = register(&mut contract);
+        let (vm, mut c) = setup();
+        let id = register(&mut c);
         vm.set_sender(DS_REGISTRY);
-        contract.add_publisher(id, USER).unwrap();
-        contract.add_publisher(id, OTHER).unwrap();
-        let publishers = contract.get_publishers(id);
-        assert_eq!(publishers.len(), 2);
-        assert!(publishers.contains(&USER));
-        assert!(publishers.contains(&OTHER));
+        c.set_data_source_registry(DS_REGISTRY);
+        c.add_publisher(id, USER).unwrap();
+        c.add_publisher(id, OTHER).unwrap();
+        assert_eq!(c.get_publisher_count(id), U256::from(2u8));
+        assert!(c.is_publisher(id, USER));
+        assert!(c.is_publisher(id, OTHER));
     }
 
     #[test]
-    fn test_get_publishers_empty() {
-        let (_, mut contract) = setup();
-        let id = register(&mut contract);
-        assert!(contract.get_publishers(id).is_empty());
+    fn test_has_publishers() {
+        let (vm, mut c) = setup();
+        let id = register(&mut c);
+        assert!(!c.has_publishers(id));
+        vm.set_sender(DS_REGISTRY);
+        c.set_data_source_registry(DS_REGISTRY);
+        c.add_publisher(id, USER).unwrap();
+        assert!(c.has_publishers(id));
     }
 
     #[test]
-    fn test_address_roundtrip() {
-        let hex = address_to_hex(USER);
-        assert!(hex.starts_with("0x"));
-        assert_eq!(hex.len(), 42);
-        assert_eq!(hex_to_address(&hex).unwrap(), USER);
+    fn test_schema_id_deterministic() {
+        let (_, c) = setup();
+        assert_eq!(c.schema_id("foo".into()), c.schema_id("foo".into()));
+        assert_ne!(c.schema_id("foo".into()), c.schema_id("bar".into()));
     }
 }

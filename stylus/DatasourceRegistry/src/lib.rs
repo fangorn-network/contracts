@@ -5,7 +5,7 @@ extern crate alloc;
 
 use alloy_sol_types::sol;
 use stylus_sdk::{
-    alloy_primitives::{Address, FixedBytes, U256, U64, keccak256},
+    alloy_primitives::{keccak256, Address, FixedBytes, U256, U64},
     call::RawCall,
     prelude::*,
     storage::*,
@@ -15,13 +15,15 @@ sol! {
     event ManifestPublished(
         address indexed owner,
         bytes32 indexed schema_id,
-        string manifest_cid,
-        uint64 version
+        bytes32 indexed name_hash,
+        string name,
+        string manifest_cid
     );
 
     event ManifestUpdated(
         address indexed owner,
         bytes32 indexed schema_id,
+        bytes32 indexed name_hash,
         string manifest_cid,
         uint64 version
     );
@@ -29,6 +31,7 @@ sol! {
     error DataSourceNotFound();
     error SchemaNotFound();
     error SchemaRequired();
+    error NameRequired();
     error ResourceSetupFailed();
 }
 
@@ -37,31 +40,25 @@ pub enum DataSourceRegistryError {
     DataSourceNotFound(DataSourceNotFound),
     SchemaNotFound(SchemaNotFound),
     SchemaRequired(SchemaRequired),
+    NameRequired(NameRequired),
     ResourceSetupFailed(ResourceSetupFailed),
 }
-
-// ── Selectors (hardcoded to avoid runtime keccak in every builder) ────────────
-//
-// schemaExists(bytes32)                    keccak256 => 0x ???
-// createResource(bytes32,uint256)          keccak256 => computed below
-// addSeedMember(bytes32)                   keccak256 => computed below
-// updatePrice(bytes32,uint256)             keccak256 => computed below
-//
-// These are verified in the selector tests below.
 
 #[storage]
 pub struct StorageDataSource {
     pub manifest_cid: StorageString,
+    pub name: StorageString,
     pub version: StorageU64,
 }
 
 #[storage]
 #[entrypoint]
 pub struct DataSourceRegistry {
-    /// owner => schema_id => DataSource
-    data_sources: StorageMap<Address, StorageMap<FixedBytes<32>, StorageDataSource>>,
-    /// owner => schema_id => comma-separated tags  e.g. "track-1,track-2"
-    data_source_tags: StorageMap<Address, StorageMap<FixedBytes<32>, StorageString>>,
+    /// owner => schema_id => name_hash => DataSource
+    data_sources: StorageMap<
+        Address,
+        StorageMap<FixedBytes<32>, StorageMap<FixedBytes<32>, StorageDataSource>>,
+    >,
     schema_registry: StorageAddress,
     settlement_registry: StorageAddress,
 }
@@ -69,28 +66,20 @@ pub struct DataSourceRegistry {
 #[public]
 impl DataSourceRegistry {
     #[constructor]
-    pub fn initialize(
-        &mut self,
-        schema_registry: Address,
-        settlement_registry: Address,
-    ) {
+    pub fn initialize(&mut self, schema_registry: Address, settlement_registry: Address) {
         self.schema_registry.set(schema_registry);
         self.settlement_registry.set(settlement_registry);
     }
 
-    /// Publish or update a manifest.
+    /// Publish or update a named data source entry.
     ///
-    /// For each tag:
-    ///   - If the resource does not exist: createResource + addSeedMember
-    ///   - If it already exists:           updatePrice
-    ///
-    /// Tags are appended to the on-chain index (no duplicates).
-    /// Emits ManifestPublished on first publish, ManifestUpdated on subsequent.
+    /// On first publish: createResource + addSeedMember in the settlement registry.
+    /// On update:        updatePrice only. The resource_id (and Semaphore group) is stable.
     pub fn publish(
         &mut self,
         manifest_cid: String,
         schema_id: FixedBytes<32>,
-        tags: String,  // comma-separated, pre-packed by caller
+        name: String,
         price: U256,
     ) -> Result<(), DataSourceRegistryError> {
         let sender = self.vm().msg_sender();
@@ -98,90 +87,78 @@ impl DataSourceRegistry {
         if schema_id == FixedBytes::ZERO {
             return Err(DataSourceRegistryError::SchemaRequired(SchemaRequired {}));
         }
+        if name.is_empty() {
+            return Err(DataSourceRegistryError::NameRequired(NameRequired {}));
+        }
 
         // Validate schema exists
         let registry = self.schema_registry.get();
-        let exists = unsafe {
-            RawCall::new(self.vm()).call(registry, &sel_schema_exists(schema_id))
-        }
-        .map(|r| r.last().copied().unwrap_or(0) != 0)
-        .unwrap_or(false);
+        let schema_exists =
+            unsafe { RawCall::new(self.vm()).call(registry, &sel_schema_exists(schema_id)) }
+                .map(|r| r.get(31).copied().unwrap_or(0) != 0) // ABI-encoded bool: byte 31 of 32
+                .unwrap_or(false);
 
-        if !exists {
+        if !schema_exists {
             return Err(DataSourceRegistryError::SchemaNotFound(SchemaNotFound {}));
         }
 
+        let name_hash: FixedBytes<32> = keccak256(name.as_bytes());
+        let resource_id = derive_resource_id(sender, schema_id, name_hash);
         let settlement = self.settlement_registry.get();
 
-        // Process each tag: create resource + seed, or update price if exists
-        for tag in tags.split(',').filter(|t| !t.is_empty()) {
-            let resource_id = derive_resource_id(sender, schema_id, tag);
+        // Read current version to determine first publish vs update
+        let current_version = {
+            let binding = self.data_sources.getter(sender);
+            let schema_binding = binding.getter(schema_id);
+            schema_binding.getter(name_hash).version.get()
+        };
 
-            // if the (owner / schema / tag) combo is fresh, create a new resource
-            // otherwise we just need to update the price in the settlement registry
-            let newly_created = unsafe {
-                RawCall::new(self.vm()).call(settlement, &sel_create_resource(resource_id, price))
+        if current_version == U64::ZERO {
+            unsafe {
+                RawCall::new(self.vm())
+                    .call(settlement, &sel_create_resource(resource_id, price, sender))
             }
-            .is_ok();
-
-            if newly_created {
-                unsafe {
-                    RawCall::new(self.vm())
-                        .call(settlement, &sel_add_seed_member(resource_id))
-                }
-                .map_err(|_| {
-                    DataSourceRegistryError::ResourceSetupFailed(ResourceSetupFailed {})
-                })?;
-            } else {
-                unsafe {
-                    RawCall::new(self.vm())
-                        .call(settlement, &sel_update_price(resource_id, price))
-                }
-                .map_err(|_| {
-                    DataSourceRegistryError::ResourceSetupFailed(ResourceSetupFailed {})
-                })?;
+            .map_err(|_| DataSourceRegistryError::ResourceSetupFailed(ResourceSetupFailed {}))?;
+            // notify the schema registry that this publisher has data against the schema
+            unsafe {
+                RawCall::new(self.vm()).call(registry, &sel_add_publisher(schema_id, sender))
             }
-        }
-
-        // Append packed tags to the index (dedup is handled client-side)
-        {
-            let existing_raw = {
-                let owner_getter = self.data_source_tags.getter(sender);
-                owner_getter.getter(schema_id).get_string()
-            };
-
-            let new_raw = if existing_raw.is_empty() {
-                tags.clone()
-            } else {
-                alloc::format!("{},{}", existing_raw, tags)
-            };
-
-            self.data_source_tags
-                .setter(sender)
-                .setter(schema_id)
-                .set_str(&new_raw);
+            .map_err(|_| DataSourceRegistryError::ResourceSetupFailed(ResourceSetupFailed {}))?;
+        } else {
+            // Update: price may change, group stays stable
+            unsafe {
+                RawCall::new(self.vm()).call(settlement, &sel_update_price(resource_id, price, sender))
+            }
+            .map_err(|_| DataSourceRegistryError::ResourceSetupFailed(ResourceSetupFailed {}))?;
         }
 
         let new_version = {
             let mut owner_binding = self.data_sources.setter(sender);
-            let mut ds = owner_binding.setter(schema_id);
+            let mut schema_binding = owner_binding.setter(schema_id);
+            let mut ds = schema_binding.setter(name_hash);
             let v = ds.version.get() + U64::from(1);
             ds.version.set(v);
             ds.manifest_cid.set_str(&manifest_cid);
+            if v == U64::from(1) {
+                // only written once; name is immutable after first publish
+                ds.name.set_str(&name);
+            }
             v
         };
 
-        if new_version != U64::from(1) {
-            self.vm().log(ManifestUpdated {
-                owner: sender,
-                schema_id,
-                manifest_cid,
-                version: new_version.to::<u64>(),
-            });
-        } else {
+        if new_version == U64::from(1) {
             self.vm().log(ManifestPublished {
                 owner: sender,
                 schema_id,
+                name_hash,
+                name,
+                manifest_cid,
+            });
+        } else {
+            self.vm().log(ManifestUpdated {
+                owner: sender,
+                schema_id,
+                name_hash,
                 manifest_cid,
                 version: new_version.to::<u64>(),
             });
@@ -190,14 +167,16 @@ impl DataSourceRegistry {
         Ok(())
     }
 
-    /// Get the manifest CID for a given (owner, schema_id) pair.
     pub fn get(
         &self,
         owner: Address,
         schema_id: FixedBytes<32>,
+        name: String,
     ) -> Result<String, DataSourceRegistryError> {
+        let name_hash: FixedBytes<32> = keccak256(name.as_bytes());
         let binding = self.data_sources.getter(owner);
-        let ds = binding.getter(schema_id);
+        let schema_binding = binding.getter(schema_id);
+        let ds = schema_binding.getter(name_hash);
         if ds.version.get() == U64::ZERO {
             return Err(DataSourceRegistryError::DataSourceNotFound(
                 DataSourceNotFound {},
@@ -206,42 +185,100 @@ impl DataSourceRegistry {
         Ok(ds.manifest_cid.get_string())
     }
 
-    pub fn get_version(&self, owner: Address, schema_id: FixedBytes<32>) -> u64 {
+    pub fn get_by_hash(
+        &self,
+        owner: Address,
+        schema_id: FixedBytes<32>,
+        name_hash: FixedBytes<32>,
+    ) -> Result<String, DataSourceRegistryError> {
+        let binding = self.data_sources.getter(owner);
+        let schema_binding = binding.getter(schema_id);
+        let ds = schema_binding.getter(name_hash);
+        if ds.version.get() == U64::ZERO {
+            return Err(DataSourceRegistryError::DataSourceNotFound(
+                DataSourceNotFound {},
+            ));
+        }
+        Ok(ds.manifest_cid.get_string())
+    }
+
+    pub fn get_version(&self, owner: Address, schema_id: FixedBytes<32>, name: String) -> u64 {
+        let name_hash: FixedBytes<32> = keccak256(name.as_bytes());
         self.data_sources
             .getter(owner)
             .getter(schema_id)
+            .getter(name_hash)
             .version
             .get()
             .to::<u64>()
     }
 
-    /// Return the raw comma-separated tag string for a given (owner, schema_id).
-    /// Callers split on ',' client-side. Avoids Vec<String> ABI encode overhead.
-    pub fn get_tags_raw(&self, owner: Address, schema_id: FixedBytes<32>) -> String {
-        let binding = self.data_source_tags.getter(owner);
-        binding.getter(schema_id).get_string()
+    pub fn get_name(
+        &self,
+        owner: Address,
+        schema_id: FixedBytes<32>,
+        name_hash: FixedBytes<32>,
+    ) -> String {
+        self.data_sources
+            .getter(owner)
+            .getter(schema_id)
+            .getter(name_hash)
+            .name
+            .get_string()
+    }
+
+    /// Derive the resource_id (= Semaphore group id) for a given (owner, schema, name).
+    /// Exposed so the SDK can compute it client-side without a contract call.
+    pub fn resource_id(
+        &self,
+        owner: Address,
+        schema_id: FixedBytes<32>,
+        name: String,
+    ) -> FixedBytes<32> {
+        let name_hash: FixedBytes<32> = keccak256(name.as_bytes());
+        derive_resource_id(owner, schema_id, name_hash)
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn derive_resource_id(owner: Address, schema_id: FixedBytes<32>, tag: &str) -> FixedBytes<32> {
-    let mut data = alloc::vec::Vec::new();
+fn derive_resource_id(
+    owner: Address,
+    schema_id: FixedBytes<32>,
+    name_hash: FixedBytes<32>,
+) -> FixedBytes<32> {
+    let mut data = alloc::vec::Vec::with_capacity(20 + 32 + 32);
     data.extend_from_slice(owner.as_slice());
     data.extend_from_slice(schema_id.as_slice());
-    data.extend_from_slice(tag.as_bytes());
+    data.extend_from_slice(name_hash.as_slice());
     keccak256(&data)
 }
 
-// ── Calldata builders ─────────────────────────────────────────────────────────
-//
-// Selectors are hardcoded to eliminate runtime keccak256 and reduce binary size.
-// Verified by selector tests below. If you change a function signature, update
-// both the constant and the test.
-const SEL_SCHEMA_EXISTS:    [u8; 4] = [0xc0, 0xef, 0x02, 0xe6]; // schemaExists(bytes32)
-const SEL_CREATE_RESOURCE:  [u8; 4] = [0xcc, 0x35, 0x31, 0x31]; // createResource(bytes32,uint256)
-const SEL_ADD_SEED_MEMBER:  [u8; 4] = [0x7d, 0x80, 0xf8, 0x0e]; // addSeedMember(bytes32)
-const SEL_UPDATE_PRICE:     [u8; 4] = [0x5f, 0x70, 0x4f, 0x3e]; // updatePrice(bytes32,uint256)
+// Calldata builders
+
+const SEL_SCHEMA_EXISTS: [u8; 4] = [0xc0, 0xef, 0x02, 0xe6]; // schemaExists(bytes32)
+const SEL_ADD_PUBLISHER: [u8; 4] = [0xc6, 0xf1, 0x7a, 0xde]; // addPublisher(bytes32,address)
+const SEL_CREATE_RESOURCE: [u8; 4] = [0xe8, 0x60, 0xd4, 0xc8]; // createResource(bytes32,uint256,address)
+const SEL_UPDATE_PRICE: [u8; 4] = [0xc9, 0x7c, 0x8b, 0x06]; // updatePrice(bytes32,uint256,address)
+
+fn sel_create_resource(
+    resource_id: FixedBytes<32>,
+    price: U256,
+    owner: Address,
+) -> alloc::vec::Vec<u8> {
+    let mut cd = SEL_CREATE_RESOURCE.to_vec();
+    cd.extend_from_slice(resource_id.as_slice());
+    cd.extend_from_slice(&price.to_be_bytes::<32>());
+    cd.extend_from_slice(&[0u8; 12]);
+    cd.extend_from_slice(owner.as_slice());
+    cd
+}
+
+fn sel_add_publisher(schema_id: FixedBytes<32>, publisher: Address) -> alloc::vec::Vec<u8> {
+    let mut cd = SEL_ADD_PUBLISHER.to_vec();
+    cd.extend_from_slice(schema_id.as_slice());
+    cd.extend_from_slice(&[0u8; 12]);
+    cd.extend_from_slice(publisher.as_slice());
+    cd
+}
 
 fn sel_schema_exists(id: FixedBytes<32>) -> alloc::vec::Vec<u8> {
     let mut cd = SEL_SCHEMA_EXISTS.to_vec();
@@ -249,25 +286,16 @@ fn sel_schema_exists(id: FixedBytes<32>) -> alloc::vec::Vec<u8> {
     cd
 }
 
-fn sel_create_resource(resource_id: FixedBytes<32>, price: U256) -> alloc::vec::Vec<u8> {
-    let mut cd = SEL_CREATE_RESOURCE.to_vec();
-    cd.extend_from_slice(resource_id.as_slice());
-    cd.extend_from_slice(&price.to_be_bytes::<32>());
-    cd
-}
-
-fn sel_add_seed_member(resource_id: FixedBytes<32>) -> alloc::vec::Vec<u8> {
-    let mut cd = SEL_ADD_SEED_MEMBER.to_vec();
-    cd.extend_from_slice(resource_id.as_slice());
-    cd
-}
-
-fn sel_update_price(resource_id: FixedBytes<32>, price: U256) -> alloc::vec::Vec<u8> {
+fn sel_update_price(resource_id: FixedBytes<32>, price: U256, owner: Address) -> alloc::vec::Vec<u8> {
     let mut cd = SEL_UPDATE_PRICE.to_vec();
     cd.extend_from_slice(resource_id.as_slice());
     cd.extend_from_slice(&price.to_be_bytes::<32>());
+    cd.extend_from_slice(&[0u8; 12]);
+    cd.extend_from_slice(owner.as_slice());
     cd
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod test {
@@ -291,42 +319,73 @@ mod test {
     #[test]
     fn test_schema_required() {
         let (_, mut c) = setup();
-        assert!(c.publish("cid".into(), FixedBytes::ZERO, "".into(), U256::ZERO).is_err());
+        assert!(c
+            .publish("cid".into(), FixedBytes::ZERO, "track-1".into(), U256::ZERO)
+            .is_err());
+    }
+
+    #[test]
+    fn test_name_required() {
+        let (_, mut c) = setup();
+        assert!(c
+            .publish("cid".into(), SCHEMA_A, "".into(), U256::ZERO)
+            .is_err());
     }
 
     #[test]
     fn test_unknown_schema_fails() {
         let (_, mut c) = setup();
-        assert!(c.publish("cid".into(), SCHEMA_A, "t".into(), U256::ZERO).is_err());
+        assert!(c
+            .publish("cid".into(), SCHEMA_A, "track-1".into(), U256::ZERO)
+            .is_err());
     }
 
     #[test]
     fn test_no_manifest_before_publish() {
         let (_, c) = setup();
-        assert!(c.get(USER, SCHEMA_A).is_err());
+        assert!(c.get(USER, SCHEMA_A, "track-1".into()).is_err());
     }
 
     #[test]
     fn test_version_starts_at_zero() {
         let (_, c) = setup();
-        assert_eq!(c.get_version(USER, SCHEMA_A), 0);
-    }
-
-    #[test]
-    fn test_get_tags_empty() {
-        let (_, c) = setup();
-        assert!(c.get_tags_raw(USER, SCHEMA_A).is_empty());
+        assert_eq!(c.get_version(USER, SCHEMA_A, "track-1".into()), 0);
     }
 
     #[test]
     fn test_independent_schemas() {
         let (_, c) = setup();
-        assert_eq!(c.get_version(USER, SCHEMA_A), 0);
-        assert_eq!(c.get_version(USER, SCHEMA_B), 0);
+        assert_eq!(c.get_version(USER, SCHEMA_A, "track-1".into()), 0);
+        assert_eq!(c.get_version(USER, SCHEMA_B, "track-1".into()), 0);
     }
 
-    // Selector sanity checks — verify hardcoded bytes match the function signatures.
-    // If a signature changes, the keccak here will catch the drift.
+    #[test]
+    fn test_resource_id_stable_across_names() {
+        let (_, c) = setup();
+        let r1 = c.resource_id(USER, SCHEMA_A, "track-1".into());
+        let r2 = c.resource_id(USER, SCHEMA_A, "track-1".into());
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_resource_id_unique_per_name() {
+        let (_, c) = setup();
+        assert_ne!(
+            c.resource_id(USER, SCHEMA_A, "track-1".into()),
+            c.resource_id(USER, SCHEMA_A, "track-2".into()),
+        );
+    }
+
+    #[test]
+    fn test_resource_id_unique_per_schema() {
+        let (_, c) = setup();
+        assert_ne!(
+            c.resource_id(USER, SCHEMA_A, "track-1".into()),
+            c.resource_id(USER, SCHEMA_B, "track-1".into()),
+        );
+    }
+
+    // Selector sanity checks
     #[test]
     fn test_sel_schema_exists() {
         assert_eq!(SEL_SCHEMA_EXISTS, keccak256(b"schemaExists(bytes32)")[..4]);
@@ -334,42 +393,25 @@ mod test {
 
     #[test]
     fn test_sel_create_resource() {
-        assert_eq!(SEL_CREATE_RESOURCE, keccak256(b"createResource(bytes32,uint256)")[..4]);
-        assert_eq!(sel_create_resource(FixedBytes::ZERO, U256::ZERO).len(), 4 + 32 + 32);
-    }
-
-    #[test]
-    fn test_sel_add_seed_member() {
-        assert_eq!(SEL_ADD_SEED_MEMBER, keccak256(b"addSeedMember(bytes32)")[..4]);
-        assert_eq!(sel_add_seed_member(FixedBytes::ZERO).len(), 4 + 32);
-    }
-
-    #[test]
-    fn test_sel_update_price() {
-        assert_eq!(SEL_UPDATE_PRICE, keccak256(b"updatePrice(bytes32,uint256)")[..4]);
-        assert_eq!(sel_update_price(FixedBytes::ZERO, U256::ZERO).len(), 4 + 32 + 32);
-    }
-
-    #[test]
-    fn test_derive_resource_id_deterministic() {
-        let r1 = derive_resource_id(USER, SCHEMA_A, "track-1");
-        let r2 = derive_resource_id(USER, SCHEMA_A, "track-1");
-        assert_eq!(r1, r2);
-    }
-
-    #[test]
-    fn test_derive_resource_id_unique_per_tag() {
-        assert_ne!(
-            derive_resource_id(USER, SCHEMA_A, "track-1"),
-            derive_resource_id(USER, SCHEMA_A, "track-2"),
+        assert_eq!(
+            SEL_CREATE_RESOURCE,
+            keccak256(b"createResource(bytes32,uint256,address)")[..4]
         );
     }
 
     #[test]
-    fn test_derive_resource_id_unique_per_schema() {
-        assert_ne!(
-            derive_resource_id(USER, SCHEMA_A, "track-1"),
-            derive_resource_id(USER, SCHEMA_B, "track-1"),
+    fn test_sel_update_price() {
+        assert_eq!(
+            SEL_UPDATE_PRICE,
+            keccak256(b"updatePrice(bytes32,uint256,address)")[..4]
+        );
+    }
+
+    #[test]
+    fn test_sel_add_publisher() {
+        assert_eq!(
+            SEL_ADD_PUBLISHER,
+            keccak256(b"addPublisher(bytes32,address)")[..4]
         );
     }
 }

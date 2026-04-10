@@ -1,8 +1,8 @@
 [package]
-name = "SettlementRegistryV2"
-version = "0.1.0"
+name = "SettlementRegistry"
+version = "0.0.1"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 keywords = ["arbitrum", "ethereum", "fangorn", "stylus", "alloy"]
 
 [dependencies]
