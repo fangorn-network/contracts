@@ -4,6 +4,8 @@ This is a basic description of the core contracts and interactions between them.
 
 ## Contracts Overview
 
+![alt text](image.png)
+
 ### Schema Registry
 
 ### Settlement Registry
