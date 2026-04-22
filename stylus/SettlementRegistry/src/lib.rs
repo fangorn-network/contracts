@@ -3,7 +3,7 @@ extern crate alloc;
 
 use alloy_sol_types::sol;
 use stylus_sdk::{
-    alloy_primitives::{Address, FixedBytes, U256, keccak256},
+    alloy_primitives::{keccak256, Address, FixedBytes, U256},
     call::RawCall,
     prelude::*,
     storage::*,
@@ -36,17 +36,17 @@ pub enum SettlementError {
 }
 
 // Error code constants
-const E_ALREADY_REGISTERED:      u8 = 1;
-const E_ALREADY_SETTLED:         u8 = 2;
-const E_INCORRECT_PAYMENT:       u8 = 3;
-const E_TRANSFER_FAILED:         u8 = 4;
-const E_VERIFICATION_FAILED:     u8 = 5;
-const E_NOT_RESOURCE_OWNER:      u8 = 6;
-const E_NOT_ADMIN:               u8 = 7;
+const E_ALREADY_REGISTERED: u8 = 1;
+const E_ALREADY_SETTLED: u8 = 2;
+const E_INCORRECT_PAYMENT: u8 = 3;
+const E_TRANSFER_FAILED: u8 = 4;
+const E_VERIFICATION_FAILED: u8 = 5;
+const E_NOT_RESOURCE_OWNER: u8 = 6;
+const E_NOT_ADMIN: u8 = 7;
 const E_NOT_AUTHORIZED_REGISTRY: u8 = 8;
-const E_RESOURCE_NOT_FOUND:      u8 = 9;
-const E_HOOK_FAILED:             u8 = 10;
-const E_GROUP_CREATION_FAILED:   u8 = 11;
+const E_RESOURCE_NOT_FOUND: u8 = 9;
+const E_HOOK_FAILED: u8 = 10;
+const E_GROUP_CREATION_FAILED: u8 = 11;
 
 #[inline(never)]
 fn err(code: u8) -> SettlementError {
@@ -60,31 +60,31 @@ const BN254_FIELD_MOD: U256 = U256::from_limbs([
     0x30644e72e131a029,
 ]);
 
-const SEL_CREATE_GROUP:   [u8; 4] = [0x5c, 0x3f, 0x3b, 0x60];
-const SEL_ADD_MEMBER:     [u8; 4] = [0x17, 0x83, 0xef, 0xc3];
+const SEL_CREATE_GROUP: [u8; 4] = [0x5c, 0x3f, 0x3b, 0x60];
+const SEL_ADD_MEMBER: [u8; 4] = [0x17, 0x83, 0xef, 0xc3];
 const SEL_VALIDATE_PROOF: [u8; 4] = [0xd0, 0xd8, 0x98, 0xdd];
-const SEL_TRANSFER_AUTH:  [u8; 4] = [0xe3, 0xee, 0x16, 0x0e];
-const SEL_AFTER_SETTLE:   [u8; 4] = [0x71, 0xe5, 0xea, 0xc2];
+const SEL_TRANSFER_AUTH: [u8; 4] = [0xe3, 0xee, 0x16, 0x0e];
+const SEL_AFTER_SETTLE: [u8; 4] = [0x71, 0xe5, 0xea, 0xc2];
 
 #[storage]
 pub struct Resource {
     group_id: StorageU256,
-    price:    StorageU256,
-    owner:    StorageAddress,
-    hook:     StorageAddress,
+    price: StorageU256,
+    owner: StorageAddress,
+    hook: StorageAddress,
 }
 
 #[storage]
 #[entrypoint]
 pub struct SettlementRegistry {
-    admin:                 StorageAddress,
-    usdc_address:          StorageAddress,
-    semaphore_address:     StorageAddress,
+    admin: StorageAddress,
+    usdc_address: StorageAddress,
+    semaphore_address: StorageAddress,
     authorized_registries: StorageMap<Address, StorageBool>,
-    resources:             StorageMap<FixedBytes<32>, Resource>,
-    nullifiers:            StorageMap<U256, StorageBool>,
-    settlements:           StorageMap<Address, StorageMap<FixedBytes<32>, StorageBool>>,
-    registrations:         StorageMap<FixedBytes<32>, StorageMap<U256, StorageBool>>,
+    resources: StorageMap<FixedBytes<32>, Resource>,
+    nullifiers: StorageMap<U256, StorageBool>,
+    settlements: StorageMap<Address, StorageMap<FixedBytes<32>, StorageBool>>,
+    registrations: StorageMap<FixedBytes<32>, StorageMap<U256, StorageBool>>,
 }
 
 #[public]
@@ -96,7 +96,11 @@ impl SettlementRegistry {
         self.semaphore_address.set(semaphore_address);
     }
 
-    pub fn set_registry(&mut self, registry: Address, authorized: bool) -> Result<(), SettlementError> {
+    pub fn set_registry(
+        &mut self,
+        registry: Address,
+        authorized: bool,
+    ) -> Result<(), SettlementError> {
         if self.vm().msg_sender() != self.admin.get() {
             return Err(err(E_NOT_ADMIN));
         }
@@ -131,12 +135,24 @@ impl SettlementRegistry {
 
         let seed = U256::from_be_bytes(*keccak256(resource_id.as_slice())) % BN254_FIELD_MOD;
         unsafe {
-            RawCall::new(self.vm()).call(self.semaphore_address.get(), &sel_add_member(group_id, seed))
+            RawCall::new(self.vm()).call(
+                self.semaphore_address.get(),
+                &sel_add_member(group_id, seed),
+            )
         }
         .map_err(|_| err(E_GROUP_CREATION_FAILED))?;
 
-        self.vm().log(MemberRegistered { resourceId: resource_id, groupId: group_id, identityCommitment: seed });
-        self.vm().log(ResourceCreated { resourceId: resource_id, groupId: group_id, owner, price });
+        self.vm().log(MemberRegistered {
+            resourceId: resource_id,
+            groupId: group_id,
+            identityCommitment: seed,
+        });
+        self.vm().log(ResourceCreated {
+            resourceId: resource_id,
+            groupId: group_id,
+            owner,
+            price,
+        });
         Ok(group_id)
     }
 
@@ -156,24 +172,27 @@ impl SettlementRegistry {
         }
         r.hook.set(hook);
         drop(r);
-        self.vm().log(HookRegistered { resourceId: resource_id, hook });
+        self.vm().log(HookRegistered {
+            resourceId: resource_id,
+            hook,
+        });
         Ok(())
     }
 
     #[payable]
     pub fn register(
         &mut self,
-        resource_id:         FixedBytes<32>,
+        resource_id: FixedBytes<32>,
         identity_commitment: U256,
-        from:                Address,
-        to:                  Address,
-        amount:              U256,
-        valid_after:         U256,
-        valid_before:        U256,
-        nonce:               FixedBytes<32>,
-        v:                   u8,
-        r:                   FixedBytes<32>,
-        s:                   FixedBytes<32>,
+        from: Address,
+        to: Address,
+        amount: U256,
+        valid_after: U256,
+        valid_before: U256,
+        nonce: FixedBytes<32>,
+        v: u8,
+        r: FixedBytes<32>,
+        s: FixedBytes<32>,
     ) -> Result<(), SettlementError> {
         let (owner, price, group_id) = {
             let res = self.resources.getter(resource_id);
@@ -182,7 +201,11 @@ impl SettlementRegistry {
         if owner == Address::ZERO {
             return Err(err(E_RESOURCE_NOT_FOUND));
         }
-        if self.registrations.getter(resource_id).get(identity_commitment) {
+        if self
+            .registrations
+            .getter(resource_id)
+            .get(identity_commitment)
+        {
             return Err(err(E_ALREADY_REGISTERED));
         }
         if amount != price {
@@ -198,11 +221,17 @@ impl SettlementRegistry {
         .map_err(|_| err(E_TRANSFER_FAILED))?;
 
         unsafe {
-            RawCall::new(self.vm()).call(self.semaphore_address.get(), &sel_add_member(group_id, identity_commitment))
+            RawCall::new(self.vm()).call(
+                self.semaphore_address.get(),
+                &sel_add_member(group_id, identity_commitment),
+            )
         }
         .map_err(|_| err(E_GROUP_CREATION_FAILED))?;
 
-        self.registrations.setter(resource_id).setter(identity_commitment).set(true);
+        self.registrations
+            .setter(resource_id)
+            .setter(identity_commitment)
+            .set(true);
         self.vm().log(MemberRegistered {
             resourceId: resource_id,
             groupId: group_id,
@@ -213,14 +242,14 @@ impl SettlementRegistry {
 
     pub fn settle(
         &mut self,
-        resource_id:       FixedBytes<32>,
-        stealth_address:   Address,
+        resource_id: FixedBytes<32>,
+        stealth_address: Address,
         merkle_tree_depth: U256,
-        merkle_tree_root:  U256,
-        nullifier:         U256,
-        message:           U256,
-        points:            [U256; 8],
-        hook_data:         Vec<u8>,
+        merkle_tree_root: U256,
+        nullifier: U256,
+        message: U256,
+        points: [U256; 8],
+        hook_data: Vec<u8>,
     ) -> Result<(), SettlementError> {
         let (owner, group_id, hook_addr) = {
             let r = self.resources.getter(resource_id);
@@ -236,18 +265,36 @@ impl SettlementRegistry {
         unsafe {
             RawCall::new(self.vm()).call(
                 self.semaphore_address.get(),
-                &sel_validate_proof(group_id, merkle_tree_depth, merkle_tree_root, nullifier, message, group_id, &points),
+                &sel_validate_proof(
+                    group_id,
+                    merkle_tree_depth,
+                    merkle_tree_root,
+                    nullifier,
+                    message,
+                    group_id,
+                    &points,
+                ),
             )
         }
         .map_err(|_| err(E_VERIFICATION_FAILED))?;
 
         self.nullifiers.setter(nullifier).set(true);
-        self.settlements.setter(stealth_address).setter(resource_id).set(true);
-        self.vm().log(SettlementFinalized { resourceId: resource_id, nullifierHash: nullifier, message });
+        self.settlements
+            .setter(stealth_address)
+            .setter(resource_id)
+            .set(true);
+        self.vm().log(SettlementFinalized {
+            resourceId: resource_id,
+            nullifierHash: nullifier,
+            message,
+        });
 
         if hook_addr != Address::ZERO {
             unsafe {
-                RawCall::new(self.vm()).call(hook_addr, &sel_after_settle(resource_id, nullifier, message, &hook_data))
+                RawCall::new(self.vm()).call(
+                    hook_addr,
+                    &sel_after_settle(resource_id, nullifier, message, &hook_data),
+                )
             }
             .map_err(|_| err(E_HOOK_FAILED))?;
         }
@@ -259,7 +306,9 @@ impl SettlementRegistry {
     }
 
     pub fn is_registered(&self, resource_id: FixedBytes<32>, identity_commitment: U256) -> bool {
-        self.registrations.getter(resource_id).get(identity_commitment)
+        self.registrations
+            .getter(resource_id)
+            .get(identity_commitment)
     }
 
     /// Returns the Semaphore group id for a resource, or 0 if the resource doesn't exist.
@@ -267,6 +316,10 @@ impl SettlementRegistry {
     /// but adjust interpretation on caller side if treating 0 as sentinel).
     pub fn get_group_id(&self, resource_id: FixedBytes<32>) -> U256 {
         self.resources.getter(resource_id).group_id.get()
+    }
+
+    pub fn get_price(&self, resource_id: FixedBytes<32>) -> U256 {
+        self.resources.getter(resource_id).price.get()
     }
 }
 
@@ -298,8 +351,12 @@ fn sel_add_member(group_id: U256, commitment: U256) -> alloc::vec::Vec<u8> {
 
 #[inline(never)]
 fn sel_validate_proof(
-    group_id: U256, depth: U256, root: U256,
-    nullifier: U256, message: U256, scope: U256,
+    group_id: U256,
+    depth: U256,
+    root: U256,
+    nullifier: U256,
+    message: U256,
+    scope: U256,
     points: &[U256; 8],
 ) -> alloc::vec::Vec<u8> {
     let mut cd = SEL_VALIDATE_PROOF.to_vec();
@@ -317,9 +374,15 @@ fn sel_validate_proof(
 
 #[inline(never)]
 fn sel_transfer_auth(
-    from: Address, to: Address, value: U256,
-    valid_after: U256, valid_before: U256,
-    nonce: FixedBytes<32>, v: u8, r: FixedBytes<32>, s: FixedBytes<32>,
+    from: Address,
+    to: Address,
+    value: U256,
+    valid_after: U256,
+    valid_before: U256,
+    nonce: FixedBytes<32>,
+    v: u8,
+    r: FixedBytes<32>,
+    s: FixedBytes<32>,
 ) -> alloc::vec::Vec<u8> {
     let mut cd = SEL_TRANSFER_AUTH.to_vec();
     let mut addr = [0u8; 32];
@@ -341,7 +404,10 @@ fn sel_transfer_auth(
 
 #[inline(never)]
 fn sel_after_settle(
-    resource_id: FixedBytes<32>, nullifier_hash: U256, message: U256, hook_data: &[u8],
+    resource_id: FixedBytes<32>,
+    nullifier_hash: U256,
+    message: U256,
+    hook_data: &[u8],
 ) -> alloc::vec::Vec<u8> {
     let mut cd = SEL_AFTER_SETTLE.to_vec();
     cd.extend_from_slice(resource_id.as_slice());
@@ -360,7 +426,9 @@ fn sel_after_settle(
 
 #[inline(never)]
 fn decode_u256(ret: &[u8]) -> Option<U256> {
-    if ret.len() < 32 { return None; }
+    if ret.len() < 32 {
+        return None;
+    }
     Some(U256::from_be_slice(&ret[..32]))
 }
 
@@ -369,7 +437,9 @@ mod tests {
     use super::*;
     use stylus_sdk::alloy_primitives::{keccak256, FixedBytes, U256};
 
-    fn resource_id() -> FixedBytes<32> { keccak256(b"test-resource-v1") }
+    fn resource_id() -> FixedBytes<32> {
+        keccak256(b"test-resource-v1")
+    }
 
     #[test]
     fn test_seed_in_field() {
@@ -388,13 +458,19 @@ mod tests {
     #[test]
     fn test_sel_validate_proof() {
         let cd = sel_validate_proof(
-            U256::ZERO, U256::ZERO, U256::ZERO,
-            U256::ZERO, U256::ZERO, U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
             &[U256::ZERO; 8],
         );
         assert_eq!(
             &cd[..4],
-            &keccak256(b"validateProof(uint256,(uint256,uint256,uint256,uint256,uint256,uint256[8]))")[..4]
+            &keccak256(
+                b"validateProof(uint256,(uint256,uint256,uint256,uint256,uint256,uint256[8]))"
+            )[..4]
         );
         assert_eq!(cd.len(), 452);
     }
@@ -402,7 +478,11 @@ mod tests {
     #[test]
     fn test_after_settle_encoding() {
         let cd = sel_after_settle(resource_id(), U256::ZERO, U256::ZERO, &[]);
-        assert_eq!(U256::from_be_slice(&cd[100..132]), U256::from(0x80u64), "offset");
+        assert_eq!(
+            U256::from_be_slice(&cd[100..132]),
+            U256::from(0x80u64),
+            "offset"
+        );
         assert_eq!(U256::from_be_slice(&cd[132..164]), U256::ZERO, "length");
     }
 }
