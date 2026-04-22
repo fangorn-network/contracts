@@ -6,5 +6,5 @@ pub extern "C" fn main() {}
 
 #[cfg(feature = "export-abi")]
 fn main() {
-    SettlementRegistryV2::print_from_args();
+    SettlementRegistry::print_from_args();
 }

@@ -29,6 +29,6 @@ crate-type = ["lib", "cdylib"]
 [profile.release]
 codegen-units = 1
 strip = true
-lto = true
-panic = "abort"
+lto = "fat"
 opt-level = "z"
+panic = "abort"
