@@ -9,15 +9,6 @@ use stylus_sdk::{
     storage::*,
 };
 
-// ── Add to Cargo.toml ─────────────────────────────────────────────────────────
-// [profile.release]
-// codegen-units = 1
-// strip        = true
-// lto          = "fat"
-// opt-level    = "z"
-// panic        = "abort"
-// ──────────────────────────────────────────────────────────────────────────────
-
 sol! {
     error GroupCreationFailed();
     error AddMemberFailed();

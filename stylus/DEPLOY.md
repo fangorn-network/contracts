@@ -1,5 +1,6 @@
 # Contract Deployment Guide
 
+- semaphore adapter:
 - settlement: 0x1d21545f536a2f026348477960ca59f9f1d7fabd
 - schema: 0x267084865813550d9d97d3842c4a2d33a872908f
 - datasource: 0xe8a5906825680a5816a7f28f2a0fa2d9ceec3755

@@ -148,11 +148,7 @@ impl SettlementRegistry {
         }
         .map_err(|_| SettlementError::GroupCreationFailed(GroupCreationFailed {}))?;
 
-        self.vm().log(MemberRegistered {
-            resourceId: resource_id,
-            groupId: group_id,
-            identityCommitment: seed,
-        });
+
         self.vm().log(ResourceCreated {
             resourceId: resource_id,
             groupId: group_id,
@@ -162,31 +158,34 @@ impl SettlementRegistry {
         Ok(group_id)
     }
 
-    // pub fn update_resource(
-    //     &mut self,
-    //     resource_id: FixedBytes<32>,
-    //     hook: Address,
-    //     price: U256,
-    // ) -> Result<(), SettlementError> {
-    //     let owner = self.resources.getter(resource_id).owner.get();
-    //     if owner == Address::ZERO {
-    //         return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
-    //     }
-    //     if self.vm().msg_sender() != owner {
-    //         return Err(SettlementError::NotResourceOwner(NotResourceOwner {}));
-    //     }
-    //     {
-    //         let mut r = self.resources.setter(resource_id);
-    //         r.hook.set(hook);
-    //         r.price.set(price);
-    //     }
-    //     self.vm().log(ResourceUpdated {
-    //         resourceId: resource_id,
-    //         hook,
-    //         price,
-    //     });
-    //     Ok(())
-    // }
+    // Update the hook and price associated with a resource id
+    // Only executable by the resource owner.
+    // 
+    pub fn update_resource(
+        &mut self,
+        resource_id: FixedBytes<32>,
+        hook: Address,
+        price: U256,
+    ) -> Result<(), SettlementError> {
+        let owner = self.resources.getter(resource_id).owner.get();
+        if owner == Address::ZERO {
+            return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
+        }
+        if self.vm().msg_sender() != owner {
+            return Err(SettlementError::NotResourceOwner(NotResourceOwner {}));
+        }
+        {
+            let mut r = self.resources.setter(resource_id);
+            r.hook.set(hook);
+            r.price.set(price);
+        }
+        self.vm().log(ResourceUpdated {
+            resourceId: resource_id,
+            hook,
+            price,
+        });
+        Ok(())
+    }
 
     #[payable]
     pub fn register(
