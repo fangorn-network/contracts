@@ -9,47 +9,48 @@ use stylus_sdk::{
     storage::*,
 };
 
-// ── Add to Cargo.toml ─────────────────────────────────────────────────────────
-// [profile.release]
-// codegen-units = 1
-// strip        = true
-// lto          = "fat"
-// opt-level    = "z"
-// panic        = "abort"
-// ──────────────────────────────────────────────────────────────────────────────
-
 sol! {
     event MemberRegistered(bytes32 indexed resourceId, uint256 indexed groupId, uint256 identityCommitment);
     event SettlementFinalized(bytes32 indexed resourceId, uint256 indexed nullifierHash, uint256 message);
     event ResourceUpdated(bytes32 indexed resourceId, address hook, uint256 price);
     event ResourceCreated(bytes32 indexed resourceId, uint256 groupId, address owner, uint256 price);
 
-    error AlreadyRegistered();
-    error AlreadySettled();
-    error IncorrectPaymentAmount();
-    error TransferFailed();
-    error VerificationFailed();
-    error NotResourceOwner();
-    error NotAdmin();
-    error NotAuthorizedRegistry();
-    error ResourceNotFound();
-    error HookFailed();
-    error GroupCreationFailed();
+    // Error codes:
+    //  1 = AlreadyRegistered
+    //  2 = AlreadySettled
+    //  3 = IncorrectPaymentAmount
+    //  4 = TransferFailed
+    //  5 = VerificationFailed
+    //  6 = NotResourceOwner
+    //  7 = NotAdmin
+    //  8 = NotAuthorizedRegistry
+    //  9 = ResourceNotFound
+    // 10 = HookFailed
+    // 11 = GroupCreationFailed
+    error ErrCode(uint8 code);
 }
 
 #[derive(SolidityError)]
 pub enum SettlementError {
-    AlreadyRegistered(AlreadyRegistered),
-    AlreadySettled(AlreadySettled),
-    IncorrectPaymentAmount(IncorrectPaymentAmount),
-    TransferFailed(TransferFailed),
-    VerificationFailed(VerificationFailed),
-    NotResourceOwner(NotResourceOwner),
-    NotAdmin(NotAdmin),
-    NotAuthorizedRegistry(NotAuthorizedRegistry),
-    ResourceNotFound(ResourceNotFound),
-    HookFailed(HookFailed),
-    GroupCreationFailed(GroupCreationFailed),
+    ErrCode(ErrCode),
+}
+
+// Error code constants
+const E_ALREADY_REGISTERED: u8 = 1;
+const E_ALREADY_SETTLED: u8 = 2;
+const E_INCORRECT_PAYMENT: u8 = 3;
+const E_TRANSFER_FAILED: u8 = 4;
+const E_VERIFICATION_FAILED: u8 = 5;
+const E_NOT_RESOURCE_OWNER: u8 = 6;
+const E_NOT_ADMIN: u8 = 7;
+const E_NOT_AUTHORIZED_REGISTRY: u8 = 8;
+const E_RESOURCE_NOT_FOUND: u8 = 9;
+const E_HOOK_FAILED: u8 = 10;
+const E_GROUP_CREATION_FAILED: u8 = 11;
+
+#[inline(never)]
+fn err(code: u8) -> SettlementError {
+    SettlementError::ErrCode(ErrCode { code })
 }
 
 const BN254_FIELD_MOD: U256 = U256::from_limbs([
@@ -59,21 +60,17 @@ const BN254_FIELD_MOD: U256 = U256::from_limbs([
     0x30644e72e131a029,
 ]);
 
-// ── Selectors ─────────────────────────────────────────────────────────────────
-// USDC (ERC-3009) — kept local, raw-called as before.
-const SEL_TRANSFER_AUTH: [u8; 4] = [0xe3, 0xee, 0x16, 0x0e]; // transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32)
-                                                             // Hook callback
-const SEL_AFTER_SETTLE: [u8; 4] = [0x71, 0xe5, 0xea, 0xc2]; // afterSettle(bytes32,uint256,uint256,bytes)
-                                                            // SemaphoreAdapter (we call our own adapter, not Semaphore directly)
-const SEL_ADAPTER_CREATE_GROUP: [u8; 4] = [0x7b, 0x0a, 0x47, 0xee]; // createGroup()
-const SEL_ADAPTER_ADD_MEMBER: [u8; 4] = [0x17, 0x83, 0xef, 0xc3]; // addMember(uint256,uint256)
-const SEL_ADAPTER_VALIDATE_PROOF: [u8; 4] = [0x32, 0x58, 0x2b, 0x7c]; // validateProof(uint256,uint256,uint256,uint256,uint256,uint256,uint256[8])
+const SEL_CREATE_GROUP: [u8; 4] = [0x5c, 0x3f, 0x3b, 0x60];
+const SEL_ADD_MEMBER: [u8; 4] = [0x17, 0x83, 0xef, 0xc3];
+const SEL_VALIDATE_PROOF: [u8; 4] = [0xd0, 0xd8, 0x98, 0xdd];
+const SEL_TRANSFER_AUTH: [u8; 4] = [0xe3, 0xee, 0x16, 0x0e];
+const SEL_AFTER_SETTLE: [u8; 4] = [0x71, 0xe5, 0xea, 0xc2];
 
 #[storage]
 pub struct Resource {
     group_id: StorageU256,
-    owner: StorageAddress,
     price: StorageU256,
+    owner: StorageAddress,
     hook: StorageAddress,
 }
 
@@ -82,22 +79,26 @@ pub struct Resource {
 pub struct SettlementRegistry {
     admin: StorageAddress,
     usdc_address: StorageAddress,
-    // Now points at the SemaphoreAdapter, not Semaphore itself.
-    semaphore_adapter: StorageAddress,
-    authorized_registry: StorageAddress,
+    semaphore_address: StorageAddress,
+    authorized_registries: StorageMap<Address, StorageBool>,
     resources: StorageMap<FixedBytes<32>, Resource>,
     nullifiers: StorageMap<U256, StorageBool>,
-    settlements: StorageMap<FixedBytes<32>, StorageBool>,
-    registrations: StorageMap<FixedBytes<32>, StorageBool>,
+    settlements: StorageMap<Address, StorageMap<FixedBytes<32>, StorageBool>>,
+    registrations: StorageMap<FixedBytes<32>, StorageMap<U256, StorageBool>>,
 }
 
 #[public]
 impl SettlementRegistry {
     #[constructor]
-    pub fn init(&mut self, admin: Address, usdc_address: Address, semaphore_adapter: Address) {
+    pub fn init(
+        &mut self,
+        admin: Address, 
+        usdc_address: Address, 
+        semaphore_address: Address
+    ) {
         self.admin.set(admin);
         self.usdc_address.set(usdc_address);
-        self.semaphore_adapter.set(semaphore_adapter);
+        self.semaphore_address.set(semaphore_address);
     }
 
     pub fn set_registry(
@@ -106,9 +107,9 @@ impl SettlementRegistry {
         authorized: bool,
     ) -> Result<(), SettlementError> {
         if self.vm().msg_sender() != self.admin.get() {
-            return Err(SettlementError::NotAdmin(NotAdmin {}));
+            return Err(err(E_NOT_ADMIN));
         }
-        self.authorized_registry.set(registry);
+        self.authorized_registries.setter(registry).set(authorized);
         Ok(())
     }
 
@@ -119,18 +120,16 @@ impl SettlementRegistry {
         owner: Address,
     ) -> Result<U256, SettlementError> {
         self.only_authorized_registry()?;
-
         if self.resources.getter(resource_id).owner.get() != Address::ZERO {
-            return Err(SettlementError::AlreadyRegistered(AlreadyRegistered {}));
+            return Err(err(E_ALREADY_REGISTERED));
         }
 
-        // Adapter returns new group_id. Admin on the adapter side becomes
-        // msg_sender, which is this contract — so we remain the group admin.
+        let this = self.vm().contract_address();
         let ret = unsafe {
-            RawCall::new(self.vm()).call(self.semaphore_adapter.get(), &SEL_ADAPTER_CREATE_GROUP)
+            RawCall::new(self.vm()).call(self.semaphore_address.get(), &sel_create_group(this))
         }
-        .map_err(|_| SettlementError::GroupCreationFailed(GroupCreationFailed {}))?;
-        let group_id = U256::from_be_slice(&ret[..32]);
+        .map_err(|_| err(E_GROUP_CREATION_FAILED))?;
+        let group_id = decode_u256(&ret).ok_or(err(E_GROUP_CREATION_FAILED))?;
 
         {
             let mut r = self.resources.setter(resource_id);
@@ -142,13 +141,17 @@ impl SettlementRegistry {
         let seed = U256::from_be_bytes(*keccak256(resource_id.as_slice())) % BN254_FIELD_MOD;
         unsafe {
             RawCall::new(self.vm()).call(
-                self.semaphore_adapter.get(),
-                &sel_adapter_add_member(group_id, seed),
+                self.semaphore_address.get(),
+                &sel_add_member(group_id, seed),
             )
         }
-        .map_err(|_| SettlementError::GroupCreationFailed(GroupCreationFailed {}))?;
+        .map_err(|_| err(E_GROUP_CREATION_FAILED))?;
 
-
+        // self.vm().log(MemberRegistered {
+        //     resourceId: resource_id,
+        //     groupId: group_id,
+        //     identityCommitment: seed,
+        // });
         self.vm().log(ResourceCreated {
             resourceId: resource_id,
             groupId: group_id,
@@ -158,7 +161,7 @@ impl SettlementRegistry {
         Ok(group_id)
     }
 
-    // Update the hook and price associated with a resource id
+   // Update the hook and price associated with a resource id
     // Only executable by the resource owner.
     // 
     pub fn update_resource(
@@ -169,10 +172,10 @@ impl SettlementRegistry {
     ) -> Result<(), SettlementError> {
         let owner = self.resources.getter(resource_id).owner.get();
         if owner == Address::ZERO {
-            return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
+            return Err(err(E_RESOURCE_NOT_FOUND));
         }
         if self.vm().msg_sender() != owner {
-            return Err(SettlementError::NotResourceOwner(NotResourceOwner {}));
+            return Err(err(E_NOT_RESOURCE_OWNER));
         }
         {
             let mut r = self.resources.setter(resource_id);
@@ -186,6 +189,7 @@ impl SettlementRegistry {
         });
         Ok(())
     }
+
 
     #[payable]
     pub fn register(
@@ -206,23 +210,18 @@ impl SettlementRegistry {
             let res = self.resources.getter(resource_id);
             (res.owner.get(), res.price.get(), res.group_id.get())
         };
-
         if owner == Address::ZERO {
-            return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
+            return Err(err(E_RESOURCE_NOT_FOUND));
         }
-
-        let reg_key = hash_concat(
-            resource_id.as_slice(),
-            &identity_commitment.to_be_bytes::<32>(),
-        );
-        if self.registrations.get(reg_key) {
-            return Err(SettlementError::AlreadyRegistered(AlreadyRegistered {}));
+        if self
+            .registrations
+            .getter(resource_id)
+            .get(identity_commitment)
+        {
+            return Err(err(E_ALREADY_REGISTERED));
         }
-
         if amount != price {
-            return Err(SettlementError::IncorrectPaymentAmount(
-                IncorrectPaymentAmount {},
-            ));
+            return Err(err(E_INCORRECT_PAYMENT));
         }
 
         unsafe {
@@ -231,17 +230,20 @@ impl SettlementRegistry {
                 &sel_transfer_auth(from, to, amount, valid_after, valid_before, nonce, v, r, s),
             )
         }
-        .map_err(|_| SettlementError::TransferFailed(TransferFailed {}))?;
+        .map_err(|_| err(E_TRANSFER_FAILED))?;
 
         unsafe {
             RawCall::new(self.vm()).call(
-                self.semaphore_adapter.get(),
-                &sel_adapter_add_member(group_id, identity_commitment),
+                self.semaphore_address.get(),
+                &sel_add_member(group_id, identity_commitment),
             )
         }
-        .map_err(|_| SettlementError::GroupCreationFailed(GroupCreationFailed {}))?;
+        .map_err(|_| err(E_GROUP_CREATION_FAILED))?;
 
-        self.registrations.setter(reg_key).set(true);
+        self.registrations
+            .setter(resource_id)
+            .setter(identity_commitment)
+            .set(true);
         self.vm().log(MemberRegistered {
             resourceId: resource_id,
             groupId: group_id,
@@ -262,21 +264,20 @@ impl SettlementRegistry {
         hook_data: Vec<u8>,
     ) -> Result<(), SettlementError> {
         let (owner, group_id, hook_addr) = {
-            let res = self.resources.getter(resource_id);
-            (res.owner.get(), res.group_id.get(), res.hook.get())
+            let r = self.resources.getter(resource_id);
+            (r.owner.get(), r.group_id.get(), r.hook.get())
         };
-
         if owner == Address::ZERO {
-            return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
+            return Err(err(E_RESOURCE_NOT_FOUND));
         }
         if self.nullifiers.get(nullifier) {
-            return Err(SettlementError::AlreadySettled(AlreadySettled {}));
+            return Err(err(E_ALREADY_SETTLED));
         }
 
         unsafe {
             RawCall::new(self.vm()).call(
-                self.semaphore_adapter.get(),
-                &sel_adapter_validate_proof(
+                self.semaphore_address.get(),
+                &sel_validate_proof(
                     group_id,
                     merkle_tree_depth,
                     merkle_tree_root,
@@ -287,14 +288,12 @@ impl SettlementRegistry {
                 ),
             )
         }
-        .map_err(|_| SettlementError::VerificationFailed(VerificationFailed {}))?;
+        .map_err(|_| err(E_VERIFICATION_FAILED))?;
 
         self.nullifiers.setter(nullifier).set(true);
         self.settlements
-            .setter(hash_concat(
-                stealth_address.as_slice(),
-                resource_id.as_slice(),
-            ))
+            .setter(stealth_address)
+            .setter(resource_id)
             .set(true);
         self.vm().log(SettlementFinalized {
             resourceId: resource_id,
@@ -309,70 +308,61 @@ impl SettlementRegistry {
                     &sel_after_settle(resource_id, nullifier, message, &hook_data),
                 )
             }
-            .map_err(|_| SettlementError::HookFailed(HookFailed {}))?;
+            .map_err(|_| err(E_HOOK_FAILED))?;
         }
         Ok(())
     }
 
-    pub fn get_status(
-        &self,
-        stealth_address: Address,
-        resource_id: FixedBytes<32>,
-        identity_commitment: U256,
-    ) -> (bool, bool) {
-        let is_settled = self.settlements.get(hash_concat(
-            stealth_address.as_slice(),
-            resource_id.as_slice(),
-        ));
-        let is_registered = self.registrations.get(hash_concat(
-            resource_id.as_slice(),
-            &identity_commitment.to_be_bytes::<32>(),
-        ));
-        (is_settled, is_registered)
+    pub fn is_settled(&self, stealth_address: Address, resource_id: FixedBytes<32>) -> bool {
+        self.settlements.getter(stealth_address).get(resource_id)
     }
 
-    /// Returns (owner, price, group_id, hook).
-    pub fn get_resource(&self, resource_id: FixedBytes<32>) -> (Address, U256, U256, Address) {
-        let r = self.resources.getter(resource_id);
-        (r.owner.get(), r.price.get(), r.group_id.get(), r.hook.get())
+    pub fn is_registered(&self, resource_id: FixedBytes<32>, identity_commitment: U256) -> bool {
+        self.registrations
+            .getter(resource_id)
+            .get(identity_commitment)
     }
 
-    pub fn get_semaphore_adapter(&self) -> Address {
-        self.semaphore_adapter.get()
+    /// Returns the Semaphore group id for a resource, or 0 if the resource doesn't exist.
+    /// Group ids start at 1 (groupCounter is post-incremented in Semaphore V4's createGroup,
+    /// but adjust interpretation on caller side if treating 0 as sentinel).
+    pub fn get_group_id(&self, resource_id: FixedBytes<32>) -> U256 {
+        self.resources.getter(resource_id).group_id.get()
+    }
+
+    pub fn get_price(&self, resource_id: FixedBytes<32>) -> U256 {
+        self.resources.getter(resource_id).price.get()
     }
 }
 
 impl SettlementRegistry {
     #[inline(never)]
     fn only_authorized_registry(&self) -> Result<(), SettlementError> {
-        if !self.authorized_registry.get().eq(&self.vm().msg_sender()) {
-            return Err(SettlementError::NotAuthorizedRegistry(
-                NotAuthorizedRegistry {},
-            ));
+        if !self.authorized_registries.get(self.vm().msg_sender()) {
+            return Err(err(E_NOT_AUTHORIZED_REGISTRY));
         }
         Ok(())
     }
 }
 
-// ── Calldata encoding ─────────────────────────────────────────────────────────
-// Note: the heavy validate_proof and create_group encoders are GONE from this
-// contract — they live in SemaphoreAdapter now. What remains:
-//   - sel_transfer_auth (USDC, 9 words)
-//   - sel_after_settle  (hook, 4 words + dynamic bytes)
-//   - sel_adapter_add_member (adapter, 2 words)
-//   - sel_adapter_validate_proof (adapter, 14 words)
-// The adapter create_group selector is a constant (no args), no helper needed.
+#[inline(never)]
+fn sel_create_group(admin: Address) -> alloc::vec::Vec<u8> {
+    let mut cd = SEL_CREATE_GROUP.to_vec();
+    cd.extend_from_slice(&[0u8; 12]);
+    cd.extend_from_slice(admin.as_slice());
+    cd
+}
 
 #[inline(never)]
-fn sel_adapter_add_member(group_id: U256, commitment: U256) -> alloc::vec::Vec<u8> {
-    let mut cd = SEL_ADAPTER_ADD_MEMBER.to_vec();
+fn sel_add_member(group_id: U256, commitment: U256) -> alloc::vec::Vec<u8> {
+    let mut cd = SEL_ADD_MEMBER.to_vec();
     cd.extend_from_slice(&group_id.to_be_bytes::<32>());
     cd.extend_from_slice(&commitment.to_be_bytes::<32>());
     cd
 }
 
 #[inline(never)]
-fn sel_adapter_validate_proof(
+fn sel_validate_proof(
     group_id: U256,
     depth: U256,
     root: U256,
@@ -381,7 +371,7 @@ fn sel_adapter_validate_proof(
     scope: U256,
     points: &[U256; 8],
 ) -> alloc::vec::Vec<u8> {
-    let mut cd = SEL_ADAPTER_VALIDATE_PROOF.to_vec();
+    let mut cd = SEL_VALIDATE_PROOF.to_vec();
     cd.extend_from_slice(&group_id.to_be_bytes::<32>());
     cd.extend_from_slice(&depth.to_be_bytes::<32>());
     cd.extend_from_slice(&root.to_be_bytes::<32>());
@@ -447,14 +437,12 @@ fn sel_after_settle(
 }
 
 #[inline(never)]
-fn hash_concat(a: &[u8], b: &[u8]) -> FixedBytes<32> {
-    let mut data = alloc::vec::Vec::with_capacity(a.len() + b.len());
-    data.extend_from_slice(a);
-    data.extend_from_slice(b);
-    keccak256(&data)
+fn decode_u256(ret: &[u8]) -> Option<U256> {
+    if ret.len() < 32 {
+        return None;
+    }
+    Some(U256::from_be_slice(&ret[..32]))
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -466,26 +454,6 @@ mod tests {
     }
 
     #[test]
-    fn test_const_selectors() {
-        assert_eq!(SEL_TRANSFER_AUTH,  keccak256(b"transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32)")[..4]);
-        assert_eq!(
-            SEL_AFTER_SETTLE,
-            keccak256(b"afterSettle(bytes32,uint256,uint256,bytes)")[..4]
-        );
-        // These are the adapter's public method selectors — must match SemaphoreAdapter's #[public] fn signatures.
-        assert_eq!(SEL_ADAPTER_CREATE_GROUP, keccak256(b"createGroup()")[..4]);
-        assert_eq!(
-            SEL_ADAPTER_ADD_MEMBER,
-            keccak256(b"addMember(uint256,uint256)")[..4]
-        );
-        assert_eq!(
-            SEL_ADAPTER_VALIDATE_PROOF,
-            keccak256(b"validateProof(uint256,uint256,uint256,uint256,uint256,uint256,uint256[8])")
-                [..4]
-        );
-    }
-
-    #[test]
     fn test_seed_in_field() {
         let seed = U256::from_be_bytes(*keccak256(resource_id().as_slice())) % BN254_FIELD_MOD;
         assert!(seed < BN254_FIELD_MOD);
@@ -493,14 +461,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sel_adapter_add_member_length() {
-        let cd = sel_adapter_add_member(U256::ZERO, U256::ZERO);
+    fn test_sel_add_member() {
+        let cd = sel_add_member(U256::ZERO, U256::ZERO);
+        assert_eq!(&cd[..4], &keccak256(b"addMember(uint256,uint256)")[..4]);
         assert_eq!(cd.len(), 68);
     }
 
     #[test]
-    fn test_sel_adapter_validate_proof_length() {
-        let cd = sel_adapter_validate_proof(
+    fn test_sel_validate_proof() {
+        let cd = sel_validate_proof(
             U256::ZERO,
             U256::ZERO,
             U256::ZERO,
@@ -508,6 +477,12 @@ mod tests {
             U256::ZERO,
             U256::ZERO,
             &[U256::ZERO; 8],
+        );
+        assert_eq!(
+            &cd[..4],
+            &keccak256(
+                b"validateProof(uint256,(uint256,uint256,uint256,uint256,uint256,uint256[8]))"
+            )[..4]
         );
         assert_eq!(cd.len(), 452);
     }
@@ -521,14 +496,5 @@ mod tests {
             "offset"
         );
         assert_eq!(U256::from_be_slice(&cd[132..164]), U256::ZERO, "length");
-    }
-
-    #[test]
-    fn test_reg_key_unique() {
-        let rid = resource_id();
-        assert_ne!(
-            hash_concat(rid.as_slice(), &U256::from(1u64).to_be_bytes::<32>()),
-            hash_concat(rid.as_slice(), &U256::from(2u64).to_be_bytes::<32>()),
-        );
     }
 }

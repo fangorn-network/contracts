@@ -165,26 +165,26 @@ echo "  semaphore: $SEMAPHORE"
 echo "  artifacts: $ARTIFACTS_FILE"
 echo
 
-echo "0/6 SemaphoreAdapter"
-ADAPTER=$(deploy_contract adapter ./semaphore_adapter "$SEMAPHORE")
+# echo "0/5 SemaphoreAdapter"
+# ADAPTER=$(deploy_contract adapter ./semaphore_adapter "$SEMAPHORE")
 
-echo "1/6 SettlementRegistry"
+echo "1/5 SettlementRegistry"
 SETTLEMENT=$(deploy_contract settlement ./SettlementRegistry \
     "$ADMIN" "$USDC" "$ADAPTER")
 
-echo "2/6 SchemaRegistry"
+echo "2/5 SchemaRegistry"
 SCHEMA=$(deploy_contract schema ./SchemaRegistry "$ADMIN")
 
-echo "3/6 DatasourceRegistry"
+echo "3/5 DatasourceRegistry"
 DATASOURCE=$(deploy_contract datasource ./DatasourceRegistry "$SCHEMA" "$SETTLEMENT")
 
-echo "4/6 wire: SchemaRegistry -> DatasourceRegistry"
+echo "4/5 wire: SchemaRegistry -> DatasourceRegistry"
 ensure_tx "set data source registry in schema registry" \
     "$SCHEMA" \
     "setDataSourceRegistry(address)" "$DATASOURCE" \
     "getDataSourceRegistry()(address)" "$DATASOURCE"
 
-echo "5/6 wire: SettlementRegistry authorizes DatasourceRegistry"
+echo "5/5 wire: SettlementRegistry authorizes DatasourceRegistry"
 # No getter for authorized_registries; we just send. This step isn't idempotent
 # but rerunning is harmless (just sets the same bool true).
 echo "  → authorizing data source registry in settlement registry ..." >&2
