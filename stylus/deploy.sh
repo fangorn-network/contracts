@@ -1,215 +1,123 @@
-#!/usr/bin/env bash
-# Deploy the Fangorn contracts (Settlement, Schema, DataSource) to an EVM chain
-# and wire them together. Idempotent: if an address already exists in the
-# artifacts file, that step is skipped.
-#
-# Usage:
-#   export PRIVATE_KEY=0x...
-#   ./deploy.sh                   # deploys to arbitrum-sepolia by default
-#   ./deploy.sh --network mainnet # override
-#   ./deploy.sh --fresh           # delete existing artifacts and redeploy everything
-#
-# Requires: cargo-stylus, cast (from foundry), jq
-
-set -euo pipefail
+#!/bin/bash
+set -e
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-NETWORK="${NETWORK:-arbitrum-sepolia}"
-FRESH=0
+PRIVATE_KEY="PK"
+ADMIN="0x147c24c5Ea2f1EE1ac42AD16820De23bBba45Ef6"
+RPC="https://sepolia-rollup.arbitrum.io/rpc"
+MAX_FEE="0.1"
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --network) NETWORK="$2"; shift 2 ;;
-        --fresh)   FRESH=1; shift ;;
-        *) echo "unknown arg: $1" >&2; exit 1 ;;
-    esac
-done
+USDC="0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d"
+SEMAPHORE="0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D"
 
-# Network-specific settings
-case "$NETWORK" in
-    arbitrum-sepolia)
-        RPC_URL="https://sepolia-rollup.arbitrum.io/rpc"
-        ADMIN="0x147c24c5Ea2f1EE1ac42AD16820De23bBba45Ef6"
-        USDC="0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d"
-        SEMAPHORE="0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D"
-        MAX_FEE_GWEI="0.1"
-        ;;
-    *)
-        echo "unknown network: $NETWORK" >&2
-        exit 1
-        ;;
-esac
-
-ARTIFACTS_FILE="deployments/${NETWORK}.json"
-mkdir -p "$(dirname "$ARTIFACTS_FILE")"
-
-if [[ "$FRESH" == "1" ]]; then
-    rm -f "$ARTIFACTS_FILE"
-fi
-
-if [[ ! -f "$ARTIFACTS_FILE" ]]; then
-    echo "{}" > "$ARTIFACTS_FILE"
-fi
-
-: "${PRIVATE_KEY:?PRIVATE_KEY env var required}"
+SETTLEMENT_DIR="./SettlementRegistry"
+SCHEMA_DIR="./SchemaRegistry"
+DS_DIR="./DatasourceRegistry"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-# Read an address from the artifacts file; empty string if not present.
-read_addr() {
-    local key="$1"
-    jq -r --arg k "$key" '.[$k] // ""' "$ARTIFACTS_FILE"
-}
-
-# Write an address to the artifacts file.
-write_addr() {
-    local key="$1"
-    local value="$2"
-    local tmp
-    tmp=$(mktemp)
-    jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$ARTIFACTS_FILE" > "$tmp"
-    mv "$tmp" "$ARTIFACTS_FILE"
-}
-
-# Deploy a contract from a subdirectory. Echoes the deployed address.
-# Skips if artifact already exists.
-deploy_contract() {
-    local key="$1"
-    local dir="$2"
-    shift 2
-    local constructor_args=("$@")
-
-    local existing
-    existing=$(read_addr "$key")
-    if [[ -n "$existing" ]]; then
-        echo "  ✓ $key already at $existing (skipping)" >&2
-        echo "$existing"
-        return
-    fi
-
-    echo "  → deploying $key from $dir ..." >&2
-    local output
-    output=$(cd "$dir" && cargo stylus deploy \
-        --private-key "$PRIVATE_KEY" \
-        --endpoint "$RPC_URL" \
-        --max-fee-per-gas-gwei "$MAX_FEE_GWEI" \
-        --constructor-args "${constructor_args[@]}" \
-        2>&1)
-
-    # cargo-stylus prints the deployed address; grab the last 0x-prefixed 40-hex match
-    local addr
-    addr=$(echo "$output" | grep -oE '0x[a-fA-F0-9]{40}' | tail -1)
-    if [[ -z "$addr" ]]; then
-        echo "deploy failed for $key:" >&2
-        echo "$output" >&2
+deploy() {
+    local dir=$1
+    local constructor_args=$2
+    echo "" >&2
+    echo "Deploying from $dir..." >&2
+    
+    if [ ! -d "$dir" ]; then
+        echo "Error: Directory $dir not found" >&2
         exit 1
     fi
 
-    write_addr "$key" "$addr"
-    echo "  ✓ $key deployed at $addr" >&2
+    pushd "$dir" > /dev/null
+
+    local output
+    # Pass args without internal quotes so they expand to multiple CLI arguments
+    output=$(cargo stylus deploy \
+        --private-key "$PRIVATE_KEY" \
+        --endpoint "$RPC" \
+        --max-fee-per-gas-gwei "$MAX_FEE" \
+        --constructor-args $constructor_args 2>&1)
+
+    echo "$output" >&2
+
+    local addr
+    addr=$(echo "$output" | grep -oE '0x[0-9a-fA-F]{40}' | head -1)
+
+    if [ -z "$addr" ]; then
+        echo "FAILED: No address returned from stylus deploy" >&2
+        exit 1
+    fi
+
+    popd > /dev/null
     echo "$addr"
 }
 
-# Call a read-only function and compare result to expected.
-check_wiring() {
-    local label="$1"
-    local contract="$2"
-    local signature="$3"
-    local expected="$4"
+send() {
+    local contract=$1
+    local sig=$2
+    shift 2
+    echo "  Sending: $sig $@" >&2
+    cast send "$contract" "$sig" "$@" \
+        --rpc-url "$RPC" \
+        --private-key "$PRIVATE_KEY" >&2
+}
 
-    local actual
-    actual=$(cast call "$contract" "$signature" --rpc-url "$RPC_URL" 2>&1 \
-        | tr '[:upper:]' '[:lower:]')
-    expected=$(echo "$expected" | tr '[:upper:]' '[:lower:]')
+verify_call() {
+    local contract=$1
+    local sig=$2
+    local expected=$3
+    
+    if [ -z "$contract" ]; then
+        echo "ERROR: Attempted to call empty address. Deployment failed." >&2
+        exit 1
+    fi
 
-    # cast returns 0x-prefixed, zero-padded; normalize by extracting the last 40 hex chars
-    local actual_normalized
-    actual_normalized="0x$(echo "$actual" | grep -oE '[a-f0-9]{40}$' || echo "")"
-
-    if [[ "$actual_normalized" == "$expected" ]]; then
-        echo "  ✓ $label" >&2
-    else
-        echo "  ✗ $label: expected $expected, got $actual_normalized" >&2
+    local result
+    result=$(cast call "$contract" "$sig" --rpc-url "$RPC")
+    echo "  $sig => $result" >&2
+    if [[ -n "$expected" && "${result,,}" != "${expected,,}" ]]; then
+        echo "  ERROR: expected $expected, got $result" >&2
         exit 1
     fi
 }
 
-# Send a tx, waiting for inclusion. No-op if the "check" call already passes.
-ensure_tx() {
-    local label="$1"
-    local contract="$2"
-    local write_sig="$3"
-    local write_args="$4"
-    local check_sig="$5"
-    local expected="$6"
+# ── Deploy ────────────────────────────────────────────────────────────────────
 
-    local actual
-    actual=$(cast call "$contract" "$check_sig" --rpc-url "$RPC_URL" 2>&1 \
-        | grep -oE '[a-f0-9]{40}$' | tr '[:upper:]' '[:lower:]' || echo "")
-    expected=$(echo "$expected" | tr '[:upper:]' '[:lower:]' | sed 's/^0x//')
+echo "=== 1. Deploy SettlementRegistry ===" >&2
+SETTLEMENT_ADDR=$(deploy "$SETTLEMENT_DIR" "$ADMIN $USDC $SEMAPHORE")
+echo "SettlementRegistry: $SETTLEMENT_ADDR" >&2
 
-    if [[ "$actual" == "$expected" ]]; then
-        echo "  ✓ $label already configured (skipping)" >&2
-        return
-    fi
+echo "" >&2
+echo "=== 2. Deploy SchemaRegistry ===" >&2
+SCHEMA_ADDR=$(deploy "$SCHEMA_DIR" "$ADMIN")
+echo "SchemaRegistry: $SCHEMA_ADDR" >&2
 
-    echo "  → $label ..." >&2
-    # shellcheck disable=SC2086
-    cast send "$contract" "$write_sig" $write_args \
-        --rpc-url "$RPC_URL" \
-        --private-key "$PRIVATE_KEY" > /dev/null
-    echo "  ✓ $label" >&2
-}
+echo "Verifying SchemaRegistry admin..." >&2
+verify_call "$SCHEMA_ADDR" "getAdmin()(address)" "$ADMIN"
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+echo "" >&2
+echo "=== 3. Deploy DataSourceRegistry ===" >&2
+DS_ADDR=$(deploy "$DS_DIR" "$SCHEMA_ADDR $SETTLEMENT_ADDR")
+echo "DataSourceRegistry: $DS_ADDR" >&2
 
-echo "Deploying Fangorn to $NETWORK"
-echo "  admin:     $ADMIN"
-echo "  usdc:      $USDC"
-echo "  semaphore: $SEMAPHORE"
-echo "  artifacts: $ARTIFACTS_FILE"
-echo
+# ── Wire ──────────────────────────────────────────────────────────────────────
 
-echo "0/6 SemaphoreAdapter"
-ADAPTER=$(deploy_contract adapter ./semaphore_adapter "$SEMAPHORE")
+echo "" >&2
+echo "=== 4. Wire SchemaRegistry → DataSourceRegistry ===" >&2
+send "$SCHEMA_ADDR" "setDataSourceRegistry(address)" "$DS_ADDR"
+echo "Verifying..." >&2
+verify_call "$SCHEMA_ADDR" "getDataSourceRegistry()(address)" "$DS_ADDR"
 
-echo "1/6 SettlementRegistry"
-SETTLEMENT=$(deploy_contract settlement ./SettlementRegistry \
-    "$ADMIN" "$USDC" "$ADAPTER")      # ← was $SEMAPHORE before
+echo "" >&2
+echo "=== 5. Wire SettlementRegistry → DataSourceRegistry ===" >&2
+send "$SETTLEMENT_ADDR" "setRegistry(address,bool)" "$DS_ADDR" true
 
-echo "2/6 SchemaRegistry"
-SCHEMA=$(deploy_contract schema ./SchemaRegistry "$ADMIN")
+# ── Summary ───────────────────────────────────────────────────────────────────
 
-echo "3/6 DatasourceRegistry"
-DATASOURCE=$(deploy_contract datasource ./DatasourceRegistry "$SCHEMA" "$SETTLEMENT")
+echo "" >&2
+echo "=== Deployment complete ===" >&2
+echo "" >&2
 
-echo "4/6 wire: SchemaRegistry -> DatasourceRegistry"
-ensure_tx "set data source registry in schema registry" \
-    "$SCHEMA" \
-    "setDatasourceRegistry(address)" "$DATASOURCE" \
-    "getDatasourceRegistry()(address)" "$DATASOURCE"
-
-echo "5/6 wire: SettlementRegistry authorizes DatasourceRegistry"
-# No getter for authorized_registries; we just send. This step isn't idempotent
-# but rerunning is harmless (just sets the same bool true).
-echo "  → authorizing data source registry in settlement registry ..." >&2
-cast send "$SETTLEMENT" \
-    "setRegistry(address,bool)" "$DATASOURCE" true \
-    --rpc-url "$RPC_URL" \
-    --private-key "$PRIVATE_KEY" > /dev/null
-echo "  ✓ authorized" >&2
-
-# ── Final sanity checks ───────────────────────────────────────────────────────
-
-echo
-echo "Verifying wiring..."
-check_wiring "schema.getAdmin == $ADMIN" \
-    "$SCHEMA" "getAdmin()(address)" "$ADMIN"
-check_wiring "schema.getDatasourceRegistry == $DATASOURCE" \
-    "$SCHEMA" "getDatasourceRegistry()(address)" "$DATASOURCE"
-# Settlement has no public admin getter in current ABI; if you add one, check here.
-
-echo
-echo "Deployment complete. Addresses saved to $ARTIFACTS_FILE:"
-jq . "$ARTIFACTS_FILE"
+echo "SETTLEMENT_REGISTRY_ADDRESS=$SETTLEMENT_ADDR"
+echo "SCHEMA_REGISTRY_ADDRESS=$SCHEMA_ADDR"
+echo "DATA_SOURCE_REGISTRY_ADDRESS=$DS_ADDR"
