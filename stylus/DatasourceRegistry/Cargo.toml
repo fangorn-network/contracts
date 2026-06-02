@@ -22,6 +22,7 @@ alloy-primitives = { version = "^1.0.1", features = ["sha3-keccak"] }
 
 [features]
 export-abi = ["stylus-sdk/export-abi"]
+contract-client-gen = []
 
 [lib]
 crate-type = ["lib", "cdylib"]
