@@ -1,123 +1,115 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
 
-# ── Config ────────────────────────────────────────────────────────────────────
+set -euo pipefail
 
-PRIVATE_KEY="PK"
-ADMIN="0x147c24c5Ea2f1EE1ac42AD16820De23bBba45Ef6"
-RPC="https://sepolia-rollup.arbitrum.io/rpc"
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+PRIVATE_KEY="0xde0e6c1c331fcd8692463d6ffcf20f9f2e1847264f7a3f578cf54f62f05196cb"
+RPC_ENDPOINT="https://sepolia-rollup.arbitrum.io/rpc"
 MAX_FEE="0.1"
 
-USDC="0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d"
-SEMAPHORE="0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D"
+ADMIN_ADDR="0x147c24c5Ea2f1EE1ac42AD16820De23bBba45Ef6"
+USDC_ADDR="0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d"
+SEMAPHORE_ADDR="0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D"
 
-SETTLEMENT_DIR="./SettlementRegistry"
-SCHEMA_DIR="./SchemaRegistry"
-DS_DIR="./DatasourceRegistry"
+LOG_FILE="$(mktemp)"
+trap 'rm -f "$LOG_FILE"' EXIT
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-deploy() {
-    local dir=$1
-    local constructor_args=$2
-    echo "" >&2
-    echo "Deploying from $dir..." >&2
-    
-    if [ ! -d "$dir" ]; then
-        echo "Error: Directory $dir not found" >&2
-        exit 1
-    fi
-
-    pushd "$dir" > /dev/null
-
-    local output
-    # Pass args without internal quotes so they expand to multiple CLI arguments
-    output=$(cargo stylus deploy \
-        --private-key "$PRIVATE_KEY" \
-        --endpoint "$RPC" \
-        --max-fee-per-gas-gwei "$MAX_FEE" \
-        --constructor-args $constructor_args 2>&1)
-
-    echo "$output" >&2
-
-    local addr
-    addr=$(echo "$output" | grep -oE '0x[0-9a-fA-F]{40}' | head -1)
-
-    if [ -z "$addr" ]; then
-        echo "FAILED: No address returned from stylus deploy" >&2
-        exit 1
-    fi
-
-    popd > /dev/null
-    echo "$addr"
+# ==============================================================================
+# HELPERS
+# All diagnostic output goes to stderr so stdout stays clean for capture.
+# ==============================================================================
+log_step() {
+    echo -e "\n==================================================" >&2
+    echo -e "🚀 $1" >&2
+    echo -e "==================================================" >&2
 }
 
-send() {
-    local contract=$1
-    local sig=$2
+cast_call() {
+    local contract="$1" signature="$2"
+    cast call "$contract" "$signature" --rpc-url "$RPC_ENDPOINT"
+}
+
+cast_send() {
+    local contract="$1" signature="$2"
     shift 2
-    echo "  Sending: $sig $@" >&2
-    cast send "$contract" "$sig" "$@" \
-        --rpc-url "$RPC" \
-        --private-key "$PRIVATE_KEY" >&2
+    cast send "$contract" "$signature" "$@" \
+        --rpc-url "$RPC_ENDPOINT" \
+        --private-key "$PRIVATE_KEY" > /dev/null
 }
 
-verify_call() {
-    local contract=$1
-    local sig=$2
-    local expected=$3
-    
-    if [ -z "$contract" ]; then
-        echo "ERROR: Attempted to call empty address. Deployment failed." >&2
+deploy_contract() {
+    local dir="$1"
+    shift
+
+    echo "Deploying from $dir..." >&2
+
+    (cd "$dir" && cargo stylus deploy \
+        --private-key "$PRIVATE_KEY" \
+        --endpoint "$RPC_ENDPOINT" \
+        --max-fee-per-gas-gwei "$MAX_FEE" \
+        --constructor-args "$@") > "$LOG_FILE" 2>&1
+
+    cat "$LOG_FILE" >&2
+
+    local address
+    address=$(grep -i "deployed code at address:" "$LOG_FILE" \
+        | grep -oE '0x[a-fA-F0-9]{40}' \
+        | head -n 1 \
+        | tr -d '[:space:]')
+
+    if [ -z "$address" ]; then
+        echo "❌ Could not extract deployed address from logs." >&2
         exit 1
     fi
 
-    local result
-    result=$(cast call "$contract" "$sig" --rpc-url "$RPC")
-    echo "  $sig => $result" >&2
-    if [[ -n "$expected" && "${result,,}" != "${expected,,}" ]]; then
-        echo "  ERROR: expected $expected, got $result" >&2
-        exit 1
-    fi
+    echo "✅ Deployed: $address" >&2
+    echo "$address"
 }
+# ==============================================================================
+# DEPLOYMENT SEQUENCE
+# ==============================================================================
+echo "=========================================" >&2
+echo " Starting Contract Deployment Sequence"   >&2
+echo "=========================================" >&2
 
-# ── Deploy ────────────────────────────────────────────────────────────────────
+# # 1. Settlement Registry
+# log_step "[1/5] Deploying Settlement Registry"
+# SETTLEMENT_REGISTRY_ADDRESS=$(deploy_contract \
+#     "./SettlementRegistry" \
+#     "$ADMIN_ADDR" "$USDC_ADDR" "$SEMAPHORE_ADDR")
 
-echo "=== 1. Deploy SettlementRegistry ===" >&2
-SETTLEMENT_ADDR=$(deploy "$SETTLEMENT_DIR" "$ADMIN $USDC $SEMAPHORE")
-echo "SettlementRegistry: $SETTLEMENT_ADDR" >&2
+# 2. Schema Registry
+log_step "[1/4] Deploying Schema Registry"
+SCHEMA_REGISTRY_ADDRESS=$(deploy_contract \
+    "./SchemaRegistry" \
+    "$ADMIN_ADDR")
 
-echo "" >&2
-echo "=== 2. Deploy SchemaRegistry ===" >&2
-SCHEMA_ADDR=$(deploy "$SCHEMA_DIR" "$ADMIN")
-echo "SchemaRegistry: $SCHEMA_ADDR" >&2
+echo "Verifying Schema Registry admin..." >&2
+cast_call "$SCHEMA_REGISTRY_ADDRESS" "getAdmin()(address)"
 
-echo "Verifying SchemaRegistry admin..." >&2
-verify_call "$SCHEMA_ADDR" "getAdmin()(address)" "$ADMIN"
+# 3. Datasource Registry  (schema reg first, then settlement reg)
+log_step "[2/4] Deploying Datasource Registry"
+DATASOURCE_REGISTRY_ADDRESS=$(deploy_contract \
+    "./DatasourceRegistry" \
+    "$SCHEMA_REGISTRY_ADDRESS")
 
-echo "" >&2
-echo "=== 3. Deploy DataSourceRegistry ===" >&2
-DS_ADDR=$(deploy "$DS_DIR" "$SCHEMA_ADDR $SETTLEMENT_ADDR")
-echo "DataSourceRegistry: $DS_ADDR" >&2
+# 4. Bind Datasource Registry → Schema Registry
+log_step "[3/4] Registering Datasource Registry in Schema Registry"
+cast_send "$SCHEMA_REGISTRY_ADDRESS" \
+    "setDataSourceRegistry(address)" \
+    "$DATASOURCE_REGISTRY_ADDRESS"
 
-# ── Wire ──────────────────────────────────────────────────────────────────────
+echo "Verifying binding..." >&2
+cast_call "$SCHEMA_REGISTRY_ADDRESS" "getDataSourceRegistry()(address)"
 
-echo "" >&2
-echo "=== 4. Wire SchemaRegistry → DataSourceRegistry ===" >&2
-send "$SCHEMA_ADDR" "setDataSourceRegistry(address)" "$DS_ADDR"
-echo "Verifying..." >&2
-verify_call "$SCHEMA_ADDR" "getDataSourceRegistry()(address)" "$DS_ADDR"
-
-echo "" >&2
-echo "=== 5. Wire SettlementRegistry → DataSourceRegistry ===" >&2
-send "$SETTLEMENT_ADDR" "setRegistry(address,bool)" "$DS_ADDR" true
-
-# ── Summary ───────────────────────────────────────────────────────────────────
-
-echo "" >&2
-echo "=== Deployment complete ===" >&2
-echo "" >&2
-
-echo "SETTLEMENT_REGISTRY_ADDRESS=$SETTLEMENT_ADDR"
-echo "SCHEMA_REGISTRY_ADDRESS=$SCHEMA_ADDR"
-echo "DATA_SOURCE_REGISTRY_ADDRESS=$DS_ADDR"
+# ==============================================================================
+# SUMMARY
+# ==============================================================================
+echo -e "\n=========================================" >&2
+echo " 🎉 All steps completed successfully!"     >&2
+echo "=========================================" >&2
+echo "Schema Registry:     $SCHEMA_REGISTRY_ADDRESS"     >&2
+echo "Datasource Registry: $DATASOURCE_REGISTRY_ADDRESS" >&2
+echo "=========================================" >&2

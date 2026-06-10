@@ -121,44 +121,42 @@ impl SettlementRegistry {
         Ok(group_id)
     }
 
-    // pub fn update_price(
-    //     &mut self,
-    //     resource_id: FixedBytes<32>,
-    //     price: U256,
-    //     owner: Address,
-    // ) -> Result<(), SettlementError> {
-    //     self.only_authorized_registry()?;
-    //     let stored = self.resource_owners.get(resource_id);
-    //     if stored == Address::ZERO {
-    //         return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
-    //     }
-    //     if owner != stored {
-    //         return Err(SettlementError::NotResourceOwner(NotResourceOwner {}));
-    //     }
-    //     self.resource_price.setter(resource_id).set(price);
-    //     self.vm().log(PriceUpdated { resourceId: resource_id, owner, price });
-    //     Ok(())
-    // }
+    pub fn update_price(
+        &mut self,
+        resource_id: FixedBytes<32>,
+        price: U256,
+        owner: Address,
+    ) -> Result<(), SettlementError> {
+        self.only_authorized_registry()?;
+        let stored = self.resource_owners.get(resource_id);
+        if stored == Address::ZERO {
+            return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
+        }
+        if owner != stored {
+            return Err(SettlementError::NotResourceOwner(NotResourceOwner {}));
+        }
+        self.resource_price.setter(resource_id).set(price);
+        self.vm().log(PriceUpdated { resourceId: resource_id, owner, price });
+        Ok(())
+    }
 
-    // // ── Direct wallet calls ───────────────────────────────────────────────────
-
-    // /// Called directly by the publisher wallet to register a hook.
-    // pub fn register_hook(
-    //     &mut self,
-    //     resource_id: FixedBytes<32>,
-    //     hook: Address,
-    // ) -> Result<(), SettlementError> {
-    //     let owner = self.resource_owners.get(resource_id);
-    //     if owner == Address::ZERO {
-    //         return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
-    //     }
-    //     if self.vm().msg_sender() != owner {
-    //         return Err(SettlementError::NotResourceOwner(NotResourceOwner {}));
-    //     }
-    //     self.resource_hooks.setter(resource_id).set(hook);
-    //     self.vm().log(HookRegistered { resourceId: resource_id, hook });
-    //     Ok(())
-    // }
+    /// Called directly by the publisher wallet to register a hook.
+    pub fn register_hook(
+        &mut self,
+        resource_id: FixedBytes<32>,
+        hook: Address,
+    ) -> Result<(), SettlementError> {
+        let owner = self.resource_owners.get(resource_id);
+        if owner == Address::ZERO {
+            return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
+        }
+        if self.vm().msg_sender() != owner {
+            return Err(SettlementError::NotResourceOwner(NotResourceOwner {}));
+        }
+        self.resource_hooks.setter(resource_id).set(hook);
+        self.vm().log(HookRegistered { resourceId: resource_id, hook });
+        Ok(())
+    }
 
     #[payable]
     pub fn register(
@@ -175,9 +173,12 @@ impl SettlementRegistry {
         r:                   FixedBytes<32>,
         s:                   FixedBytes<32>,
     ) -> Result<(), SettlementError> {
+        // the resource must exist
         if self.resource_owners.get(resource_id) == Address::ZERO {
             return Err(SettlementError::ResourceNotFound(ResourceNotFound {}));
         }
+
+        // it is not allowed to re-register in the semaphore group
         let reg_key = hash_concat(resource_id.as_slice(), &identity_commitment.to_be_bytes::<32>());
         if self.registrations.get(reg_key) {
             return Err(SettlementError::AlreadyRegistered(AlreadyRegistered {}));
@@ -265,9 +266,10 @@ impl SettlementRegistry {
         ))
     }
 
-    pub fn get_price(&self, resource_id: FixedBytes<32>) -> U256 { self.resource_price.get(resource_id) }
+    pub fn get_admin(&self) -> Address { self.admin.get() }
     pub fn get_group_id(&self, resource_id: FixedBytes<32>) -> U256 { self.resource_groups.get(resource_id) }
-    // pub fn get_owner(&self, resource_id: FixedBytes<32>) -> Address { self.resource_owners.get(resource_id) }
+    pub fn get_owner(&self, resource_id: FixedBytes<32>) -> Address { self.resource_owners.get(resource_id) }
+    pub fn get_price(&self, resource_id: FixedBytes<32>) -> U256 { self.resource_price.get(resource_id) }
 }
 
 impl SettlementRegistry {
