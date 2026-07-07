@@ -25,3 +25,4 @@ docs/
 .env
 .env.*
 !.env.example
+skills-lock.json
