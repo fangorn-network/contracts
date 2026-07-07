@@ -6,5 +6,5 @@ pub extern "C" fn main() {}
 
 #[cfg(feature = "export-abi")]
 fn main() {
-    DatasourceRegistry::print_from_args();
+    publisher_registry::print_from_args();
 }

@@ -3,3 +3,26 @@ cache/
 out/
 nitro-testnode/
 **/node_modules
+.claude
+.forge
+
+# Commonly ignored directories
+.logs/
+.ignore/
+
+# ignore forge-std
+bucket_factory/lib
+
+# Ignores development broadcast logs
+!/broadcast
+/broadcast/*/31337/
+/broadcast/**/dry-run/
+
+# Docs
+docs/
+
+# Dotenv file
+.env
+.env.*
+!.env.example
+skills-lock.json
