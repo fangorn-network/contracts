@@ -10,6 +10,9 @@ nitro-testnode/
 .logs/
 .ignore/
 
+# ignore forge-std
+bucket_factory/lib
+
 # Ignores development broadcast logs
 !/broadcast
 /broadcast/*/31337/
