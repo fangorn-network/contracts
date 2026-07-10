@@ -84,20 +84,41 @@ deploy_forge() {
     echo "$address"
 }
 
+# ── Deployment sequence ───────────────────────────────────────────────────────
 echo "=========================================" >&2
-echo " Deploying to Arbitrum Sepolia" >&2
+echo " Deploying bucket system to Arbitrum Sepolia" >&2
 echo "=========================================" >&2
 
-log_step "Deploying DataRegistry"
-DATA_REGISTRY=$(deploy_stylus "$SCRIPT_DIR/data_registry" \
-    "$ADMIN_ADDR" "$REGISTRATION_FEE")
+# 1. Bucket implementation (no constructor; clones call initialize()).
+log_step "[1/4] Deploying Bucket implementation"
+BUCKET_IMPL=$(deploy_stylus "$SCRIPT_DIR/bucket")
+
+# 2. PublisherRegistry — init(admin, factory, registration_fee). Factory not
+#    known yet, so pass the zero address and wire it in at step 4.
+log_step "[2/4] Deploying PublisherRegistry"
+REGISTRY=$(deploy_stylus "$SCRIPT_DIR/publisher_registry" \
+    "$ADMIN_ADDR" "$ZERO_ADDR" "$REGISTRATION_FEE")
 
 echo "Verifying registry admin..." >&2
 cast_call "$REGISTRY" "admin()(address)"
+
+# 3. BucketFactory(bucketImplementation, publisherRegistry).
+log_step "[3/4] Deploying BucketFactory"
+FACTORY=$(deploy_forge "$SCRIPT_DIR/bucket_factory" \
+    "src/BucketFactory.sol:BucketFactory" "$BUCKET_IMPL" "$REGISTRY")
+
+# 4. Wire the factory into the registry (admin-only).
+log_step "[4/4] Registering factory in PublisherRegistry"
+cast_send "$REGISTRY" "setFactory(address)" "$FACTORY"
+
+echo "Verifying factory binding..." >&2
+cast_call "$REGISTRY" "factory()(address)"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo -e "\n=========================================" >&2
 echo " 🎉 Deployment complete" >&2
 echo "=========================================" >&2
-echo "DataRegistry Contract Address: $DATA_REGISTRY" >&2
+echo "Bucket implementation: $BUCKET_IMPL" >&2
+echo "PublisherRegistry:     $REGISTRY"    >&2
+echo "BucketFactory:         $FACTORY"     >&2
 echo "=========================================" >&2
