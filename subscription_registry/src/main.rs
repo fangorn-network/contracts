@@ -6,5 +6,5 @@ pub extern "C" fn main() {}
 
 #[cfg(feature = "export-abi")]
 fn main() {
-    bucket::print_from_args();
+    subscription_registry::print_from_args();
 }

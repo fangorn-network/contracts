@@ -1,5 +1,5 @@
 [package]
-name = "bucket"
+name = "settlement_registry"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,9 +7,6 @@ edition = "2024"
 alloy-primitives = "1.5.7"
 alloy-sol-types = "1.5.7"
 stylus-sdk = "0.10.7"
-
-[dev-dependencies]
-stylus-sdk = { version = "0.10.7", features = ["stylus-test"] }
 
 [lib]
 crate-type = ["lib", "cdylib"]
