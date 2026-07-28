@@ -3,17 +3,14 @@
 set -euo pipefail
 
 # ==============================================================================
-# Deploys the bucket system to Arbitrum Sepolia.
+# Deploys the DataRegistry to Arbitrum Sepolia.
 #
-#   Bucket (Stylus)            – shared implementation; clones delegatecall it
-#   PublisherRegistry (Stylus) – only user-facing contract
-#   BucketFactory (Solidity)   – ERC-1167 clone factory
-#
-# Order (breaks the registry<->factory cycle):
-#   1. deploy Bucket impl
-#   2. deploy PublisherRegistry with factory = 0x0 (unknown yet)
-#   3. deploy BucketFactory(bucketImpl, registry)
-#   4. registry.set_factory(factory)   ← admin wires it in
+#   1. deploy DataRegistry(admin, registration_fee)
+#   2. register the default app namespace, so the SDK's out-of-the-box
+#      appId("fangorn") — what the CLI uses — can be committed to immediately.
+#      Namespaces are hierarchical (app:publisher:subspace) and commit_state_root
+#      rejects an unregistered app_id, so without this every default-config
+#      publish fails with AppNotFound.
 # ==============================================================================
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -24,6 +21,10 @@ MAX_FEE="${MAX_FEE:-0.1}"
 ADMIN_ADDR="${ADMIN_ADDR:-0x147c24c5Ea2f1EE1ac42AD16820De23bBba45Ef6}"
 # Registration fee in wei. 0 = free registration for the MVP.
 REGISTRATION_FEE="${REGISTRATION_FEE:-0}"
+# The app namespace claimed at deploy time. Must match the SDK's default
+# `appId("fangorn")` in fangorn/src/config.ts — keccak256 of the UTF-8 name,
+# which is exactly what `cast keccak` computes.
+DEFAULT_APP_NAME="${DEFAULT_APP_NAME:-fangorn}"
 
 ZERO_ADDR="0x0000000000000000000000000000000000000000"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,7 +38,11 @@ log_step() {
     echo -e "==================================================" >&2
 }
 
-cast_call() { cast call "$1" "$2" --rpc-url "$RPC_ENDPOINT"; }
+# Extra args after the signature become call arguments.
+cast_call() {
+    local contract="$1" signature="$2"; shift 2
+    cast call "$contract" "$signature" "$@" --rpc-url "$RPC_ENDPOINT"
+}
 
 cast_send() {
     local contract="$1" signature="$2"; shift 2
@@ -93,11 +98,21 @@ DATA_REGISTRY=$(deploy_stylus "$SCRIPT_DIR/data_registry" \
     "$ADMIN_ADDR" "$REGISTRATION_FEE")
 
 echo "Verifying registry admin..." >&2
-cast_call "$REGISTRY" "admin()(address)"
+cast_call "$DATA_REGISTRY" "admin()(address)"
+
+log_step "Registering default app namespace: $DEFAULT_APP_NAME"
+APP_ID=$(cast keccak "$DEFAULT_APP_NAME")
+echo "app_id = $APP_ID" >&2
+cast_send "$DATA_REGISTRY" "registerApp(bytes32)" "$APP_ID"
+echo "Verifying app owner..." >&2
+cast_call "$DATA_REGISTRY" "getAppOwner(bytes32)(address)" "$APP_ID"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo -e "\n=========================================" >&2
 echo " 🎉 Deployment complete" >&2
 echo "=========================================" >&2
 echo "DataRegistry Contract Address: $DATA_REGISTRY" >&2
+echo "Default app \"$DEFAULT_APP_NAME\": $APP_ID" >&2
 echo "=========================================" >&2
+echo >&2
+echo "Set dataRegistryContractAddress in fangorn/src/config.ts to $DATA_REGISTRY" >&2

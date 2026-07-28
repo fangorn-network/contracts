@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-alloy-primitives = "1.5.7"
-alloy-sol-types = "1.5.7"
-stylus-sdk = "0.10.7"
+alloy-primitives = { version = "1.5.7", default-features = false }
+alloy-sol-types = { version = "1.5.7", default-features = false }
+stylus-sdk = { version = "0.10.7", features = ["stylus-test"] }
 
 [lib]
 crate-type = ["lib", "cdylib"]
@@ -23,7 +23,4 @@ codegen-units = 1
 strip = true
 lto = true
 panic = "abort"
-
-# If you need to reduce the binary size, it is advisable to try other
-# optimization levels, such as "s" and "z"
 opt-level = 3
