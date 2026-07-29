@@ -5,15 +5,19 @@ set -euo pipefail
 # ==============================================================================
 # Deploys the Fangorn contracts to Arbitrum Sepolia.
 #
-#   DataRegistry (Stylus)         – publisher registration + state-root timeline;
-#                                   pulls the registration fee in USDC.
+#   DataRegistry (Stylus)         – publisher registration + state-root timeline.
 #   SubscriptionRegistry (Stylus) – the paid storage subscription; pulls the
 #                                   subscription fee in USDC and cross-calls
 #                                   DataRegistry.isRegistered.
 #
 # Order (when deploying both):
-#   1. deploy DataRegistry(admin, usdc, registration_fee)
-#   2. deploy SubscriptionRegistry(admin, usdc, dataRegistry, subscription_fee)
+#   1. deploy DataRegistry(admin, registration_fee)
+#   2. register the default app namespace, so the SDK's out-of-the-box
+#      appId("fangorn") — what the CLI uses — can be committed to immediately.
+#      Namespaces are hierarchical (app:publisher:subspace) and commit_state_root
+#      rejects an unregistered app_id, so without this every default-config
+#      publish fails with AppNotFound.
+#   3. deploy SubscriptionRegistry(admin, usdc, dataRegistry, subscription_fee)
 #
 # Runs interactively — asks whether to deploy both or a single contract — or preset
 # TARGET=both|data-registry|subscription for non-interactive runs. Deploying ONLY the
@@ -29,8 +33,12 @@ MAX_FEE="${MAX_FEE:-0.1}"
 ADMIN_ADDR="${ADMIN_ADDR:-0x147c24c5Ea2f1EE1ac42AD16820De23bBba45Ef6}"
 # Fees are in USDC base units (6 decimals). 0 = free.
 REGISTRATION_FEE="${REGISTRATION_FEE:-0}"
+# The app namespace claimed at deploy time. Must match the SDK's default
+# `appId("fangorn")` in fangorn/src/config.ts — keccak256 of the UTF-8 name,
+# which is exactly what `cast keccak` computes.
+DEFAULT_APP_NAME="${DEFAULT_APP_NAME:-fangorn}"
 SUBSCRIPTION_FEE="${SUBSCRIPTION_FEE:-0}"
-# USDC token on Arbitrum Sepolia (both fees are paid in it).
+# USDC token on Arbitrum Sepolia (the subscription fee is paid in it).
 USDC_ADDR="${USDC_ADDR:-0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d}"
 # Only needed when deploying the SubscriptionRegistry ALONE: the already-deployed
 # DataRegistry it checks registration against. Prompted if empty and required.
@@ -48,7 +56,11 @@ log_step() {
     echo -e "==================================================" >&2
 }
 
-cast_call() { cast call "$1" "$2" --rpc-url "$RPC_ENDPOINT"; }
+# Extra args after the signature become call arguments.
+cast_call() {
+    local contract="$1" signature="$2"; shift 2
+    cast call "$contract" "$signature" "$@" --rpc-url "$RPC_ENDPOINT"
+}
 
 cast_send() {
     local contract="$1" signature="$2"; shift 2
@@ -121,13 +133,22 @@ echo "=========================================" >&2
 DATA_REGISTRY=""
 SUBSCRIPTION_REGISTRY=""
 
+APP_ID=""
+
 # DataRegistry (fresh) when deploying it or both.
 if [ "$TARGET" = "both" ] || [ "$TARGET" = "data-registry" ]; then
     log_step "Deploying DataRegistry"
     DATA_REGISTRY=$(deploy_stylus "$SCRIPT_DIR/data_registry" \
-        "$ADMIN_ADDR" "$USDC_ADDR" "$REGISTRATION_FEE")
+        "$ADMIN_ADDR" "$REGISTRATION_FEE")
     echo "Verifying registry admin..." >&2
     cast_call "$DATA_REGISTRY" "admin()(address)"
+
+    log_step "Registering default app namespace: $DEFAULT_APP_NAME"
+    APP_ID=$(cast keccak "$DEFAULT_APP_NAME")
+    echo "app_id = $APP_ID" >&2
+    cast_send "$DATA_REGISTRY" "registerApp(bytes32)" "$APP_ID"
+    echo "Verifying app owner..." >&2
+    cast_call "$DATA_REGISTRY" "getAppOwner(bytes32)(address)" "$APP_ID"
 fi
 
 # Subscription-only needs the address of an existing DataRegistry to point at — the
@@ -159,6 +180,7 @@ if [ -n "$DATA_REGISTRY" ]; then
         echo "DataRegistry:            $DATA_REGISTRY" >&2
     fi
 fi
+[ -n "$APP_ID" ] && echo "Default app \"$DEFAULT_APP_NAME\": $APP_ID" >&2
 [ -n "$SUBSCRIPTION_REGISTRY" ] && echo "SubscriptionRegistry:    $SUBSCRIPTION_REGISTRY" >&2
 echo "=========================================" >&2
 echo "Next: repoint fangorn/src/config.ts, websites/fangorn/.env.local," >&2
