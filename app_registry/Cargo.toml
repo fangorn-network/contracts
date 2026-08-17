@@ -1,11 +1,11 @@
 [package]
-name = "settlement_registry"
+name = "app_registry"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-alloy-primitives = { version = "1.5.7", default-features = false }
-alloy-sol-types = { version = "1.5.7", default-features = false }
+alloy-primitives = "1.5.7"
+alloy-sol-types = "1.5.7"
 stylus-sdk = "0.10.7"
 
 [dev-dependencies]
@@ -26,4 +26,7 @@ codegen-units = 1
 strip = true
 lto = true
 panic = "abort"
+
+# If you need to reduce the binary size, it is advisable to try other
+# optimization levels, such as "s" and "z"
 opt-level = 3
