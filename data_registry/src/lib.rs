@@ -85,7 +85,7 @@ sol_interface! {
 #[storage]
 #[entrypoint]
 pub struct DataRegistry {
-    /// Protocol admin.
+    /// Protocol admin (has global takedown authority)
     admin: StorageAddress,
     /// Registration fee (in native chain token or $FANG).
     registration_fee: StorageU256,
@@ -96,12 +96,22 @@ pub struct DataRegistry {
     /// The AppRegistry consulted for app existence and per-app publisher membership.
     app_registry: StorageAddress,
     /// Canonical state timeline heads keyed by composite namespace hash:
-    /// keccak256(app_id ‖ publisher ‖ subspace_id) => latest valid PailRootCID bytes
+    /// keccak256(app_id ‖ publisher ‖ subspace_id) => latest valid CID
     namespace_heads: StorageMap<FixedBytes<32>, StorageFixedBytes<32>>,
 }
 
 #[public]
 impl DataRegistry {
+
+
+    // q: do we register each publisher globally AND per app, or should it just be per-app?
+    // probably per app right? per app + take a cut of each registration
+    // but then we can't reliably calculate the number of global publishers as easily
+    // here, it's singular, in the app registry there may be MANY
+    // However, double registration presents a fair amount of friction in some ways
+    // we can *try* to hide it, but it's unclear if this is really *needed*
+    // this is actually a hard choice..
+
     #[constructor]
     pub fn init(&mut self, admin: Address, registration_fee: U256, app_registry: Address) {
         self.admin.set(admin);
@@ -164,7 +174,7 @@ impl DataRegistry {
             return Err(RegistryError::PublisherSuspendedErr(PublisherSuspendedErr {}));
         }
 
-        // fail if not an active publisher
+        // fail if not an active publisher in the app registry for the given app
         let registry = IAppRegistry::new(self.app_registry.get());
         if !registry.is_registered_for_app(self.vm(), Call::new(), app_id, sender).unwrap_or(false) {
             return Err(RegistryError::NotRegisteredForApp(NotRegisteredForApp {}));

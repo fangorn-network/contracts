@@ -46,14 +46,13 @@ sol! {
     /// An app was registered
     event AppRegistered(bytes32 indexed app_id, address indexed owner);
 
-    /// The app's terms moved. Every publisher on the old hash is dropped back to
-    /// "must accept again" by that fact alone — see `isRegisteredForApp`.
+    /// The app's terms changed and every publisher on the old hash must accept the new terms 
+    /// before they can publish again
     event AppTermsChanged(bytes32 indexed app_id, bytes32 terms_hash, string terms_uri);
 
     event AppFeeChanged(bytes32 indexed app_id, uint256 fee);
 
-    /// A publisher joined an app AND accepted `terms_hash` by doing so. This event
-    /// is the durable, self-verifying record that replaces a line in a log file.
+    /// A publisher joined an app AND accepted `terms_hash`
     event PublisherJoined(
         bytes32 indexed app_id,
         address indexed publisher,
@@ -61,8 +60,7 @@ sol! {
         uint256 fee
     );
 
-    /// An app owner ejected a publisher from their market. Global standing in the
-    /// DataRegistry is untouched — this is one market's door, not the network's.
+    /// An app owner suspended a publisher from their app
     event PublisherSuspendedForApp(bytes32 indexed app_id, address indexed publisher);
 
     event PublisherReinstatedForApp(bytes32 indexed app_id, address indexed publisher);
@@ -91,25 +89,21 @@ impl fmt::Debug for AppRegistryError {
 #[storage]
 #[entrypoint]
 pub struct AppRegistry {
-    /// Protocol admin. Can re-point the DataRegistry and rescue stuck ETH, and
-    /// deliberately CANNOT set an app's terms or eject its publishers — those
-    /// belong to the app owner.
+    /// The app registry admin can re-point the DataRegistry, rescue stuck ETH, and has global takedown authority
     admin: StorageAddress,
-    /// app_id => owner. The canonical answer to "does this app exist and whose is
-    /// it", moved here from the DataRegistry so one contract holds an app's
-    /// identity, its terms and its membership together.
+    /// app_id => owner
     apps: StorageMap<FixedBytes<32>, StorageAddress>,
-    /// app_id => hash of the app's current publisher terms. Zero means the app has
-    /// set none, and registration is refused rather than silently meaning nothing.
+    /// app_id => hash of the app's current publisher terms (e.g. an IPFS cid)
+    // Zero means there are no terms set
     app_terms: StorageMap<FixedBytes<32>, StorageFixedBytes<32>>,
-    /// app_id => where those terms can be read. Stored because a hash nobody can
-    /// resolve to a document is not terms anyone agreed to.
+    /// app_id => URI to read the terms (e.g. an IPFS gateway)
     app_terms_uri: StorageMap<FixedBytes<32>, StorageString>,
-    /// app_id => join fee in wei, paid to the app owner. Zero is normal.
+    /// app_id => join fee (in wei) - can be zerof
     app_fees: StorageMap<FixedBytes<32>, StorageU256>,
     /// keccak256(app_id ‖ publisher) => lifecycle status.
     statuses: StorageMap<FixedBytes<32>, StorageU8>,
-    /// keccak256(app_id ‖ publisher) => the terms hash they actually accepted.
+    /// keccak256(app_id ‖ publisher) => the terms hash they actually accepted
+    /// used to determine if they must accept new terms
     accepted: StorageMap<FixedBytes<32>, StorageFixedBytes<32>>,
 }
 
@@ -350,8 +344,6 @@ impl AppRegistry {
         Ok(())
     }
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
