@@ -1,48 +1,10 @@
-//! SettlementRegistry — pay for a resource, then prove you paid without saying
-//! who you are.
+//! SettlementRegistry
+//! This contract leverages Semaphore alongside ERC-3009 transferWithAuth to enable a private-payment-for-content mechanism.
 //!
-//! ## What changed in v2, and why
+//! * **One Semaphore group per resource.**
+//! * **Derived resourceIds** as keccak(publisher ++ uid)
 //!
-//! v1 kept ONE Semaphore group for the whole registry. `register()` paid a
-//! publisher and added the buyer to that global group; `settle()` then verified
-//! group membership with the resource as the proof scope — and nothing else. The
-//! consequences were not subtle:
 //!
-//!   1. Membership meant "paid for *something*, once". A buyer who paid one
-//!      publisher $0.10 could settle every resource in the registry, from every
-//!      publisher, forever.
-//!   2. `create_resource` was unauthenticated and took an arbitrary price, so
-//!      anyone could mint a resource priced at zero, register against it for
-//!      free, and land in that same global group. Total paywall bypass for the
-//!      cost of gas.
-//!   3. `register()` took the payment recipient as an argument and never checked
-//!      it against the resource's owner. A buyer could pay themselves and still
-//!      join the group.
-//!
-//! v2 closes all three:
-//!
-//!   * **One Semaphore group per resource.** Membership in resource R's group is
-//!     exactly "somebody paid for R", so `settle(R)` verifying against R's own
-//!     group is a payment check that stays anonymous. The anonymity set narrows
-//!     from "every buyer ever" to "the buyers of this resource" — that is the
-//!     real cost of correctness here, and it is the right trade: an entitlement
-//!     nobody paid for is not privacy, it is a broken paywall.
-//!   * **The registry derives the resourceId** as keccak(publisher ++ uid), so a
-//!     resourceId cannot be squatted, front-run, or claimed by anyone but the
-//!     publisher whose address is baked into it.
-//!   * **`register()` pays `resource_owners[id]`**, read from storage. There is
-//!     no recipient argument to get wrong.
-//!
-//! v2 also adds a `disabled` flag (owner or admin), because takedown had no
-//! on-chain representation at all and the access gate had nothing to consult.
-//!
-//! ## What this contract does NOT do
-//!
-//! Disabling stops new registrations and new settlements. It does not and cannot
-//! un-settle an existing buyer: `is_settled` stays true, because that is a
-//! historical fact. Enforcement of a takedown against already-settled buyers is
-//! the access gate's job (refuse to release the DEK for a disabled resource),
-//! not the chain's.
 #![cfg_attr(not(any(test, feature = "export-abi")), no_main)]
 extern crate alloc;
 
@@ -98,15 +60,13 @@ pub enum SettlementError {
 pub struct SettlementRegistry {
     usdc_address:      StorageAddress,
     semaphore_address: StorageAddress,
-    /// May be zero — a registry deployed with no admin has no takedown authority
-    /// beyond each resource's own owner. That is a deployment-time choice about
-    /// who can pull content, and it is deliberately visible on-chain.
+    /// Can be zero, takedown authority exists only at the app-level
     admin:             StorageAddress,
     resource_price:    StorageMap<FixedBytes<32>, StorageU256>,
     resource_owners:   StorageMap<FixedBytes<32>, StorageAddress>,
     resource_uris:     StorageMap<FixedBytes<32>, StorageString>,
     resource_hooks:    StorageMap<FixedBytes<32>, StorageAddress>,
-    /// resourceId → its own Semaphore group. The heart of v2.
+    // per-resource semaphore groups
     resource_groups:   StorageMap<FixedBytes<32>, StorageU256>,
     resource_disabled: StorageMap<FixedBytes<32>, StorageBool>,
     nullifiers:        StorageMap<U256, StorageBool>,
@@ -116,13 +76,7 @@ pub struct SettlementRegistry {
 
 #[public]
 impl SettlementRegistry {
-    /// `admin` may be `Address::ZERO` for a registry nobody can administer.
-    ///
-    /// Note there is no group created here any more. Groups are per-resource and
-    /// are created by `create_resource`, which means this registry is the admin
-    /// of every group it creates — `addMember` is `onlyGroupAdmin`, and
-    /// Semaphore's admin handover is two-step, which this contract cannot
-    /// accept. Creating each group here keeps that property per resource.
+    
     #[constructor]
     pub fn init(
         &mut self,
@@ -137,7 +91,7 @@ impl SettlementRegistry {
         Ok(())
     }
 
-    /// Hand over (or renounce, with `Address::ZERO`) the takedown authority.
+    /// Set a new admin (has global takedown authority)
     pub fn set_admin(&mut self, new_admin: Address) -> Result<(), SettlementError> {
         let current = self.admin.get();
         if self.vm().msg_sender() != current || current == Address::ZERO {
@@ -148,16 +102,9 @@ impl SettlementRegistry {
         Ok(())
     }
 
-    /// Create a resource owned by the caller, and its Semaphore group.
+    /// Create a resource and associated Semaphore group
+    /// The resourceId is computed as `keccak(publisher || uid)`.
     ///
-    /// The resourceId is DERIVED, not supplied: `keccak(publisher ++ uid)`. In v1
-    /// the caller passed the id, which meant the id space was first-come — anyone
-    /// watching the mempool could claim a publisher's id, set their own price and
-    /// URI, and collect the payments while the real publisher's `create_resource`
-    /// reverted forever. Deriving it makes that impossible: an id nobody can
-    /// produce without the publisher's address is an id nobody can steal.
-    ///
-    /// Returns the id so the caller does not have to recompute it.
     pub fn create_resource(
         &mut self,
         uid: FixedBytes<32>,
@@ -171,8 +118,7 @@ impl SettlementRegistry {
             return Err(SettlementError::AlreadyRegistered(AlreadyRegistered {}));
         }
 
-        // One group per resource. Created before any state is written so a
-        // Semaphore failure leaves nothing half-built.
+        // One group per resource
         let ret = unsafe {
             RawCall::new(self.vm())
                 .call(self.semaphore_address.get(), &keccak256(b"createGroup()")[..4])
@@ -188,11 +134,6 @@ impl SettlementRegistry {
         self.resource_uris.setter(resource_id).set_str(&uri);
         self.resource_groups.setter(resource_id).set(group_id);
 
-        // v1 seeded each new resource into the global group with
-        // keccak(resourceId) as a fake "member". Nothing can ever prove
-        // membership with that leaf (there is no identity secret behind it), so
-        // it bought nothing and inflated every member count and every client-side
-        // group rebuild. A group's members are now exactly its buyers.
         self.vm().log(ResourceCreated { resourceId: resource_id, owner, price, groupId: group_id, uri });
         Ok(resource_id)
     }
@@ -225,12 +166,8 @@ impl SettlementRegistry {
         Ok(())
     }
 
-    /// Take a resource down (or put it back). Either the owner or the registry
-    /// admin may do this — the owner because it is their content, the admin
-    /// because a platform served with a valid takedown notice needs a lever that
-    /// does not depend on the publisher's cooperation.
-    ///
-    /// Existing settlements are untouched; see the module docs.
+    /// Disable (takedown) a resource down (or put it back)
+    /// Only callable by the owner or the registrya dmin
     pub fn set_disabled(
         &mut self,
         resource_id: FixedBytes<32>,
@@ -248,17 +185,7 @@ impl SettlementRegistry {
     }
 
     /// Pay for a resource and join its group.
-    ///
-    /// There is no `to` parameter. v1 accepted one and forwarded it straight to
-    /// `transferWithAuthorization` while only checking the AMOUNT, so a buyer
-    /// could sign an authorization paying themselves the correct price and join
-    /// the group having paid the publisher nothing. The recipient now comes from
-    /// storage and cannot be influenced by the caller.
-    ///
-    /// A zero-priced resource skips the transfer entirely rather than demanding a
-    /// signature to move zero dollars. Free is free — and because groups are
-    /// per-resource, joining a free resource's group entitles the joiner to that
-    /// resource and nothing else.
+    /// A zero-priced resource skips the transfer entirely
     pub fn register(
         &mut self,
         resource_id:         FixedBytes<32>,
@@ -306,11 +233,9 @@ impl SettlementRegistry {
         Ok(())
     }
 
-    /// Prove — without revealing which buyer you are — that you are a member of
-    /// THIS resource's group, and record access for `stealth_address`.
+    /// Prove that you are a member of the resource's group without revealing which buyer you 
+    /// are and record access for `stealth_address`.
     ///
-    /// The group id comes from the resource. In v1 it came from a single global
-    /// field, which is what made one payment unlock the whole registry.
     pub fn settle(
         &mut self,
         resource_id:       FixedBytes<32>,
@@ -358,10 +283,6 @@ impl SettlementRegistry {
         Ok(())
     }
 
-    // ── views ────────────────────────────────────────────────────────────────
-
-    /// The id a given publisher's uid maps to. Clients derive this themselves;
-    /// exposing it keeps the two derivations from drifting apart.
     pub fn resource_id_for(&self, publisher: Address, uid: FixedBytes<32>) -> FixedBytes<32> {
         resource_id_of(publisher, uid)
     }
@@ -404,12 +325,10 @@ impl SettlementRegistry {
     }
 }
 
-/// keccak(publisher ++ uid) — the whole anti-squatting property in one line.
+/// keccak(publisher ++ uid)
 fn resource_id_of(publisher: Address, uid: FixedBytes<32>) -> FixedBytes<32> {
     hash_concat(publisher.as_slice(), uid.as_slice())
 }
-
-// ── ABI Encoders ─────────────────────────────────────────────────────────────
 
 #[inline(never)]
 fn sel_add_member(group_id: U256, commitment: U256) -> alloc::vec::Vec<u8> {
