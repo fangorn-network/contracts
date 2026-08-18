@@ -45,7 +45,7 @@ DEFAULT_APP_NAME="${DEFAULT_APP_NAME:-fangorn}"
 # served. An app with a zero terms hash cannot be joined, so this must be real
 # before any publisher can register for it.
 # note: this hash is for testing only and has no real significance
-DEFAULT_APP_TERMS_HASH="${DEFAULT_APP_TERMS_HASH:-0x523ba247a93d0a32fe397bac62acad8b7e6dbf543b79d5ee07d2d6847e2fb761}"
+DEFAULT_APP_TERMS_HASH="${DEFAULT_APP_TERMS_HASH:-0x0000000000000000000000000000000000000000}"
 DEFAULT_APP_TERMS_URI="${DEFAULT_APP_TERMS_URI:-https://fangorn.network/terms.html}"
 DEFAULT_APP_JOIN_FEE="${DEFAULT_APP_JOIN_FEE:-0}"
 SUBSCRIPTION_FEE="${SUBSCRIPTION_FEE:-0}"

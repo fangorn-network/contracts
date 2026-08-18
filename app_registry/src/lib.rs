@@ -40,6 +40,7 @@ sol! {
     error AlreadyRegistered();
     error NotRegistered();
     error PublisherSuspendedErr();
+    error AppSuspendedErr();
     error JoinFeeRequired();
     error TransferFailed();
 
@@ -64,6 +65,9 @@ sol! {
     event PublisherSuspendedForApp(bytes32 indexed app_id, address indexed publisher);
 
     event PublisherReinstatedForApp(bytes32 indexed app_id, address indexed publisher);
+
+    /// The protocol admin suspended (or reinstated) an entire app
+    event AppSuspensionChanged(bytes32 indexed app_id, bool suspended);
 }
 
 #[derive(SolidityError)]
@@ -76,6 +80,7 @@ pub enum AppRegistryError {
     AlreadyRegistered(AlreadyRegistered),
     NotRegistered(NotRegistered),
     PublisherSuspendedErr(PublisherSuspendedErr),
+    AppSuspendedErr(AppSuspendedErr),
     JoinFeeRequired(JoinFeeRequired),
     TransferFailed(TransferFailed),
 }
@@ -89,7 +94,7 @@ impl fmt::Debug for AppRegistryError {
 #[storage]
 #[entrypoint]
 pub struct AppRegistry {
-    /// The app registry admin can re-point the DataRegistry, rescue stuck ETH, and has global takedown authority
+    /// The app registry admin
     admin: StorageAddress,
     /// app_id => owner
     apps: StorageMap<FixedBytes<32>, StorageAddress>,
@@ -105,6 +110,8 @@ pub struct AppRegistry {
     /// keccak256(app_id ‖ publisher) => the terms hash they actually accepted
     /// used to determine if they must accept new terms
     accepted: StorageMap<FixedBytes<32>, StorageFixedBytes<32>>,
+    /// app_id => admin takedown flag. A suspended app is dead for every publisher at once
+    app_suspended: StorageMap<FixedBytes<32>, StorageBool>,
 }
 
 #[public]
@@ -214,6 +221,22 @@ impl AppRegistry {
         Ok(())
     }
 
+    /// Suspend an entire app. Admin-only global takedown: every publisher — the owner
+    /// included — reads as unregistered until it is reinstated. Memberships are left
+    /// intact so a reinstatement restores them exactly.
+    pub fn suspend_app(&mut self, app_id: FixedBytes<32>) -> Result<(), AppRegistryError> {
+        self.set_app_suspended(app_id, true)
+    }
+
+    /// Lift an app-level suspension
+    pub fn reinstate_app(&mut self, app_id: FixedBytes<32>) -> Result<(), AppRegistryError> {
+        self.set_app_suspended(app_id, false)
+    }
+
+    pub fn is_app_suspended(&self, app_id: FixedBytes<32>) -> bool {
+        self.app_suspended.get(app_id)
+    }
+
     /// Register to publish to an app
     /// By registering, you are agreeing to the app terms and conditions.
     #[payable]
@@ -225,6 +248,10 @@ impl AppRegistry {
         let owner = self.apps.get(app_id);
         if owner == Address::ZERO {
             return Err(AppRegistryError::AppNotFound(AppNotFound {}));
+        }
+        // block on a suspended app
+        if self.app_suspended.get(app_id) {
+            return Err(AppRegistryError::AppSuspendedErr(AppSuspendedErr {}));
         }
 
         // empty terms are invalid
@@ -240,7 +267,7 @@ impl AppRegistry {
         let key = member_key(app_id, sender);
         let status = self.statuses.get(key).to::<u8>();
 
-        // must not be suspended
+        // must not be suspended as a publisher
         if status == STATUS_SUSPENDED {
             return Err(AppRegistryError::PublisherSuspendedErr(PublisherSuspendedErr {}));
         }
@@ -270,10 +297,12 @@ impl AppRegistry {
     }
 
     /// Check if a publisher is actively registered in an app
+    /// returns false if the publisher is suspended or if the app is suspended
     pub fn is_registered_for_app(&self, app_id: FixedBytes<32>, publisher: Address) -> bool {
         let key = member_key(app_id, publisher);
         let current = self.app_terms.get(app_id);
-        current != FixedBytes::<32>::ZERO
+        !self.app_suspended.get(app_id)
+            && current != FixedBytes::<32>::ZERO
             && self.statuses.get(key).to::<u8>() == STATUS_ACTIVE
             && self.accepted.get(key) == current
     }
@@ -325,6 +354,20 @@ impl AppRegistry {
 }
 
 impl AppRegistry {
+    fn set_app_suspended(
+        &mut self,
+        app_id: FixedBytes<32>,
+        suspended: bool,
+    ) -> Result<(), AppRegistryError> {
+        self.only_admin()?;
+        if self.apps.get(app_id) == Address::ZERO {
+            return Err(AppRegistryError::AppNotFound(AppNotFound {}));
+        }
+        self.app_suspended.setter(app_id).set(suspended);
+        self.vm().log(AppSuspensionChanged { app_id, suspended });
+        Ok(())
+    }
+
     /// Mark an app owner as an active publisher of their own app
     fn join_owner(&mut self, app_id: FixedBytes<32>, owner: Address, terms_hash: FixedBytes<32>) {
         let key = member_key(app_id, owner);
@@ -580,6 +623,47 @@ mod tests {
         vm.set_sender(APP_OWNER);
         r.reinstate_for_app(APP, PUBLISHER).unwrap();
         assert!(r.is_registered_for_app(APP, PUBLISHER));
+    }
+
+    #[test]
+    fn the_admin_can_take_down_a_whole_app() {
+        let vm = TestVM::default();
+        let mut r = new_registry(&vm);
+        open_app(&vm, &mut r);
+        vm.set_sender(APP_OWNER);
+        r.register_app(OTHER_APP, TERMS_V1, String::new(), U256::ZERO).unwrap();
+
+        vm.set_sender(PUBLISHER);
+        vm.set_balance(CONTRACT, U256::from(FEE));
+        vm.set_value(U256::from(FEE));
+        r.register_for_app(APP, TERMS_V1).unwrap();
+
+        // The app owner has no say over their own takedown, and a stranger even less.
+        vm.set_sender(APP_OWNER);
+        assert!(r.suspend_app(APP).is_err(), "an app owner suspended their own app");
+        vm.set_sender(STRANGER);
+        assert!(r.suspend_app(APP).is_err(), "a stranger suspended an app");
+
+        vm.set_sender(ADMIN);
+        assert!(r.suspend_app(FixedBytes([0xCC; 32])).is_err(), "suspended an app nobody owns");
+        r.suspend_app(APP).unwrap();
+
+        // Everyone is out, owner included, and nothing about the other app moved.
+        assert!(!r.is_registered_for_app(APP, PUBLISHER));
+        assert!(!r.is_registered_for_app(APP, APP_OWNER), "a takedown left the owner publishing");
+        assert!(r.is_registered_for_app(OTHER_APP, APP_OWNER), "a takedown leaked into another app");
+
+        // No buying back in, and per-publisher status is untouched underneath.
+        vm.set_sender(PUBLISHER);
+        vm.set_value(U256::from(FEE));
+        assert!(r.register_for_app(APP, TERMS_V1).is_err(), "joined a suspended app");
+        assert_eq!(r.status_for_app(APP, PUBLISHER), STATUS_ACTIVE);
+
+        // Reinstating restores the memberships exactly as they were.
+        vm.set_sender(ADMIN);
+        r.reinstate_app(APP).unwrap();
+        assert!(r.is_registered_for_app(APP, PUBLISHER), "reinstating an app lost its publishers");
+        assert!(r.is_registered_for_app(APP, APP_OWNER));
     }
 
     #[test]

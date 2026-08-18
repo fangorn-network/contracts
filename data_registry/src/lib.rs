@@ -128,6 +128,8 @@ impl DataRegistry {
         if current_status == STATUS_ACTIVE {
             return Err(RegistryError::AlreadyRegistered(AlreadyRegistered {}));
         }
+
+        // maybe remove?
         if self.vm().msg_value() < self.registration_fee.get() {
             return Err(RegistryError::RegistrationFeeRequired(RegistrationFeeRequired {}));
         }
@@ -155,7 +157,7 @@ impl DataRegistry {
     /// Mutating State Transition Gateway
     ///
     /// Enforces linear timeline execution (Compare-And-Swap) over `app_id:sender:subspace_id`.
-    /// TODO: needs a merkle proof?
+    /// TODO: needs a proof?
     pub fn commit_state_root(
         &mut self,
         app_id: FixedBytes<32>,
