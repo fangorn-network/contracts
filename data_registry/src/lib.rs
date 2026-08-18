@@ -1,12 +1,11 @@
 //! DataRegistry
 //!
-//! This single contract handles publisher registration and enforces cryptographically
-//! secure, linear timeline state updates (Compare-and-Swap) for all multi-tenant namespaces.
-//! All schemas, data sources, and indices live off-chain within the Pail Merkle Trie structure.
+//! The DataRegistry handles: 
+//! - per-app publisher registration
+//! -  enforces cryptographically secure, linear timeline state updates (Compare-and-Swap) for all multi-tenant namespaces.
 //!
-//! Namespaces are hierarchical: `app_id:publisher:subspace_id`, flattened on-chain into
-//! keccak256(app_id ‖ publisher ‖ subspace_id). Callers hash human-readable path segments
-//! client-side; no dynamic strings ever touch storage.
+//! Namespaces are hierarchical: `app_id:publisher:subspace_id`
+//! flattened on-chain using keccak256(app_id ‖ publisher ‖ subspace_id)
 
 #![cfg_attr(not(any(test, feature = "export-abi")), no_main)]
 #![cfg_attr(feature = "contract-client-gen", allow(unused_imports))]
@@ -27,13 +26,7 @@ sol! {
     error Unauthorized();
     error StaleStateRoot();
     error PublisherSuspendedErr();
-    error AppAlreadyRegistered();
-    error AppNotFound();
-
-    event AppRegistered(
-        bytes32 indexed app_id,
-        address indexed owner
-    );
+    error NotRegisteredForApp();
 
     event PublisherRegistered(
         address indexed publisher,
@@ -69,8 +62,7 @@ pub enum RegistryError {
     Unauthorized(Unauthorized),
     StaleStateRoot(StaleStateRoot),
     PublisherSuspendedErr(PublisherSuspendedErr),
-    AppAlreadyRegistered(AppAlreadyRegistered),
-    AppNotFound(AppNotFound),
+    NotRegisteredForApp(NotRegisteredForApp),
 }
 
 impl fmt::Debug for RegistryError {
@@ -79,15 +71,21 @@ impl fmt::Debug for RegistryError {
     }
 }
 
-// Explicit status mappings for the internal state machine
+// Explicit status mappings
 const STATUS_UNREGISTERED: u8 = 0;
 const STATUS_ACTIVE: u8 = 1;
 const STATUS_SUSPENDED: u8 = 2;
 
+sol_interface! {
+    interface IAppRegistry {
+        function isRegisteredForApp(bytes32 app_id, address publisher) external view returns (bool);
+    }
+}
+
 #[storage]
 #[entrypoint]
 pub struct DataRegistry {
-    /// Protocol admin.
+    /// Protocol admin (has global takedown authority)
     admin: StorageAddress,
     /// Registration fee (in native chain token or $FANG).
     registration_fee: StorageU256,
@@ -95,39 +93,33 @@ pub struct DataRegistry {
     statuses: StorageMap<Address, StorageU8>,
     /// Number of active global publishers
     publisher_count: StorageU64,
-    /// Registered app namespaces: app_id => app owner address
-    apps: StorageMap<FixedBytes<32>, StorageAddress>,
+    /// The AppRegistry consulted for app existence and per-app publisher membership.
+    app_registry: StorageAddress,
     /// Canonical state timeline heads keyed by composite namespace hash:
-    /// keccak256(app_id ‖ publisher ‖ subspace_id) => latest valid PailRootCID bytes
+    /// keccak256(app_id ‖ publisher ‖ subspace_id) => latest valid CID
     namespace_heads: StorageMap<FixedBytes<32>, StorageFixedBytes<32>>,
 }
 
 #[public]
 impl DataRegistry {
+
+
+    // q: do we register each publisher globally AND per app, or should it just be per-app?
+    // probably per app right? per app + take a cut of each registration
+    // but then we can't reliably calculate the number of global publishers as easily
+    // here, it's singular, in the app registry there may be MANY
+    // However, double registration presents a fair amount of friction in some ways
+    // we can *try* to hide it, but it's unclear if this is really *needed*
+    // this is actually a hard choice..
+
     #[constructor]
-    pub fn init(&mut self, admin: Address, registration_fee: U256) {
+    pub fn init(&mut self, admin: Address, registration_fee: U256, app_registry: Address) {
         self.admin.set(admin);
         self.registration_fee.set(registration_fee);
-    }
-
-    /// Register a root application namespace (e.g. keccak256("app_name")). First come, first served.
-    pub fn register_app(&mut self, app_id: FixedBytes<32>) -> Result<(), RegistryError> {
-        let sender = self.vm().msg_sender();
-        if self.apps.get(app_id) != Address::ZERO {
-            return Err(RegistryError::AppAlreadyRegistered(AppAlreadyRegistered {}));
-        }
-
-        self.apps.setter(app_id).set(sender);
-        self.vm().log(AppRegistered {
-            app_id,
-            owner: sender,
-        });
-
-        Ok(())
+        self.app_registry.set(app_registry);
     }
 
     /// Register as a new data publisher or reactivate a suspended registration on the network.
-    /// Allocates or unfreezes an isolated cryptographic namespace tracking slot.
     #[payable]
     pub fn register(&mut self) -> Result<(), RegistryError> {
         let sender = self.vm().msg_sender();
@@ -136,6 +128,8 @@ impl DataRegistry {
         if current_status == STATUS_ACTIVE {
             return Err(RegistryError::AlreadyRegistered(AlreadyRegistered {}));
         }
+
+        // maybe remove?
         if self.vm().msg_value() < self.registration_fee.get() {
             return Err(RegistryError::RegistrationFeeRequired(RegistrationFeeRequired {}));
         }
@@ -162,9 +156,8 @@ impl DataRegistry {
 
     /// Mutating State Transition Gateway
     ///
-    /// The only state-modifying route needed for data ingestion, schema registration, or deletion.
     /// Enforces linear timeline execution (Compare-And-Swap) over `app_id:sender:subspace_id`.
-    /// TODO: needs a merkle proof
+    /// TODO: needs a proof?
     pub fn commit_state_root(
         &mut self,
         app_id: FixedBytes<32>,
@@ -175,26 +168,26 @@ impl DataRegistry {
         let sender = self.vm().msg_sender();
         let current_status = self.statuses.get(sender);
         
-        // 1. Authenticate identity and lifecycle constraints
+        // must be an active publisher
         if current_status == STATUS_UNREGISTERED {
             return Err(RegistryError::NotRegistered(NotRegistered {}));
         }
         if current_status == STATUS_SUSPENDED {
             return Err(RegistryError::PublisherSuspendedErr(PublisherSuspendedErr {}));
         }
-        
-        // 2. Ensure the application namespace exists
-        if self.apps.get(app_id) == Address::ZERO {
-            return Err(RegistryError::AppNotFound(AppNotFound {}));
+
+        // fail if not an active publisher in the app registry for the given app
+        let registry = IAppRegistry::new(self.app_registry.get());
+        if !registry.is_registered_for_app(self.vm(), Call::new(), app_id, sender).unwrap_or(false) {
+            return Err(RegistryError::NotRegisteredForApp(NotRegisteredForApp {}));
         }
 
-        // 3. Validate linear sequence progress for this subspace only
+        // validate linear sequence progress for this subspace only
         let ns_key = namespace_key(app_id, sender, subspace_id);
         if self.namespace_heads.get(ns_key) != old_root {
             return Err(RegistryError::StaleStateRoot(StaleStateRoot {}));
         }
 
-        // 4. Persist the state change
         self.namespace_heads.setter(ns_key).set(new_root);
 
         self.vm().log(StateCommitted {
@@ -209,9 +202,7 @@ impl DataRegistry {
         Ok(())
     }
 
-    // ── Views ─────────────────────────────────────────────────────────────────
-
-    /// Read-route for indexing nodes and data consumers to obtain the latest state map reference.
+    /// Get the latest head for a specific publisher's subspace within an application
     pub fn get_namespace_head(
         &self,
         app_id: FixedBytes<32>,
@@ -221,8 +212,8 @@ impl DataRegistry {
         self.namespace_heads.get(namespace_key(app_id, publisher, subspace_id))
     }
 
-    pub fn get_app_owner(&self, app_id: FixedBytes<32>) -> Address {
-        self.apps.get(app_id)
+    pub fn app_registry(&self) -> Address {
+        self.app_registry.get()
     }
 
     pub fn get_publisher_status(&self, publisher: Address) -> u8 {
@@ -245,9 +236,6 @@ impl DataRegistry {
         self.admin.get()
     }
 
-    // ── Admin ─────────────────────────────────────────────────────────────────
-
-    /// Allows governance/admin to forcefully suspend a malicious or decommissioned publisher.
     pub fn suspend_publisher(&mut self, publisher: Address) -> Result<(), RegistryError> {
         self.only_admin()?;
         
@@ -266,6 +254,38 @@ impl DataRegistry {
         Ok(())
     }
 
+    pub fn set_app_registry(&mut self, registry: Address) -> Result<(), RegistryError> {
+        self.only_admin()?;
+        self.app_registry.set(registry);
+        Ok(())
+    }
+
+    /// Restore one namespace head after a redeploy.
+    /// This is for assisting in migration to a new version of the data registry contract
+    pub fn seed_namespace_head(
+        &mut self,
+        app_id: FixedBytes<32>,
+        publisher: Address,
+        subspace_id: FixedBytes<32>,
+        root: FixedBytes<32>,
+    ) -> Result<(), RegistryError> {
+        self.only_admin()?;
+        let ns_key = namespace_key(app_id, publisher, subspace_id);
+        if self.namespace_heads.get(ns_key) != FixedBytes::ZERO {
+            return Err(RegistryError::StaleStateRoot(StaleStateRoot {}));
+        }
+        self.namespace_heads.setter(ns_key).set(root);
+        self.vm().log(StateCommitted {
+            namespace_key: ns_key,
+            app_id,
+            publisher,
+            subspace_id,
+            old_root: FixedBytes::ZERO,
+            new_root: root,
+        });
+        Ok(())
+    }
+
     pub fn set_registration_fee(&mut self, fee: U256) -> Result<(), RegistryError> {
         self.only_admin()?;
         self.registration_fee.set(fee);
@@ -274,7 +294,7 @@ impl DataRegistry {
     }
 }
 
-/// keccak256(app_id ‖ publisher ‖ subspace_id) — the flattened hierarchical namespace slot.
+/// keccak256(app_id ‖ publisher ‖ subspace_id)
 fn namespace_key(
     app_id: FixedBytes<32>,
     publisher: Address,
@@ -296,13 +316,17 @@ impl DataRegistry {
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_sol_types::{sol, SolCall};
     use stylus_sdk::alloy_primitives::{address, hex};
     use stylus_sdk::testing::TestVM;
+
+    // Local ABI defs used only to build the exact calldata TestVM matches on.
+    sol! {
+        function isRegisteredForApp(bytes32 app_id, address publisher) external view returns (bool);
+    }
 
     const ADMIN_ADDR: Address = address!("1111111111111111111111111111111111111111");
     const PUB_ADDR: Address = address!("2222222222222222222222222222222222222222");
@@ -310,14 +334,24 @@ mod tests {
     const APP_ID: FixedBytes<32> = FixedBytes([1u8; 32]);
     const SUB_A: FixedBytes<32> = FixedBytes([2u8; 32]);
     const SUB_B: FixedBytes<32> = FixedBytes([3u8; 32]);
+    const APP_REGISTRY_ADDR: Address = address!("7777777777777777777777777777777777777777");
 
-    /// Registered app + registered, active publisher.
+    fn bool_word(b: bool) -> Vec<u8> {
+        U256::from(b as u64).to_be_bytes::<32>().to_vec()
+    }
+
+    /// Mock the AppRegistry's membership view — the only cross-call commit makes.
+    fn mock_member(vm: &TestVM, app_id: FixedBytes<32>, publisher: Address, joined: bool) {
+        let data = isRegisteredForAppCall { app_id, publisher }.abi_encode();
+        vm.mock_static_call(APP_REGISTRY_ADDR, data, Ok(bool_word(joined)));
+    }
+
+    /// An app that exists with PUB_ADDR joined, plus a globally registered publisher.
     fn setup(vm: &TestVM) -> DataRegistry {
         let mut registry = DataRegistry::from(vm);
-        registry.init(ADMIN_ADDR, U256::from(FEE_AMT));
+        registry.init(ADMIN_ADDR, U256::from(FEE_AMT), APP_REGISTRY_ADDR);
 
-        vm.set_sender(ADMIN_ADDR);
-        registry.register_app(APP_ID).unwrap();
+        mock_member(vm, APP_ID, PUB_ADDR, true);
 
         vm.set_sender(PUB_ADDR);
         vm.set_value(U256::from(FEE_AMT));
@@ -329,7 +363,7 @@ mod tests {
     fn test_initialization() {
         let vm = TestVM::default();
         let mut registry = DataRegistry::from(&vm);
-        registry.init(ADMIN_ADDR, U256::from(FEE_AMT));
+        registry.init(ADMIN_ADDR, U256::from(FEE_AMT), APP_REGISTRY_ADDR);
 
         assert_eq!(registry.admin(), ADMIN_ADDR);
         assert_eq!(registry.registration_fee(), U256::from(FEE_AMT));
@@ -340,7 +374,7 @@ mod tests {
     fn test_failed_registration_insufficient_fee() {
         let vm = TestVM::default();
         let mut registry = DataRegistry::from(&vm);
-        registry.init(ADMIN_ADDR, U256::from(FEE_AMT));
+        registry.init(ADMIN_ADDR, U256::from(FEE_AMT), APP_REGISTRY_ADDR);
 
         // Use TestVM setters to modify the context state dynamically
         vm.set_sender(PUB_ADDR);
@@ -354,7 +388,7 @@ mod tests {
     fn test_successful_registration_and_duplicate_prevention() {
         let vm = TestVM::default();
         let mut registry = DataRegistry::from(&vm);
-        registry.init(ADMIN_ADDR, U256::from(FEE_AMT));
+        registry.init(ADMIN_ADDR, U256::from(FEE_AMT), APP_REGISTRY_ADDR);
 
         vm.set_sender(PUB_ADDR);
         vm.set_value(U256::from(FEE_AMT));
@@ -373,7 +407,7 @@ mod tests {
     fn test_admin_suspension_flow() {
         let vm = TestVM::default();
         let mut registry = DataRegistry::from(&vm);
-        registry.init(ADMIN_ADDR, U256::from(FEE_AMT));
+        registry.init(ADMIN_ADDR, U256::from(FEE_AMT), APP_REGISTRY_ADDR);
 
         // Register publisher
         vm.set_sender(PUB_ADDR);
@@ -426,31 +460,56 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_unknown_app_rejected() {
-        let vm = TestVM::default();
-        let mut registry = setup(&vm);
 
-        let res = registry.commit_state_root(
-            FixedBytes([0xAAu8; 32]),
-            SUB_A,
-            FixedBytes::ZERO,
-            FixedBytes([7u8; 32]),
+    /// The check this contract did not used to make. A globally registered
+    /// publisher who never joined the app must not be able to write under it —
+    /// previously the app merely had to EXIST, so every app was open to everyone.
+    ///
+    /// This also covers the old `test_unknown_app_rejected` case: an app nobody
+    /// claimed is an app nobody joined, and both now take the same branch.
+    #[test]
+    fn test_publisher_not_registered_for_app_rejected() {
+        // Built from scratch rather than on `setup`: TestVM resolves mocks in
+        // registration order per address, so a second mock added later for the same
+        // contract does not reliably win. Every mock this test needs is registered
+        // before the first call.
+        let vm = TestVM::default();
+        let mut registry = DataRegistry::from(&vm);
+        registry.init(ADMIN_ADDR, U256::from(FEE_AMT), APP_REGISTRY_ADDR);
+
+        // The app exists and is owned, but PUB_ADDR never joined it.
+        mock_member(&vm, APP_ID, PUB_ADDR, false);
+
+        vm.set_sender(PUB_ADDR);
+        vm.set_value(U256::from(FEE_AMT));
+        registry.register().unwrap(); // globally registered — and still not enough
+
+        let res = registry.commit_state_root(APP_ID, SUB_A, FixedBytes::ZERO, FixedBytes([7u8; 32]));
+        assert!(
+            matches!(res, Err(RegistryError::NotRegisteredForApp(_))),
+            "an app this publisher never joined accepted their commit",
         );
-        assert!(matches!(res, Err(RegistryError::AppNotFound(_))));
     }
 
+    /// A missing head can be restored once; a live one can never be rewritten.
+
     #[test]
-    fn test_app_registration_is_exclusive() {
+    fn test_seed_namespace_head_is_fill_only() {
         let vm = TestVM::default();
         let mut registry = setup(&vm);
+        let root = FixedBytes([9u8; 32]);
 
-        assert_eq!(registry.get_app_owner(APP_ID), ADMIN_ADDR);
-        // PUB_ADDR is still the sender after setup
-        assert!(matches!(
-            registry.register_app(APP_ID),
-            Err(RegistryError::AppAlreadyRegistered(_))
-        ));
+        vm.set_sender(PUB_ADDR);
+        assert!(registry.seed_namespace_head(APP_ID, PUB_ADDR, SUB_A, root).is_err(), "a non-admin seeded a head");
+
+        vm.set_sender(ADMIN_ADDR);
+        registry.seed_namespace_head(APP_ID, PUB_ADDR, SUB_A, root).unwrap();
+        assert_eq!(registry.get_namespace_head(APP_ID, PUB_ADDR, SUB_A), root);
+
+        assert!(
+            registry.seed_namespace_head(APP_ID, PUB_ADDR, SUB_A, FixedBytes([8u8; 32])).is_err(),
+            "the migration lever overwrote a live timeline — that is a backdoor, not a migration",
+        );
     }
 
     #[test]

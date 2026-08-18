@@ -115,21 +115,32 @@ tunable without a redeploy. Full doc: `subscription_registry/README.md`.
 Anonymous paid access to a resource, via Semaphore. Standalone — it is not part of the
 register/publish flow above and `deploy.sh` does not touch it.
 
-Owners `create_resource(id, price, uri)`; buyers `register(...)` with a USDC
-`transferWithAuthorization` (gasless permit), which adds their identity commitment to
-the registry's Semaphore group; `settle(...)` verifies a Semaphore proof, burns a
-nullifier, and optionally fires a per-resource `afterSettle` hook. The contract creates
-its own Semaphore group at construction — it has to be the group admin, and Semaphore's
-handover is two-step, so accepting a group id as a constructor argument would brick
-`create_resource`.
+Publishers `create_resource(uid, price, uri)` — the contract derives
+`resourceId = keccak(publisher ++ uid)` and creates **a Semaphore group for that
+resource**. Buyers `register(...)` with a USDC `transferWithAuthorization` (gasless
+permit), which pays the resource's owner and adds their identity commitment to that
+resource's group; `settle(...)` verifies a Semaphore proof against that same group,
+burns a nullifier, and optionally fires a per-resource `afterSettle` hook. The contract
+creates each group itself because it has to be the group admin — Semaphore's handover is
+two-step, so accepting a group id from outside would brick `create_resource`.
 
-Deploy instructions are in `settlement_registry/README.md`.
+`set_disabled(resourceId, bool)` (owner or admin) is the takedown flag: it blocks new
+registrations and settlements, and the access gate is expected to consult `is_disabled`
+before releasing a key. It does not un-settle existing buyers.
+
+**v2 is a security rewrite and an ABI break.** v1 shared ONE group across the whole
+registry, so a single payment to any publisher unlocked every resource forever — and a
+free self-minted resource unlocked it for nothing. v1 also let the caller name the
+payment recipient, and let anyone claim any resourceId. Do not run v1, and do not point
+a v1 client at a v2 deployment. Rationale, migration steps and the open questions around
+`set_disabled` are in `settlement_registry/README.md`.
 
 ## Build and test
 
 ```sh
 cargo test --manifest-path data_registry/Cargo.toml
 cargo test --manifest-path subscription_registry/Cargo.toml
+cargo test --manifest-path settlement_registry/Cargo.toml
 ```
 
 Tests run against the stylus-sdk `TestVM`, which mocks cross-contract calls
