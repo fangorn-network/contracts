@@ -121,6 +121,8 @@ impl AppRegistry {
     /// * `terms_uri`: A URI where the terms can be found (e.g. an IPFS gateway, an erc-8004 agent card)
     /// * `fee`: a fee for registering as a publisher
     ///
+    /// The claimer becomes the app's first registered publisher, so they can write to
+    /// their own namespace without a second transaction against their own terms.
     pub fn register_app(
         &mut self,
         app_id: FixedBytes<32>,
@@ -137,6 +139,7 @@ impl AppRegistry {
         self.app_terms_uri.setter(app_id).set_str(&terms_uri);
         // TODO: introduce a proper treasury
         self.app_fees.setter(app_id).set(fee);
+        self.join_owner(app_id, owner, terms_hash);
         self.vm().log(AppRegistered { app_id, owner });
         self.vm().log(AppTermsChanged { app_id, terms_hash, terms_uri });
         self.vm().log(AppFeeChanged { app_id, fee });
@@ -162,6 +165,10 @@ impl AppRegistry {
         self.only_app_owner(app_id)?;
         self.app_terms.setter(app_id).set(terms_hash);
         self.app_terms_uri.setter(app_id).set_str(&terms_uri);
+        // The owner accepts their own terms by publishing them. Without this they are
+        // locked out of their own app by every edit, needing a round trip to agree to
+        // a document they wrote.
+        self.join_owner(app_id, self.apps.get(app_id), terms_hash);
         self.vm().log(AppTermsChanged { app_id, terms_hash, terms_uri });
         Ok(())
     }
@@ -314,6 +321,15 @@ impl AppRegistry {
         self.only_admin()?;
         transfer_eth(self.vm(), to, amount)
             .map_err(|_| AppRegistryError::TransferFailed(TransferFailed {}))
+    }
+}
+
+impl AppRegistry {
+    /// Mark an app owner as an active publisher of their own app
+    fn join_owner(&mut self, app_id: FixedBytes<32>, owner: Address, terms_hash: FixedBytes<32>) {
+        let key = member_key(app_id, owner);
+        self.statuses.setter(key).set(U8::from(STATUS_ACTIVE));
+        self.accepted.setter(key).set(terms_hash);
     }
 }
 
@@ -578,5 +594,23 @@ mod tests {
         assert_eq!(fee, U256::from(FEE));
         assert_eq!(status, STATUS_UNREGISTERED);
         assert!(!registered);
+    }
+
+    #[test]
+    fn an_app_owner_is_their_own_first_publisher() {
+        let vm = TestVM::default();
+        let mut r = new_registry(&vm);
+        open_app(&vm, &mut r);
+
+        assert!(r.is_registered_for_app(APP, APP_OWNER), "register_app left the owner unable to publish");
+
+        // ...and editing the terms must not lock them out of their own app either.
+        vm.set_sender(APP_OWNER);
+        r.set_app_terms(APP, TERMS_V2, String::new()).unwrap();
+        assert!(r.is_registered_for_app(APP, APP_OWNER), "set_app_terms locked the owner out");
+        assert_eq!(r.accepted_terms(APP, APP_OWNER), TERMS_V2);
+
+        // Claiming an app must not enrol you anywhere else.
+        assert!(!r.is_registered_for_app(OTHER_APP, APP_OWNER));
     }
 }
