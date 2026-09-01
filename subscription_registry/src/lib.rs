@@ -13,7 +13,7 @@ extern crate alloc;
 use alloc::fmt;
 use alloy_sol_types::sol;
 use stylus_sdk::{
-    alloy_primitives::{Address, U256, U64},
+    alloy_primitives::{Address, FixedBytes, U256, U64},
     call::transfer::transfer_eth,
     prelude::*,
     storage::*,
@@ -45,6 +45,12 @@ sol_interface! {
     /// The DataRegistry publisher-registration check.
     interface IDataRegistry {
         function isRegistered(address publisher) external view returns (bool);
+        function appRegistry() external view returns (address);
+    }
+
+    /// The AppRegistry app-ownership lookup.
+    interface IAppRegistry {
+        function getAppOwner(bytes32 app_id) external view returns (address);
     }
 }
 
@@ -124,6 +130,19 @@ impl SubscriptionRegistry {
         let registered = self.check_registered(publisher);
         let paid_at = self.subscribed_at.get(publisher).to::<u64>();
         (registered, paid_at)
+    }
+
+    /// Has the owner of `app_id` ever paid the subscription? Returns
+    /// `(subscribed, owner)`; `owner` is `Address::ZERO` for an unclaimed app (which
+    /// is never subscribed). The AppRegistry is resolved through the DataRegistry, so
+    /// this contract needs no extra wiring.
+    ///
+    /// ponytail: `subscribed` is `paid_at != 0` — the 30-day active window lives in
+    /// the off-chain gate, same as `access`. Return `paid_at` here too if a caller
+    /// ever needs to apply the window on-chain.
+    pub fn is_app_subscribed(&self, app_id: FixedBytes<32>) -> (bool, Address) {
+        let owner = self.app_owner(app_id);
+        (self.subscribed_at.get(owner).to::<u64>() != 0, owner)
     }
 
     /// Block timestamp (Unix seconds) of the publisher's last subscription payment,
@@ -210,6 +229,21 @@ impl SubscriptionRegistry {
         )
     }
 
+    /// Resolve an app's owner: DataRegistry.appRegistry() → AppRegistry.getAppOwner().
+    /// A reverted/failed call at either hop yields `Address::ZERO`.
+    fn app_owner(&self, app_id: FixedBytes<32>) -> Address {
+        let registry = self.data_registry.get();
+        let apps = IDataRegistry::new(registry)
+            .app_registry(self.vm(), Call::new())
+            .unwrap_or(Address::ZERO);
+        if apps == Address::ZERO {
+            return Address::ZERO;
+        }
+        IAppRegistry::new(apps)
+            .get_app_owner(self.vm(), Call::new(), app_id)
+            .unwrap_or(Address::ZERO)
+    }
+
     /// Pull `amount` of USDC from `from` into this contract. `from` must have
     /// approved this contract. Returns `Err(())` on revert or a `false` return.
     fn pull_usdc(&mut self, from: Address, amount: U256) -> Result<(), ()> {
@@ -240,6 +274,8 @@ mod tests {
         function transferFrom(address from, address to, uint256 amount) external returns (bool);
         function transfer(address to, uint256 amount) external returns (bool);
         function isRegistered(address publisher) external view returns (bool);
+        function appRegistry() external view returns (address);
+        function getAppOwner(bytes32 app_id) external view returns (address);
     }
 
     const ADMIN_ADDR: Address = address!("1111111111111111111111111111111111111111");
@@ -248,6 +284,7 @@ mod tests {
     const USDC_ADDR: Address = address!("4444444444444444444444444444444444444444");
     const REGISTRY_ADDR: Address = address!("6666666666666666666666666666666666666666");
     const RECIPIENT: Address = address!("5555555555555555555555555555555555555555");
+    const APPS_ADDR: Address = address!("7777777777777777777777777777777777777777");
     const SUB_FEE_AMT: u64 = 2_000_000; // 2 USDC (6 decimals)
 
     // 32-byte ABI word encoding a bool return value.
@@ -344,6 +381,46 @@ mod tests {
         let (registered, paid_at) = registry.access(RECIPIENT);
         assert!(!registered);
         assert_eq!(paid_at, 0);
+    }
+
+    // Mock DataRegistry.appRegistry() → AppRegistry.getAppOwner(app_id) → owner.
+    fn mock_app_owner(vm: &TestVM, app_id: FixedBytes<32>, owner: Address) {
+        vm.mock_static_call(
+            REGISTRY_ADDR,
+            appRegistryCall {}.abi_encode(),
+            Ok(APPS_ADDR.into_word().to_vec()),
+        );
+        vm.mock_static_call(
+            APPS_ADDR,
+            getAppOwnerCall { app_id }.abi_encode(),
+            Ok(owner.into_word().to_vec()),
+        );
+    }
+
+    #[test]
+    fn test_is_app_subscribed() {
+        let vm = TestVM::default();
+        let mut registry = new_registry(&vm);
+        let app_id = FixedBytes::<32>::from([0xAAu8; 32]);
+        let unclaimed = FixedBytes::<32>::from([0xBBu8; 32]);
+
+        // Owner is known but has never paid.
+        mock_app_owner(&vm, app_id, PUB_ADDR);
+        assert_eq!(registry.is_app_subscribed(app_id), (false, PUB_ADDR));
+
+        // …then subscribes.
+        vm.set_block_timestamp(1_700_000_000);
+        vm.set_sender(PUB_ADDR);
+        mock_registered(&vm, PUB_ADDR, true);
+        mock_pull(&vm, PUB_ADDR, SUB_FEE_AMT, true);
+        registry.subscribe().unwrap();
+
+        mock_app_owner(&vm, app_id, PUB_ADDR);
+        assert_eq!(registry.is_app_subscribed(app_id), (true, PUB_ADDR));
+
+        // An unclaimed app has no owner and is never subscribed.
+        mock_app_owner(&vm, unclaimed, Address::ZERO);
+        assert_eq!(registry.is_app_subscribed(unclaimed), (false, Address::ZERO));
     }
 
     #[test]

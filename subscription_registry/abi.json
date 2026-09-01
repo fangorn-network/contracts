@@ -72,6 +72,30 @@
     {
         "inputs": [
             {
+                "internalType": "bytes32",
+                "name": "app_id",
+                "type": "bytes32"
+            }
+        ],
+        "name": "isAppSubscribed",
+        "outputs": [
+            {
+                "internalType": "bool",
+                "name": "",
+                "type": "bool"
+            },
+            {
+                "internalType": "address",
+                "name": "",
+                "type": "address"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
                 "internalType": "address",
                 "name": "registry",
                 "type": "address"
