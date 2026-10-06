@@ -34,7 +34,11 @@ set -euo pipefail
 # ==============================================================================
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-PRIVATE_KEY="${PRIVATE_KEY:-0xde0e6c1c331fcd8692463d6ffcf20f9f2e1847264f7a3f578cf54f62f05196cb}"
+# Any variable below can be set in a .env next to this script (gitignored).
+ENV_FILE="$(dirname "${BASH_SOURCE[0]}")/.env"
+if [ -f "$ENV_FILE" ]; then set -a; source "$ENV_FILE"; set +a; fi
+
+PRIVATE_KEY="${PRIVATE_KEY:?PRIVATE_KEY not set — export it or add it to .env}"
 RPC_ENDPOINT="${RPC_ENDPOINT:-https://sepolia-rollup.arbitrum.io/rpc}"
 MAX_FEE="${MAX_FEE:-0.1}"
 

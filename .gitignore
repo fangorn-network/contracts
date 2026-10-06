@@ -26,3 +26,6 @@ docs/
 .env.*
 !.env.example
 skills-lock.json
+
+# ignore any tmp work
+/tmp

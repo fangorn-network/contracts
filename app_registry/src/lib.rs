@@ -2,6 +2,13 @@
 //!
 //! An application is essentially a named domain and set of agreements for 
 //! associating data with a given top-level app domain.
+//! 
+//! Each app is a tuple A = (R, W, V) where:
+//! - R  is the set of allowed relations in published graphs
+//! - W represents a (trusted or untrusted) agent that gates ingress into the application.
+//!         It is responsible for validating all data that becomes committed to the app.
+//! - V represents the validation logic 
+//! 
 //! Publishers must *register* with the application in order to be able to write to the app-level namespace
 //! in an associated DataRegistry where a specific instance of the AppRegistry is referenced. 
 //! See [deploy.sh](../deploy.sh) for an example script of how these are configured.
@@ -44,7 +51,7 @@ sol! {
     error JoinFeeRequired();
     error TransferFailed();
 
-    /// An app was registered
+    /// A new app was registered
     event AppRegistered(bytes32 indexed app_id, address indexed owner);
 
     /// The app's terms changed and every publisher on the old hash must accept the new terms 
@@ -52,6 +59,9 @@ sol! {
     event AppTermsChanged(bytes32 indexed app_id, bytes32 terms_hash, string terms_uri);
 
     event AppFeeChanged(bytes32 indexed app_id, uint256 fee);
+
+    /// The app's agent card moved
+    event AppAgentChanged(bytes32 indexed app_id, string agent_uri);
 
     /// A publisher joined an app AND accepted `terms_hash`
     event PublisherJoined(
@@ -112,6 +122,9 @@ pub struct AppRegistry {
     accepted: StorageMap<FixedBytes<32>, StorageFixedBytes<32>>,
     /// app_id => admin takedown flag. A suspended app is dead for every publisher at once
     app_suspended: StorageMap<FixedBytes<32>, StorageBool>,
+    /// app_id => URI of the app's ERC-8004 agent card. Empty means the app has none.
+    // Appended last on purpose: inserting a field above shifts every slot below it.
+    app_agent_uri: StorageMap<FixedBytes<32>, StorageString>,
 }
 
 #[public]
@@ -121,11 +134,13 @@ impl AppRegistry {
         self.admin.set(admin);
     }
 
-    /// Claim an app id, first-come-first-served and irreversible
+    /// Claim a unique app id
     ///
     /// * `app_id`: a unique 32-byte identifier for the app
     /// * `terms_hash`: the CID of the terms and conditions for using the app
-    /// * `terms_uri`: A URI where the terms can be found (e.g. an IPFS gateway, an erc-8004 agent card)
+    /// * `terms_uri`: A URI where the terms can be found (e.g. an IPFS gateway).
+    ///   NOT the app's agent card — that goes in `set_app_agent_uri`, which carries no
+    ///   hash precisely so that moving it does not unregister every publisher.
     /// * `fee`: a fee for registering as a publisher
     ///
     /// The claimer becomes the app's first registered publisher, so they can write to
@@ -188,8 +203,21 @@ impl AppRegistry {
         Ok(())
     }
 
-    /// Suspend a publisher from this app. 
-    /// The global DataRegistry and their registrations with every other app are untouched.
+    /// Point at the app's ERC-8004 agent card. 
+    /// Only callable by the app owner.
+    pub fn set_app_agent_uri(
+        &mut self,
+        app_id: FixedBytes<32>,
+        agent_uri: String,
+    ) -> Result<(), AppRegistryError> {
+        self.only_app_owner(app_id)?;
+        self.app_agent_uri.setter(app_id).set_str(&agent_uri);
+        self.vm().log(AppAgentChanged { app_id, agent_uri });
+        Ok(())
+    }
+
+    /// Suspend a publisher from only this app.
+    /// Does not suspend globally.
     pub fn suspend_for_app(
         &mut self,
         app_id: FixedBytes<32>,
@@ -221,14 +249,13 @@ impl AppRegistry {
         Ok(())
     }
 
-    /// Suspend an entire app. Admin-only global takedown: every publisher — the owner
-    /// included — reads as unregistered until it is reinstated. Memberships are left
-    /// intact so a reinstatement restores them exactly.
+    /// Suspend an app's entire set of publisher. 
+    /// Admin-only global takedown
     pub fn suspend_app(&mut self, app_id: FixedBytes<32>) -> Result<(), AppRegistryError> {
         self.set_app_suspended(app_id, true)
     }
 
-    /// Lift an app-level suspension
+    /// Reinstate a suspended app
     pub fn reinstate_app(&mut self, app_id: FixedBytes<32>) -> Result<(), AppRegistryError> {
         self.set_app_suspended(app_id, false)
     }
@@ -322,6 +349,11 @@ impl AppRegistry {
 
     pub fn app_terms_uri(&self, app_id: FixedBytes<32>) -> String {
         self.app_terms_uri.get(app_id).get_string()
+    }
+
+    /// The app's agent card URI, or an empty string if it has never set one.
+    pub fn app_agent_uri(&self, app_id: FixedBytes<32>) -> String {
+        self.app_agent_uri.get(app_id).get_string()
     }
 
     pub fn app_fee(&self, app_id: FixedBytes<32>) -> U256 {
@@ -457,6 +489,42 @@ mod tests {
         r.set_app_terms(APP, TERMS_V2, String::from("https://tabs.example/v2")).unwrap();
         assert_eq!(r.app_terms(APP), TERMS_V2);
         assert_eq!(r.app_terms_uri(APP), "https://tabs.example/v2");
+    }
+
+    #[test]
+    fn moving_the_agent_card_leaves_registrations_alone() {
+        let vm = TestVM::default();
+        let mut r = new_registry(&vm);
+        open_app(&vm, &mut r);
+
+        vm.set_sender(PUBLISHER);
+        vm.set_value(U256::from(FEE));
+        r.register_for_app(APP, TERMS_V1).unwrap();
+        assert!(r.is_registered_for_app(APP, PUBLISHER));
+
+        vm.set_sender(STRANGER);
+        assert!(
+            r.set_app_agent_uri(APP, String::from("https://evil.example/card.json")).is_err(),
+            "a stranger repointed an app's agent card",
+        );
+
+        // The point of the separate field: an endpoint can rotate as often as it likes
+        // without touching terms_hash, so nobody gets unregistered by a redeploy.
+        vm.set_sender(APP_OWNER);
+        r.set_app_agent_uri(APP, String::from("https://a.example/card.json")).unwrap();
+        r.set_app_agent_uri(APP, String::from("https://b.example/card.json")).unwrap();
+        assert_eq!(r.app_agent_uri(APP), "https://b.example/card.json");
+        assert_eq!(r.app_terms(APP), TERMS_V1, "the agent card disturbed the terms hash");
+        assert_eq!(r.accepted_terms(APP, PUBLISHER), TERMS_V1);
+        assert!(
+            r.is_registered_for_app(APP, PUBLISHER),
+            "moving the agent card unregistered a publisher — the exact trap this field exists to avoid",
+        );
+
+        // An app that never set one reads as empty, not as a revert.
+        vm.set_sender(APP_OWNER);
+        r.register_app(OTHER_APP, TERMS_V1, String::new(), U256::ZERO).unwrap();
+        assert_eq!(r.app_agent_uri(OTHER_APP), "");
     }
 
     #[test]
