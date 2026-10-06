@@ -3,11 +3,12 @@
 set -euo pipefail
 
 # ==============================================================================
-# Updates the subscription fee on a deployed SubscriptionRegistry (admin-only).
+# Updates the subscription fee on a deployed AppRegistry (admin-only): what claiming
+# or renewing an app costs.
 #
 # Usage:
 #   ./set_subscription_fee.sh <amount-in-USDC>
-#   SUBSCRIPTION_ADDR=0x… ./set_subscription_fee.sh 5        # $5 per period
+#   APP_REGISTRY_ADDR=0x… ./set_subscription_fee.sh 5        # $5 per period
 #   ./set_subscription_fee.sh                                # prompts for both
 #
 # The amount is given in USDC (decimals allowed, e.g. 5 or 2.5) and converted to
@@ -17,8 +18,8 @@ set -euo pipefail
 # ── Configuration (env-overridable, same defaults as deploy.sh) ───────────────
 PRIVATE_KEY="${PRIVATE_KEY:-0xde0e6c1c331fcd8692463d6ffcf20f9f2e1847264f7a3f578cf54f62f05196cb}"
 RPC_ENDPOINT="${RPC_ENDPOINT:-https://sepolia-rollup.arbitrum.io/rpc}"
-# The deployed SubscriptionRegistry. Prompted if empty.
-SUBSCRIPTION_ADDR="${SUBSCRIPTION_ADDR:-}"
+# The deployed AppRegistry. Prompted if empty.
+APP_REGISTRY_ADDR="${APP_REGISTRY_ADDR:-}"
 
 command -v cast >/dev/null || { echo "❌ 'cast' (foundry) not found on PATH." >&2; exit 1; }
 
@@ -36,11 +37,11 @@ usdc_to_base() {
 }
 
 # ── Resolve the contract address ──────────────────────────────────────────────
-if ! is_address "$SUBSCRIPTION_ADDR"; then
-    read -rp "SubscriptionRegistry address (0x…): " SUBSCRIPTION_ADDR
+if ! is_address "$APP_REGISTRY_ADDR"; then
+    read -rp "AppRegistry address (0x…): " APP_REGISTRY_ADDR
 fi
-is_address "$SUBSCRIPTION_ADDR" \
-    || { echo "❌ Invalid SubscriptionRegistry address: '${SUBSCRIPTION_ADDR:-<empty>}'." >&2; exit 1; }
+is_address "$APP_REGISTRY_ADDR" \
+    || { echo "❌ Invalid AppRegistry address: '${APP_REGISTRY_ADDR:-<empty>}'." >&2; exit 1; }
 
 # ── Resolve the new amount (USDC) ─────────────────────────────────────────────
 AMOUNT="${1:-}"
@@ -52,24 +53,24 @@ BASE=$(usdc_to_base "$AMOUNT") \
 
 # ── Admin sanity check (setSubscriptionFee is only_admin) ─────────────────────
 SIGNER=$(cast wallet address --private-key "$PRIVATE_KEY")
-ADMIN=$(cast call "$SUBSCRIPTION_ADDR" "admin()(address)" --rpc-url "$RPC_ENDPOINT" | awk '{print $1}')
+ADMIN=$(cast call "$APP_REGISTRY_ADDR" "admin()(address)" --rpc-url "$RPC_ENDPOINT" | awk '{print $1}')
 if [ "${SIGNER,,}" != "${ADMIN,,}" ]; then
     echo "⚠️  Signer $SIGNER is not the contract admin ($ADMIN) — the tx will revert." >&2
     read -rp "Continue anyway? [y/N] " ok
     [[ "$ok" =~ ^[Yy]$ ]] || exit 1
 fi
 
-CURRENT=$(cast call "$SUBSCRIPTION_ADDR" "subscriptionFee()(uint256)" --rpc-url "$RPC_ENDPOINT" | awk '{print $1}')
-echo "Contract:  $SUBSCRIPTION_ADDR" >&2
+CURRENT=$(cast call "$APP_REGISTRY_ADDR" "subscriptionFee()(uint256)" --rpc-url "$RPC_ENDPOINT" | awk '{print $1}')
+echo "Contract:  $APP_REGISTRY_ADDR" >&2
 echo "Current:   $CURRENT base units" >&2
 echo "New:       $AMOUNT USDC = $BASE base units" >&2
 
 echo "Sending setSubscriptionFee($BASE)…" >&2
-cast send "$SUBSCRIPTION_ADDR" "setSubscriptionFee(uint256)" "$BASE" \
+cast send "$APP_REGISTRY_ADDR" "setSubscriptionFee(uint256)" "$BASE" \
     --rpc-url "$RPC_ENDPOINT" --private-key "$PRIVATE_KEY" > /dev/null
 
 # ── Verify the on-chain value took ────────────────────────────────────────────
-UPDATED=$(cast call "$SUBSCRIPTION_ADDR" "subscriptionFee()(uint256)" --rpc-url "$RPC_ENDPOINT" | awk '{print $1}')
+UPDATED=$(cast call "$APP_REGISTRY_ADDR" "subscriptionFee()(uint256)" --rpc-url "$RPC_ENDPOINT" | awk '{print $1}')
 if [ "$UPDATED" = "$BASE" ]; then
     echo "✅ Subscription fee is now $BASE base units ($AMOUNT USDC)." >&2
 else
