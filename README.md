@@ -57,8 +57,9 @@ talks to this contract; the other two are optional.
 State: `admin`, `registration_fee`, `statuses` (0 unregistered / 1 active /
 2 suspended), `publisher_count`, `namespace_heads` (`address → bytes32`).
 
-- `register()` — payable; pays the registration fee to become active. Re-registering
-  a suspended account reactivates it and preserves its historic root.
+- `register()` — payable; pays the registration fee to become active. A suspended
+  account cannot re-register. Only the admin can bring it back (`reinstate_global`),
+  which preserves its historic roots.
 - `commit_state_root(old_root, new_root)` — the only graph-mutating route.
   Compare-and-swap: rejects unless the caller is active **and** `old_root` equals the
   stored head (`StaleStateRoot`). That CAS is what enforces a linear timeline. Emits
@@ -66,7 +67,7 @@ State: `admin`, `registration_fee`, `statuses` (0 unregistered / 1 active /
   light-client watches.
 - Views: `get_namespace_head`, `is_registered`, `get_publisher_status`,
   `publisher_count`, `registration_fee`, `admin`.
-- Admin: `suspend_publisher`, `set_registration_fee`.
+- Admin: `suspend_publisher`, `reinstate_global`, `set_registration_fee`.
 - `init(admin, registration_fee)`.
 
 `namespace_heads` is per-**publisher**, not per-namespace: one root each, with

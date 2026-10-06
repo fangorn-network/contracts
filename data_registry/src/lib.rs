@@ -119,7 +119,8 @@ impl DataRegistry {
         self.app_registry.set(app_registry);
     }
 
-    /// Register as a new data publisher or reactivate a suspended registration on the network.
+    /// Register as a new data publisher on the network.
+    /// A suspended publisher cannot register their way back into Fangorn.
     #[payable]
     pub fn register(&mut self) -> Result<(), RegistryError> {
         let sender = self.vm().msg_sender();
@@ -127,6 +128,9 @@ impl DataRegistry {
 
         if current_status == STATUS_ACTIVE {
             return Err(RegistryError::AlreadyRegistered(AlreadyRegistered {}));
+        }
+        if current_status == STATUS_SUSPENDED {
+            return Err(RegistryError::PublisherSuspendedErr(PublisherSuspendedErr {}));
         }
 
         // maybe remove?
@@ -138,18 +142,10 @@ impl DataRegistry {
         self.statuses.setter(sender).set(U8::from(STATUS_ACTIVE));
         self.publisher_count.set(self.publisher_count.get() + U64::from(1));
 
-        if current_status == STATUS_SUSPENDED {
-            // Suspension never clears namespace heads, so every timeline resumes where it left off.
-            self.vm().log(PublisherReactivated {
-                publisher: sender,
-                current_root: FixedBytes::ZERO,
-            });
-        } else {
-            self.vm().log(PublisherRegistered {
-                publisher: sender,
-                initial_root: FixedBytes::ZERO,
-            });
-        }
+        self.vm().log(PublisherRegistered {
+            publisher: sender,
+            initial_root: FixedBytes::ZERO,
+        });
 
         Ok(())
     }
@@ -251,6 +247,25 @@ impl DataRegistry {
         }
 
         self.vm().log(PublisherSuspended { publisher });
+        Ok(())
+    }
+
+    /// Lift a network-wide suspension. Admin-only.
+    /// Suspension never clears namespace heads, so every timeline resumes where it left off.
+    pub fn reinstate_global(&mut self, publisher: Address) -> Result<(), RegistryError> {
+        self.only_admin()?;
+
+        if self.statuses.get(publisher) != STATUS_SUSPENDED {
+            return Err(RegistryError::NotRegistered(NotRegistered {}));
+        }
+
+        self.statuses.setter(publisher).set(U8::from(STATUS_ACTIVE));
+        self.publisher_count.set(self.publisher_count.get() + U64::from(1));
+
+        self.vm().log(PublisherReactivated {
+            publisher,
+            current_root: FixedBytes::ZERO,
+        });
         Ok(())
     }
 
@@ -424,6 +439,31 @@ mod tests {
     }
 
     #[test]
+    fn test_suspended_publisher_cannot_reinstate_themselves() {
+        let vm = TestVM::default();
+        let mut registry = setup(&vm);
+
+        vm.set_sender(ADMIN_ADDR);
+        registry.suspend_publisher(PUB_ADDR).unwrap();
+
+        // Paying the fee again is not a way back in, and neither is the admin route.
+        vm.set_sender(PUB_ADDR);
+        vm.set_value(U256::from(FEE_AMT));
+        assert!(matches!(registry.register(), Err(RegistryError::PublisherSuspendedErr(_))));
+        assert!(matches!(registry.reinstate_global(PUB_ADDR), Err(RegistryError::Unauthorized(_))));
+        assert_eq!(registry.get_publisher_status(PUB_ADDR), STATUS_SUSPENDED);
+        assert_eq!(registry.publisher_count(), 0);
+
+        vm.set_sender(ADMIN_ADDR);
+        // Only a suspended publisher can be reinstated.
+        assert!(matches!(registry.reinstate_global(ADMIN_ADDR), Err(RegistryError::NotRegistered(_))));
+
+        assert!(registry.reinstate_global(PUB_ADDR).is_ok());
+        assert_eq!(registry.get_publisher_status(PUB_ADDR), STATUS_ACTIVE);
+        assert_eq!(registry.publisher_count(), 1);
+    }
+
+    #[test]
     fn test_suspended_publisher_cannot_commit() {
         let vm = TestVM::default();
         let mut registry = setup(&vm);
@@ -547,11 +587,10 @@ mod tests {
         vm.set_sender(ADMIN_ADDR);
         registry.suspend_publisher(PUB_ADDR).unwrap();
 
-        // 3. Re-registration processing loop verification triggers
+        // 3. The admin reinstates the publisher
+        assert!(registry.reinstate_global(PUB_ADDR).is_ok());
         vm.set_sender(PUB_ADDR);
-        vm.set_value(U256::from(FEE_AMT));
-        assert!(registry.register().is_ok());
-        
+
         assert_eq!(registry.get_publisher_status(PUB_ADDR), STATUS_ACTIVE);
         assert_eq!(registry.publisher_count(), 1);
         // Assert historical root state remains perfectly unaffected across suspensions
