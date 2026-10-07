@@ -1,0 +1,6 @@
+admin 0 0 address
+appRegistry 2 8 address
+namespaceHeads 4 0 mapping(bytes32 => bytes32)
+publisherCount 2 0 uint64
+registrationFee 1 0 uint256
+statuses 3 0 mapping(address => uint8)

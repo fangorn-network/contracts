@@ -32,6 +32,13 @@ shopt -s inherit_errexit
 # it sits in front of: DATA_REGISTRY_ADDR equal to OLD_DATA_REGISTRY skips that half.
 #
 # Not migrated: the SettlementRegistry.
+#
+# Leaving a wallet behind (its key is lost or compromised):
+#   RETIRED_WALLET=0x… APP_REGISTRY_ADDR=0x… DATA_REGISTRY_ADDR=0x… ./scripts/migrate.sh
+# Nothing that wallet owns is carried over: not its publisher registration, its
+# namespace heads, the apps it owns, or its memberships. An app it owned that already
+# exists on the new contract — the default app, claimed afresh by deploy.sh for the new
+# admin — keeps its new owner and is compared in everything else.
 # ==============================================================================
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -57,6 +64,8 @@ OLD_DATA_REGISTRY="${OLD_DATA_REGISTRY:-0x775026e905d7b58b34d16bcbd385fa630ee36c
 FROM_BLOCK="${FROM_BLOCK:-311600000}"
 # The public Arbitrum RPC refuses an eth_getLogs spanning more than this many blocks.
 LOG_WINDOW="${LOG_WINDOW:-10000000}"
+# A wallet to leave behind (see the top of this file). Optional.
+RETIRED_WALLET="${RETIRED_WALLET:-}"
 
 STATUS_UNREGISTERED=0
 STATUS_SUSPENDED=2
@@ -128,6 +137,13 @@ keys() {
 SEEDED=0
 SKIPPED=0
 MISMATCHED=0
+LEFT_BEHIND=0
+
+retired() { [ -n "$RETIRED_WALLET" ] && same_address "$1" "$RETIRED_WALLET"; }
+leave_behind() {
+    echo "left behind: $1" >&2
+    LEFT_BEHIND=$((LEFT_BEHIND + 1))
+}
 
 # Compare one migrated value against the old contract's.
 check() {
@@ -149,6 +165,18 @@ MIGRATE_DATA=true
 if same_address "$DATA_REGISTRY_ADDR" "$OLD_DATA_REGISTRY"; then MIGRATE_DATA=false; fi
 
 SIGNER=$(cast wallet address --private-key "$PRIVATE_KEY")
+if [ -n "$RETIRED_WALLET" ]; then
+    is_address "$RETIRED_WALLET" \
+        || { echo "❌ RETIRED_WALLET is not an address: '$RETIRED_WALLET'." >&2; exit 1; }
+    if same_address "$RETIRED_WALLET" "$SIGNER"; then
+        echo "❌ RETIRED_WALLET is the signer. Sign with the wallet that replaces it." >&2; exit 1
+    fi
+    if ! $MIGRATE_DATA; then
+        echo "❌ RETIRED_WALLET needs a new DataRegistry: the old one would keep that" >&2
+        echo "   wallet's registration and heads, and DATA_REGISTRY_ADDR is the old one." >&2
+        exit 1
+    fi
+fi
 ADMIN=$(new "$APP_REGISTRY_ADDR" "admin()(address)")
 same_address "$SIGNER" "$ADMIN" \
     || { echo "❌ Signer $SIGNER is not the new AppRegistry's admin ($ADMIN)." >&2; exit 1; }
@@ -166,6 +194,9 @@ if $MIGRATE_DATA; then
 else
     echo "   DataRegistry  $DATA_REGISTRY_ADDR (kept, not migrated)" >&2
 fi
+if [ -n "$RETIRED_WALLET" ]; then
+    echo "   Leaving behind everything owned by $RETIRED_WALLET" >&2
+fi
 echo "=========================================" >&2
 
 # ── 1. DataRegistry: publishers ───────────────────────────────────────────────
@@ -176,6 +207,7 @@ if $MIGRATE_DATA; then
     keys "$DATA_LOGS" '"0x" + .topics[1][26:]' "PublisherRegistered(address,bytes32)"
     log_step "Publishers: ${#KEYS[@]}"
     for publisher in "${KEYS[@]}"; do
+        if retired "$publisher"; then leave_behind "publisher $publisher"; continue; fi
         status=$(old "$OLD_DATA_REGISTRY" "getPublisherStatus(address)(uint8)" "$publisher")
         if [ "$(new "$DATA_REGISTRY_ADDR" "getPublisherStatus(address)(uint8)" "$publisher")" != "$STATUS_UNREGISTERED" ]; then
             SKIPPED=$((SKIPPED + 1))
@@ -199,6 +231,9 @@ if $MIGRATE_DATA; then
     log_step "Namespace heads: ${#KEYS[@]}"
     for namespace in "${KEYS[@]}"; do
         read -r app_id publisher subspace_id <<< "$namespace"
+        if retired "$publisher"; then
+            leave_behind "head $app_id / $publisher / $subspace_id"; continue
+        fi
         head_sig="getNamespaceHead(bytes32,address,bytes32)(bytes32)"
         root=$(old "$OLD_DATA_REGISTRY" "$head_sig" "$app_id" "$publisher" "$subspace_id")
         if [ "$(new "$DATA_REGISTRY_ADDR" "$head_sig" "$app_id" "$publisher" "$subspace_id")" != "$ZERO_HASH" ] \
@@ -228,6 +263,17 @@ for app_id in "${KEYS[@]}"; do
     fee=$(old "$OLD_APP_REGISTRY" "appFee(bytes32)(uint256)" "$app_id")
     agent_uri=$(old_string "$OLD_APP_REGISTRY" "appAgentUri(bytes32)(string)" "$app_id")
     suspended=$(old "$OLD_APP_REGISTRY" "isAppSuspended(bytes32)(bool)" "$app_id")
+
+    if retired "$owner"; then
+        owner=$(new "$APP_REGISTRY_ADDR" "getAppOwner(bytes32)(address)" "$app_id")
+        if [ "$owner" = "$ZERO_ADDR" ]; then leave_behind "app $app_id"; continue; fi
+        # Claimed afresh on the new contract: whoever holds it now stays its owner —
+        # unless that is the retired wallet again.
+        if retired "$owner"; then
+            echo "❌ app $app_id belongs to the retired wallet on the new contract" >&2
+            MISMATCHED=$((MISMATCHED + 1))
+        fi
+    fi
 
     if [ "$(new "$APP_REGISTRY_ADDR" "getAppOwner(bytes32)(address)" "$app_id")" != "$ZERO_ADDR" ]; then
         SKIPPED=$((SKIPPED + 1))
@@ -271,6 +317,11 @@ keys "$APP_LOGS" '"\(.topics[1]) 0x\(.topics[2][26:])"' \
 log_step "Memberships: ${#KEYS[@]}"
 for member in "${KEYS[@]}"; do
     read -r app_id publisher <<< "$member"
+    if retired "$publisher"; then leave_behind "member $publisher of $app_id"; continue; fi
+    # A member of an app that was itself left behind has nothing to be seeded into.
+    if [ "$(new "$APP_REGISTRY_ADDR" "getAppOwner(bytes32)(address)" "$app_id")" = "$ZERO_ADDR" ]; then
+        leave_behind "member $publisher of $app_id (the app was left behind)"; continue
+    fi
     status=$(old "$OLD_APP_REGISTRY" "statusForApp(bytes32,address)(uint8)" "$app_id" "$publisher")
     accepted=$(old "$OLD_APP_REGISTRY" "acceptedTerms(bytes32,address)(bytes32)" "$app_id" "$publisher")
     if [ "$(new "$APP_REGISTRY_ADDR" "statusForApp(bytes32,address)(uint8)" "$app_id" "$publisher")" != "$STATUS_UNREGISTERED" ] \
@@ -296,9 +347,14 @@ echo -e "\n=========================================" >&2
 echo " Seeded:      $SEEDED" >&2
 echo " Already set: $SKIPPED" >&2
 echo " Mismatched:  $MISMATCHED" >&2
+if [ -n "$RETIRED_WALLET" ]; then echo " Left behind: $LEFT_BEHIND" >&2; fi
 echo "=========================================" >&2
 if [ "$MISMATCHED" -ne 0 ]; then
     echo "❌ The new contracts do not match the old ones. See above." >&2
     exit 1
 fi
-echo "✅ The new contracts match the old ones." >&2
+if [ "$LEFT_BEHIND" -ne 0 ]; then
+    echo "✅ The new contracts match the old ones, apart from what was left behind." >&2
+else
+    echo "✅ The new contracts match the old ones." >&2
+fi

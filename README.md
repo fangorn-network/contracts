@@ -377,7 +377,8 @@ variable of every script, and a value in `.env` wins over the command line): `IM
 `SUBSCRIPTION_FEE`, `DATA_REGISTRY_ADDR`, `APP_REGISTRY_ADDR`, and `MAX_FEE` (Stylus
 only). Requires `cast`, plus `forge` and `jq` for Solidity or `cargo stylus` for Stylus.
 
-To try a deploy without spending anything, point it at a local chain:
+To try a deploy without spending anything, point it at a local chain. Move `.env` aside
+first: its `RPC_ENDPOINT` and `PRIVATE_KEY` win over the ones on the command line.
 
 ```sh
 anvil &
@@ -473,13 +474,33 @@ another name (`DEFAULT_APP_NAME`).
 When only the AppRegistry was redeployed, pass the DataRegistry it sits in front of as
 `DATA_REGISTRY_ADDR`: if that is the old one, the DataRegistry half is skipped.
 
+**Leaving a wallet behind.** When a wallet's key is lost or compromised, name it:
+
+```sh
+RETIRED_WALLET=0x… APP_REGISTRY_ADDR=0x… DATA_REGISTRY_ADDR=0x… ./scripts/migrate.sh
+```
+
+Nothing that wallet owns is carried over: not its publisher registration, its namespace
+heads, the apps it owns, or its memberships. An app it owned that the new contract
+already has keeps its new owner and is compared in everything else. That is how the
+default app changes hands: `deploy.sh` claims it for the new admin, and the migration
+then restores its other publishers. The summary counts what was left behind. It needs a
+new DataRegistry; it refuses to run against the old one.
+
+**The old contracts must be quiet.** The copy is a snapshot and the seed functions only
+fill empty slots, so a namespace head that moves on the old contract after it was copied
+shows up as a mismatch on the next run and cannot be corrected by the script. Stop
+publishing to the old contracts before the real migration, and point every publisher at
+the new ones before they publish again.
+
 Config is env vars (or the same `.env`): `PRIVATE_KEY`, `RPC_ENDPOINT`,
 `APP_REGISTRY_ADDR`, `DATA_REGISTRY_ADDR`, `OLD_APP_REGISTRY`, `OLD_DATA_REGISTRY`
 (both default to the Stylus deployment), `OLD_RPC_ENDPOINT` and `FROM_BLOCK`. Requires
 `cast` and `jq`.
 
 To rehearse it without spending anything, read the old state from Sepolia and write to
-a local chain:
+a local chain. Move `.env` aside first: its `RPC_ENDPOINT` and `PRIVATE_KEY` win over
+the ones on the command line, and the rehearsal would run against the real chain.
 
 ```sh
 anvil &
