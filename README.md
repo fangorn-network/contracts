@@ -1,9 +1,13 @@
 # Fangorn contracts
 
-Three Stylus (Rust → WASM) contracts on Arbitrum Sepolia. **No proxies, no factories,
-no delegatecall** — each contract is deployed directly. When they need to talk, they do
-it with a plain cross-contract call to a stored address, not through a shared storage
-layout.
+Three contracts on Arbitrum Sepolia, each implemented twice: in Solidity
+(`solidity/`) and as Stylus Rust → WASM (`stylus/`). The two implementations have the
+same ABI and the same constructor arguments, so the SDK, the workers and `deploy.sh`
+work with either. See *Two implementations* below for when to use which.
+
+**No proxies, no factories, no delegatecall** — each contract is deployed directly.
+When they need to talk, they do it with a plain cross-contract call to a stored
+address, not through a shared storage layout.
 
 Almost nothing lives on-chain. A publisher's namespace is one `bytes32` in the
 DataRegistry — the sha256 digest of its latest commit block. The graph itself is
@@ -83,11 +87,65 @@ later.
 
 ## Layout
 
-| Path                   | Contract           | Toolchain    | Deployed by      |
-|------------------------|--------------------|--------------|------------------|
-| `app_registry/`        | AppRegistry        | cargo stylus | `deploy.sh`      |
-| `data_registry/`       | DataRegistry       | cargo stylus | `deploy.sh`      |
-| `settlement_registry/` | SettlementRegistry | cargo stylus | `deploy.sh`      |
+| Path                              | What                                               |
+|-----------------------------------|----------------------------------------------------|
+| `solidity/src/AppRegistry.sol`    | AppRegistry                                        |
+| `solidity/src/DataRegistry.sol`   | DataRegistry                                       |
+| `solidity/src/SettlementRegistry.sol` | SettlementRegistry                             |
+| `solidity/src/NonReentrant.sol`   | Reentrancy guard shared by the ports               |
+| `solidity/test/`                  | Foundry tests and mocks                            |
+| `stylus/app_registry/`            | AppRegistry (cargo stylus crate)                   |
+| `stylus/data_registry/`           | DataRegistry (cargo stylus crate)                  |
+| `stylus/settlement_registry/`     | SettlementRegistry (cargo stylus crate)            |
+| `deploy.sh`                       | Deploys either implementation (`IMPL=`)            |
+| `migrate.sh`                      | Admin: copy the registries' state into new ones    |
+| `set_subscription_fee.sh`         | Admin: set the subscription fee on an AppRegistry  |
+
+## Two implementations
+
+The Solidity contracts are ports of the Stylus ones, written so that nothing outside
+this repo has to know which is deployed.
+
+**What is the same.** Every function name, argument order, return shape, error name and
+event (including the `snake_case` event field names the SDK reads). `forge inspect`
+output matches the Stylus `export-abi` output and the ABI files the SDK ships. One
+detail worth knowing: `SettlementRegistry.settle` takes its hook data as `uint8[]`, not
+`bytes`, because the Stylus contract declared it `Vec<u8>` and existing clients encode
+it that way.
+
+**What differs.**
+
+- *Reentrancy.* A Stylus contract refuses reentrant calls unless it opts in. Solidity
+  does not, so the ports guard every function that calls out (`NonReentrant.sol`) and
+  expose one extra error, `Reentrancy()`. Views are not guarded: a hook may read the
+  registry it was called from, which the Stylus version would refuse.
+- *Failed cross-calls.* The registries treat anything but a clean `true` from the other
+  registry (a revert, no contract at the address, a malformed return) as "no". The
+  ports use low-level calls to get the same result; a plain interface call would revert
+  on the last two instead.
+- *Storage layout.* Unrelated. Neither implementation can be upgraded in place to the
+  other; moving between them is a redeploy.
+- *`resourceIdFor`* is `pure` in Solidity and `view` in the Stylus ABI. Callers cannot
+  tell the difference.
+- *Migration seeding.* Three admin-only functions exist in Solidity alone: `seedApp` and
+  `seedPublisherForApp` on the AppRegistry, `seedPublisher` on the DataRegistry. They are
+  what `migrate.sh` writes with. Nothing else calls them, and the SDK's ABI files do not
+  list them.
+
+**They interoperate.** A Solidity AppRegistry can be paired with a Stylus DataRegistry
+and the reverse, since each only makes one view call on the other.
+
+**Which to deploy.** Stylus needs the chain to accept new program activations. Arbitrum
+paused those on 2026-10-02; while that holds, only the Solidity contracts can be
+deployed. Check with:
+
+```sh
+cast call 0x0000000000000000000000000000000000000071 "activationGas()(uint64)" --rpc-url <rpc>
+# a value in the millions is normal; 18446744073709551615 means activations are paused
+```
+
+Programs that were already activated keep running until their activation expires
+(a year from when it happened).
 
 ## AppRegistry
 
@@ -123,6 +181,11 @@ an app.
   `admin`.
 - Admin: `set_subscription_fee`, `set_usdc`, `set_data_registry`, `withdraw_usdc`,
   `withdraw_eth`.
+- Admin, Solidity only, for `migrate.sh`: `seedApp(app_id, owner, terms_hash, terms_uri,
+  fee, agent_uri)` recreates an app for its owner, pulls **no** subscription fee and
+  stamps it as paid now (a testnet shortcut); `seedPublisherForApp(app_id, publisher,
+  status, accepted_terms)` restores one membership verbatim. Both are fill-only: they
+  refuse an app that is already claimed, or a publisher the app already knows.
 - `init(admin, usdc, subscription_fee, data_registry)`.
 
 **Global bans.** "Registered in the DataRegistry" means status active, so a wallet the
@@ -164,6 +227,9 @@ State: `admin`, `registration_fee`, `statuses` (0 unregistered / 1 active /
   `publisher_count`, `registration_fee`, `app_registry`, `admin`.
 - Admin: `suspend_publisher`, `reinstate_global`, `set_registration_fee`,
   `set_app_registry`, `seed_namespace_head` (fill-only; replays heads after a redeploy).
+- Admin, Solidity only, for `migrate.sh`: `seedPublisher(publisher)` restores one
+  registration without the fee. Fill-only: it refuses a wallet the registry already
+  knows, so it cannot lift a suspension.
 - `init(admin, registration_fee, app_registry)`.
 
 So publishing takes two registrations, in this order: `register()` here, then
@@ -201,10 +267,28 @@ a v1 client at a v2 deployment. Rationale, migration steps and the open question
 
 ## Build and test
 
+### Solidity
+
 ```sh
-(cd app_registry && cargo test)
-(cd data_registry && cargo test)
-(cd settlement_registry && cargo test)
+cd solidity
+forge build
+forge test
+```
+
+Needs [Foundry](https://getfoundry.sh). `forge-std` is a git submodule
+(`solidity/lib/forge-std`): after a fresh clone run `git submodule update --init`.
+
+The tests cover every case the Rust tests do, and the ones the Stylus test VM cannot
+express: that ETH actually reaches the app owner, that a revert unwinds state, that a
+missing or reverting partner registry fails closed, and that a hook cannot re-enter
+`settle`. The AppRegistry tests run against the real DataRegistry rather than a mock.
+
+### Stylus
+
+```sh
+(cd stylus/app_registry && cargo test)
+(cd stylus/data_registry && cargo test)
+(cd stylus/settlement_registry && cargo test)
 ```
 
 Run from inside each crate: its `rust-toolchain.toml` pins the compiler, and
@@ -223,17 +307,23 @@ Tests run against the stylus-sdk `TestVM`, which mocks cross-contract calls
 ## Generate ABI
 
 ```sh
-cargo stylus export-abi --json   # from inside a crate dir; writes that crate's abi.json
+(cd solidity && forge inspect src/AppRegistry.sol:AppRegistry abi --json)
+(cd stylus/app_registry && cargo stylus export-abi --json)
 ```
 
 Stylus exposes Rust `snake_case` as **camelCase** (`commitStateRoot`, `isRegistered`,
 `setSubscriptionFee`). The snake_case selector reverts — this bites every new caller.
-The export omits events, so the SDK's ABI files carry those by hand.
+The Stylus export omits events, so the SDK's ABI files carry those by hand; the
+Solidity output includes them.
+
+When a contract changes, change both implementations and compare the two ABIs before
+touching the SDK.
 
 ## Deploy (Arbitrum Sepolia)
 
 ```sh
-./deploy.sh                    # interactive: all, or one contract
+./deploy.sh                    # interactive: all, or one contract (Solidity by default)
+IMPL=stylus ./deploy.sh        # the Stylus crates instead
 TARGET=app-registry DATA_REGISTRY_ADDR=0x… ./deploy.sh   # new AppRegistry, same heads
 ./set_subscription_fee.sh 5    # admin: set the live subscription fee, in USDC
 ```
@@ -242,22 +332,84 @@ TARGET=app-registry DATA_REGISTRY_ADDR=0x… ./deploy.sh   # new AppRegistry, sa
 registers the deployer as a publisher, and only then claims the default app
 (`fangorn`) — a claim needs a registered claimer. Deploying the AppRegistry alone
 requires `DATA_REGISTRY_ADDR`: the new contract is born pointing at it, and it is
-repointed at the new one. Config is env
-vars (or a gitignored `.env`): `PRIVATE_KEY`, `RPC_ENDPOINT`, `MAX_FEE`, `ADMIN_ADDR`,
-`USDC_ADDR`, `REGISTRATION_FEE`, `SUBSCRIPTION_FEE`, `DATA_REGISTRY_ADDR`,
-`APP_REGISTRY_ADDR`. Requires `cargo stylus` and `cast`.
+repointed at the new one. That works across implementations, so a Solidity AppRegistry
+can replace a Stylus one in front of a live Stylus DataRegistry.
 
-The AppRegistry compresses to about 28.3 KB, over the 24 KB single-contract limit, so
-`cargo stylus` deploys it as two fragments. Arbitrum Sepolia allows that
-(`ArbOwnerPublic.getMaxStylusContractFragments()` is 4); check the same call on any
-other chain before deploying there.
+Config is env vars (or a gitignored `.env`): `IMPL`, `TARGET`, `PRIVATE_KEY`,
+`RPC_ENDPOINT`, `ADMIN_ADDR`, `USDC_ADDR`, `SEMAPHORE_ADDR`, `REGISTRATION_FEE`,
+`SUBSCRIPTION_FEE`, `DATA_REGISTRY_ADDR`, `APP_REGISTRY_ADDR`, and `MAX_FEE` (Stylus
+only). Requires `cast`, plus `forge` for Solidity or `cargo stylus` for Stylus.
 
-A new AppRegistry starts empty: every app is re-claimed (and paid for) and its
-publishers re-added. With a non-zero `SUBSCRIPTION_FEE` the deployer needs that much
-USDC to claim the default app.
+To try a deploy without spending anything, point it at a local chain:
+
+```sh
+anvil &
+PRIVATE_KEY=<an anvil dev key> ADMIN_ADDR=<its address> \
+  RPC_ENDPOINT=http://127.0.0.1:8545 TARGET=all ./deploy.sh
+```
+
+**What a redeploy loses.** Each contract starts empty at a new address.
+
+- AppRegistry and DataRegistry: everything, until `migrate.sh` copies it back (below).
+  With a non-zero `SUBSCRIPTION_FEE` the deployer needs that much USDC to claim the
+  default app.
+- SettlementRegistry: every resource, Semaphore group and settlement is gone, so
+  existing buyers lose access. Nothing migrates it.
+
+**Stylus size.** The Stylus AppRegistry compresses to about 28.3 KB, over the 24 KB
+single-contract limit, so `cargo stylus` deploys it as two fragments. Arbitrum Sepolia
+allows that (`ArbOwnerPublic.getMaxStylusContractFragments()` is 4); check the same
+call on any other chain before deploying there. The Solidity AppRegistry is about
+9.1 KB of runtime code.
 
 Deploying mints new addresses. They reach every consumer through one place:
 `fangorn/src/config.ts`. Publish the SDK, then bump it in the workers and the website.
 
+## Migrate
+
+```sh
+APP_REGISTRY_ADDR=0x… DATA_REGISTRY_ADDR=0x… ./migrate.sh
+```
+
+Copies the old registries' state into new Solidity ones (the targets must have the seed
+functions). Run it after `deploy.sh`, with the admin key:
+
+- DataRegistry: every registered publisher (a suspended one stays suspended) and every
+  namespace head.
+- AppRegistry: every app, for its original owner, with its terms, join fee, agent card
+  and suspension flag; and every membership, with the terms hash that publisher
+  accepted.
+
+**Testnet only.** A migrated app pays no subscription fee and reads as paid at the
+moment it was seeded, whatever it had paid before.
+
+The old contracts' logs are only used to list which apps, publishers and namespaces
+exist. Each value is read from the old contracts' views, so the copy is their state now.
+
+It is safe to re-run: anything the new contracts already hold is left alone, and every
+item is compared with the old contracts whether or not it was copied in that run. It
+exits non-zero if anything differs. That includes an app `deploy.sh` claimed for a
+different owner than the old one, so keep the deployer the same or give the default app
+another name (`DEFAULT_APP_NAME`).
+
+When only the AppRegistry was redeployed, pass the DataRegistry it sits in front of as
+`DATA_REGISTRY_ADDR`: if that is the old one, the DataRegistry half is skipped.
+
+Config is env vars (or the same `.env`): `PRIVATE_KEY`, `RPC_ENDPOINT`,
+`APP_REGISTRY_ADDR`, `DATA_REGISTRY_ADDR`, `OLD_APP_REGISTRY`, `OLD_DATA_REGISTRY`
+(both default to the Stylus deployment), `OLD_RPC_ENDPOINT` and `FROM_BLOCK`. Requires
+`cast` and `jq`.
+
+To rehearse it without spending anything, read the old state from Sepolia and write to
+a local chain:
+
+```sh
+anvil &
+PRIVATE_KEY=<an anvil dev key> ADMIN_ADDR=<its address> DEFAULT_APP_NAME=bootstrap \
+  RPC_ENDPOINT=http://127.0.0.1:8545 TARGET=all ./deploy.sh
+PRIVATE_KEY=<the same key> RPC_ENDPOINT=http://127.0.0.1:8545 \
+  OLD_RPC_ENDPOINT=https://sepolia-rollup.arbitrum.io/rpc \
+  APP_REGISTRY_ADDR=<new> DATA_REGISTRY_ADDR=<new> ./migrate.sh
+```
+
 MVP, not audited.
-</content>

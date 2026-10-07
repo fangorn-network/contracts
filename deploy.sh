@@ -5,15 +5,25 @@ set -euo pipefail
 # ==============================================================================
 # Deploys the Fangorn contracts to Arbitrum Sepolia.
 #
-#   AppRegistry (Stylus)          – app ids, per-app terms + join fees, invitation-only
+# There are two implementations of the same three contracts, with the same ABI and
+# the same constructor arguments, so everything below the deploy step is shared:
+#
+#   IMPL=solidity (default)  solidity/src/*.sol, deployed with `forge create`
+#   IMPL=stylus              stylus/<crate>,     deployed with `cargo stylus deploy`
+#
+# Stylus needs the chain to accept new program activations. Check before using it:
+#   cast call 0x0000000000000000000000000000000000000071 "activationGas()(uint64)" --rpc-url <rpc>
+# A value in the millions is normal; 18446744073709551615 means activations are paused.
+#
+#   AppRegistry                   – app ids, per-app terms + join fees, invitation-only
 #                                   publisher membership, and the paid storage
 #                                   subscription: claiming an app pulls the USDC fee.
 #                                   Cross-calls DataRegistry.isRegistered when an app
 #                                   is claimed or a publisher added.
-#   DataRegistry (Stylus)         – publisher registration + state-root timeline.
+#   DataRegistry                  – publisher registration + state-root timeline.
 #                                   Cross-calls AppRegistry.isRegisteredForApp in
 #                                   commit_state_root.
-#   SettlementRegistry (Stylus)   – ZK settlement registry with Semaphore & USDC auth.
+#   SettlementRegistry            – ZK settlement registry with Semaphore & USDC auth.
 #
 # The two registries point at each other, so (when deploying all):
 #
@@ -27,20 +37,18 @@ set -euo pipefail
 #
 # REDEPLOYING AppRegistry ALONE: DATA_REGISTRY_ADDR is required. The new AppRegistry
 # is born pointing at it, and it is repointed at the new one (`setAppRegistry`,
-# admin-only), keeping every namespace head. Apps and memberships do NOT carry over:
-# each app is re-claimed (and paid for) and its publishers re-added.
+# admin-only), keeping every namespace head. Apps and memberships do NOT carry over.
 #
 # REDEPLOYING DataRegistry ALONE: the existing AppRegistry is repointed at it
-# (`setDataRegistry`, admin-only). Every publisher must register again.
+# (`setDataRegistry`, admin-only). Registrations and namespace heads do NOT carry
+# over, so every library published against the old address reads as empty.
 #
-# NOTE ON REDEPLOYING DataRegistry: its `namespace_heads` mapping is every
-# publisher's timeline head and does NOT survive a new deployment. Replay them
-# with `seedNamespaceHead(app_id, publisher, subspace_id, root)` (admin-only, and
-# fill-only — it refuses a slot that already holds a root) or every library
-# published against the old address reads as empty.
+# AFTER ANY OF THESE: ./migrate.sh copies the old registries' apps, memberships,
+# publishers and namespace heads into the new ones (Solidity targets only).
 #
 # Runs interactively or non-interactively via TARGET environment variable:
 #   TARGET=all|app-registry|data-registry|settlement
+#   IMPL=solidity|stylus
 # ==============================================================================
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -50,7 +58,12 @@ if [ -f "$ENV_FILE" ]; then set -a; source "$ENV_FILE"; set +a; fi
 
 PRIVATE_KEY="${PRIVATE_KEY:?PRIVATE_KEY not set — export it or add it to .env}"
 RPC_ENDPOINT="${RPC_ENDPOINT:-https://sepolia-rollup.arbitrum.io/rpc}"
-MAX_FEE="${MAX_FEE:-0.1}"
+MAX_FEE="${MAX_FEE:-0.1}"   # Stylus only: max fee per gas, in gwei
+IMPL="${IMPL:-solidity}"
+case "$IMPL" in
+    solidity|stylus) ;;
+    *) echo "❌ IMPL must be 'solidity' or 'stylus', got '$IMPL'." >&2; exit 1 ;;
+esac
 
 ADMIN_ADDR="${ADMIN_ADDR:-0x147c24c5Ea2f1EE1ac42AD16820De23bBba45Ef6}"
 REGISTRATION_FEE="${REGISTRATION_FEE:-0}"
@@ -96,23 +109,37 @@ cast_send() {
         --rpc-url "$RPC_ENDPOINT" --private-key "$PRIVATE_KEY" > /dev/null
 }
 
-# Deploy a Stylus contract. Extra args become --constructor-args.
-deploy_stylus() {
-    local dir="$1"; shift
-    echo "Deploying Stylus contract from $dir..." >&2
-    if [ "$#" -gt 0 ]; then
-        (cd "$dir" && cargo stylus deploy \
+# Deploy one contract with the chosen implementation. The first argument is the
+# crate name (app_registry | data_registry | settlement_registry); the rest are the
+# constructor arguments, which are the same for both implementations.
+deploy_contract() {
+    local name="$1"; shift
+    local marker
+    if [ "$IMPL" = "stylus" ]; then
+        echo "Deploying Stylus contract stylus/$name..." >&2
+        marker="deployed code at address:"
+        (cd "$SCRIPT_DIR/stylus/$name" && cargo stylus deploy \
             --private-key "$PRIVATE_KEY" --endpoint "$RPC_ENDPOINT" \
             --max-fee-per-gas-gwei "$MAX_FEE" \
-            --constructor-args "$@") > "$LOG_FILE" 2>&1
+            --constructor-args "$@") > "$LOG_FILE" 2>&1 || { cat "$LOG_FILE" >&2; exit 1; }
     else
-        (cd "$dir" && cargo stylus deploy \
-            --private-key "$PRIVATE_KEY" --endpoint "$RPC_ENDPOINT" \
-            --max-fee-per-gas-gwei "$MAX_FEE") > "$LOG_FILE" 2>&1
+        local contract
+        case "$name" in
+            app_registry)        contract="AppRegistry" ;;
+            data_registry)       contract="DataRegistry" ;;
+            settlement_registry) contract="SettlementRegistry" ;;
+            *) echo "❌ Unknown contract '$name'." >&2; exit 1 ;;
+        esac
+        echo "Deploying Solidity contract solidity/src/$contract.sol..." >&2
+        marker="Deployed to:"
+        # --constructor-args takes everything after it, so it goes last.
+        (cd "$SCRIPT_DIR/solidity" && forge create "src/$contract.sol:$contract" \
+            --rpc-url "$RPC_ENDPOINT" --private-key "$PRIVATE_KEY" --broadcast \
+            --constructor-args "$@") > "$LOG_FILE" 2>&1 || { cat "$LOG_FILE" >&2; exit 1; }
     fi
     cat "$LOG_FILE" >&2
     local address
-    address=$(grep -i "deployed code at address:" "$LOG_FILE" \
+    address=$(grep -i "$marker" "$LOG_FILE" \
         | grep -oE '0x[a-fA-F0-9]{40}' | head -n1 | tr -d '[:space:]')
     [ -n "$address" ] || { echo "❌ No address in logs." >&2; exit 1; }
     echo "✅ Deployed: $address" >&2
@@ -140,7 +167,7 @@ if [ -z "$TARGET" ]; then
 fi
 
 echo "=========================================" >&2
-echo " Deploying to Arbitrum Sepolia — target: $TARGET" >&2
+echo " Deploying ($IMPL) to $RPC_ENDPOINT — target: $TARGET" >&2
 echo "=========================================" >&2
 
 APP_REGISTRY=""
@@ -164,7 +191,7 @@ fi
 
 if [ "$TARGET" = "all" ] || [ "$TARGET" = "app-registry" ]; then
     log_step "Deploying AppRegistry"
-    APP_REGISTRY=$(deploy_stylus "$SCRIPT_DIR/app_registry" \
+    APP_REGISTRY=$(deploy_contract app_registry \
         "$ADMIN_ADDR" "$USDC_ADDR" "$SUBSCRIPTION_FEE" "${DATA_REGISTRY:-$ZERO_ADDR}")
     echo "Verifying registry admin..." >&2
     cast_call "$APP_REGISTRY" "admin()(address)"
@@ -183,7 +210,7 @@ fi
 # ── 2. DataRegistry ───────────────────────────────────────────────────────────
 if [ "$TARGET" = "all" ] || [ "$TARGET" = "data-registry" ]; then
     log_step "Deploying DataRegistry"
-    DATA_REGISTRY=$(deploy_stylus "$SCRIPT_DIR/data_registry" \
+    DATA_REGISTRY=$(deploy_contract data_registry \
         "$ADMIN_ADDR" "$REGISTRATION_FEE" "$APP_REGISTRY")
     echo "Verifying registry admin..." >&2
     cast_call "$DATA_REGISTRY" "admin()(address)"
@@ -250,7 +277,7 @@ if [ "$TARGET" = "all" ] || [ "$TARGET" = "settlement" ]; then
     # Groups are per-resource now, created by createResource — there is no group
     # to verify at deploy time. The admin (takedown authority, may be the zero
     # address for a registry nobody can administer) is the new constructor arg.
-    SETTLEMENT_REGISTRY=$(deploy_stylus "$SCRIPT_DIR/settlement_registry" \
+    SETTLEMENT_REGISTRY=$(deploy_contract settlement_registry \
         "$USDC_ADDR" "$SEMAPHORE_ADDR" "$ADMIN_ADDR")
     echo "Verifying settlement registry admin..." >&2
     cast_call "$SETTLEMENT_REGISTRY" "getAdmin()(address)"
@@ -258,7 +285,7 @@ fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo -e "\n=========================================" >&2
-echo " 🎉 Deployment complete" >&2
+echo " 🎉 Deployment complete ($IMPL)" >&2
 echo "=========================================" >&2
 [ -n "$DATA_REGISTRY" ] && echo "DataRegistry:            $DATA_REGISTRY" >&2
 [ -n "$APP_REGISTRY" ] && echo "AppRegistry:          $APP_REGISTRY" >&2

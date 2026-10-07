@@ -209,7 +209,7 @@ against.
 ## Tests
 
 ```sh
-cargo test --manifest-path settlement_registry/Cargo.toml
+(cd stylus/settlement_registry && cargo test)
 ```
 
 44 tests, all `TestVM`-based, no network. Notably including the v1 exploits as
