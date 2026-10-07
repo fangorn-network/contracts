@@ -9,6 +9,8 @@ optimizer_runs = 200
 # Nothing here needs a newer fork, and "paris" bytecode runs on every Arbitrum
 # chain regardless of which ArbOS version it is on.
 evm_version = "paris"
+# layout.sh reads each contract's storage layout from the build artifacts.
+extra_output = ["storageLayout"]
 
 [lint]
 # Argument and event-field names are snake_case on purpose: they mirror the Stylus

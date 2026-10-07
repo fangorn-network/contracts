@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 import {NonReentrant} from "./NonReentrant.sol";
 
 /// The slice of Semaphore this contract calls.
@@ -34,7 +36,13 @@ interface ISemaphore {
 ///
 /// Every external call is low-level on purpose. The Stylus contract maps each failed
 /// call to its own error, and a low-level call is what lets this one do the same.
-contract SettlementRegistry is NonReentrant {
+///
+/// Deployed behind an ERC-1967 proxy (UUPS): the proxy holds the state and the address
+/// (it is the proxy that administers the Semaphore groups), and the admin can point it
+/// at a new implementation. Storage is therefore append-only: add state variables
+/// after the last one, and never reorder, retype or remove what is there
+/// (`scripts/layout.sh` checks).
+contract SettlementRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     event MemberRegistered(bytes32 indexed resourceId, uint256 identityCommitment);
     event SettlementFinalized(bytes32 indexed resourceId, uint256 indexed nullifierHash, uint256 message);
     event HookRegistered(bytes32 indexed resourceId, address hook);
@@ -74,11 +82,26 @@ contract SettlementRegistry is NonReentrant {
     /// resource => identity commitment => registered
     mapping(bytes32 => mapping(uint256 => bool)) internal registrations;
 
-    constructor(address usdc_, address semaphore_, address admin_) {
+    /// The implementation is only ever used through a proxy. Lock it, so nobody can
+    /// initialize it directly.
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// Takes the place of a constructor: runs once, in the proxy's storage, as part of
+    /// the proxy's deployment.
+    function initialize(address usdc_, address semaphore_, address admin_) external initializer {
         usdc = usdc_;
         semaphore = semaphore_;
         admin = admin_;
         emit AdminChanged(address(0), admin_);
+    }
+
+    /// Only the admin may point the proxy at a new implementation. A registry with no
+    /// admin can never be upgraded.
+    function _authorizeUpgrade(address) internal view override {
+        address current = admin;
+        if (msg.sender != current || current == address(0)) revert NotAdmin();
     }
 
     /// Set a new admin (has global takedown authority). Setting zero renounces it

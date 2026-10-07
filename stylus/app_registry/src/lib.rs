@@ -11,7 +11,7 @@
 //! 
 //! Publishers must *register* with the application in order to be able to write to the app-level namespace
 //! in an associated DataRegistry where a specific instance of the AppRegistry is referenced. 
-//! See [deploy.sh](../../deploy.sh) for an example script of how these are configured.
+//! See [deploy.sh](../../../scripts/deploy.sh) for an example script of how these are configured.
 //!
 //! An app IS a storage subscription: claiming one pulls the subscription fee (USDC), and
 //! the off-chain upload gate reads `access` to decide whether to serve its publishers.

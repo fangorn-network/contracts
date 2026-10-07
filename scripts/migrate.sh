@@ -6,7 +6,7 @@ shopt -s inherit_errexit
 
 # ==============================================================================
 # Copies the state of an old AppRegistry and DataRegistry into freshly deployed
-# Solidity ones. Run it after ./deploy.sh, with the admin key.
+# Solidity ones. Run it after ./scripts/deploy.sh, with the admin key.
 #
 #   DataRegistry   every registered publisher (a suspended one stays suspended) and
 #                  every namespace head
@@ -26,7 +26,7 @@ shopt -s inherit_errexit
 # Exits non-zero if anything differs.
 #
 # Usage:
-#   APP_REGISTRY_ADDR=0x… DATA_REGISTRY_ADDR=0x… ./migrate.sh
+#   APP_REGISTRY_ADDR=0x… DATA_REGISTRY_ADDR=0x… ./scripts/migrate.sh
 #
 # When only the AppRegistry was redeployed (TARGET=app-registry), pass the DataRegistry
 # it sits in front of: DATA_REGISTRY_ADDR equal to OLD_DATA_REGISTRY skips that half.
@@ -35,8 +35,8 @@ shopt -s inherit_errexit
 # ==============================================================================
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-# Any variable below can be set in a .env next to this script (gitignored).
-ENV_FILE="$(dirname "${BASH_SOURCE[0]}")/.env"
+# Any variable below can be set in a .env at the repo root (gitignored).
+ENV_FILE="$(dirname "${BASH_SOURCE[0]}")/../.env"
 if [ -f "$ENV_FILE" ]; then set -a; source "$ENV_FILE"; set +a; fi
 
 # The admin of the NEW contracts: every write below is admin-only.

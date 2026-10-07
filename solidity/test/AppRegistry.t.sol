@@ -4,7 +4,8 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
-import {MockUSDC, Reverter} from "./Mocks.sol";
+import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {MockUSDC, Reverter, Proxied} from "./Mocks.sol";
 
 /// An app owner that cannot receive ETH, so a join fee paid to it is undeliverable.
 contract PennilessOwner {
@@ -14,6 +15,13 @@ contract PennilessOwner {
         data.register();
         apps.registerApp(app, terms, "", fee);
         apps.addPublisher(app, invitee);
+    }
+}
+
+/// What an upgrade installs: the same contract, plus one function to tell it by.
+contract AppRegistryV2 is AppRegistry {
+    function version() external pure returns (uint256) {
+        return 2;
     }
 }
 
@@ -49,8 +57,8 @@ contract AppRegistryTest is Test {
     /// Three everyday wallets are registered publishers; OUTSIDER is not.
     function setUp() public {
         usdc = new MockUSDC();
-        data = new DataRegistry(ADMIN, 0, address(0));
-        apps = new AppRegistry(ADMIN, address(usdc), 0, address(data));
+        data = Proxied.dataRegistry(ADMIN, 0, address(0));
+        apps = Proxied.appRegistry(ADMIN, address(usdc), 0, address(data));
         vm.prank(ADMIN);
         data.setAppRegistry(address(apps));
 
@@ -597,5 +605,69 @@ contract AppRegistryTest is Test {
         vm.prank(PUBLISHER);
         data.commitStateRoot(APP, sub, bytes32(0), root);
         assertEq(data.getNamespaceHead(APP, PUBLISHER, sub), root);
+    }
+
+    // ── upgrades ──────────────────────────────────────────────────────────────
+
+    /// The point of the proxy: a new implementation takes over the same address and
+    /// the same state, and only the admin can install one.
+    function test_an_upgrade_keeps_state_and_only_the_admin_can_do_it() public {
+        openApp();
+        join(PUBLISHER, APP, TERMS_V1, FEE);
+        uint64 paidAt = apps.subscribedAt(APP);
+        address v2 = address(new AppRegistryV2());
+
+        vm.prank(APP_OWNER);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.upgradeToAndCall(v2, "");
+
+        vm.prank(ADMIN);
+        apps.upgradeToAndCall(v2, "");
+
+        assertEq(AppRegistryV2(address(apps)).version(), 2);
+        assertEq(apps.admin(), ADMIN);
+        assertEq(apps.dataRegistry(), address(data));
+        assertEq(apps.getAppOwner(APP), APP_OWNER);
+        assertEq(apps.appTerms(APP), TERMS_V1);
+        assertEq(apps.appTermsUri(APP), "https://tabs.example/terms");
+        assertEq(apps.appFee(APP), FEE);
+        assertEq(apps.subscribedAt(APP), paidAt);
+        assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
+
+        // Still the contract the DataRegistry asks, and still writable.
+        vm.prank(PUBLISHER);
+        data.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+        vm.prank(APP_OWNER);
+        apps.renewApp(APP);
+    }
+
+    /// `initialize` stands in for the constructor, so it runs exactly once — and never
+    /// on the bare implementation, which nobody should be able to take over.
+    function test_initialize_runs_once_and_never_on_the_implementation() public {
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        apps.initialize(STRANGER, address(usdc), 0, address(data));
+
+        AppRegistry implementation = new AppRegistry();
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        implementation.initialize(STRANGER, address(usdc), 0, address(data));
+    }
+
+    /// The admin role moves, and the right to upgrade moves with it.
+    function test_the_admin_role_can_be_handed_over() public {
+        address v2 = address(new AppRegistryV2());
+
+        vm.prank(STRANGER);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.setAdmin(STRANGER);
+
+        vm.prank(ADMIN);
+        apps.setAdmin(STRANGER);
+        assertEq(apps.admin(), STRANGER);
+
+        vm.prank(ADMIN);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.upgradeToAndCall(v2, "");
+        vm.prank(STRANGER);
+        apps.upgradeToAndCall(v2, "");
     }
 }

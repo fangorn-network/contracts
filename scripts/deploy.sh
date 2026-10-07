@@ -6,10 +6,17 @@ set -euo pipefail
 # Deploys the Fangorn contracts to Arbitrum Sepolia.
 #
 # There are two implementations of the same three contracts, with the same ABI and
-# the same constructor arguments, so everything below the deploy step is shared:
+# the same initial arguments, so everything below the deploy step is shared:
 #
 #   IMPL=solidity (default)  solidity/src/*.sol, deployed with `forge create`
 #   IMPL=stylus              stylus/<crate>,     deployed with `cargo stylus deploy`
+#
+# A Solidity contract is two deployments: the implementation, and an ERC-1967 proxy
+# (UUPS) that holds the state. The proxy's address is the contract's address — the
+# one printed here and used everywhere else. To change a contract that is already
+# deployed, do not run this again: ./scripts/upgrade.sh swaps the implementation behind the
+# proxy and keeps the address and the state. A Stylus contract is deployed directly
+# and cannot be upgraded.
 #
 # Stylus needs the chain to accept new program activations. Check before using it:
 #   cast call 0x0000000000000000000000000000000000000071 "activationGas()(uint64)" --rpc-url <rpc>
@@ -43,17 +50,18 @@ set -euo pipefail
 # (`setDataRegistry`, admin-only). Registrations and namespace heads do NOT carry
 # over, so every library published against the old address reads as empty.
 #
-# AFTER ANY OF THESE: ./migrate.sh copies the old registries' apps, memberships,
+# AFTER ANY OF THESE: ./scripts/migrate.sh copies the old registries' apps, memberships,
 # publishers and namespace heads into the new ones (Solidity targets only).
 #
-# Runs interactively or non-interactively via TARGET environment variable:
+# Run from anywhere, e.g. ./scripts/deploy.sh from the repo root. Interactive, or
+# non-interactive via the TARGET environment variable:
 #   TARGET=all|app-registry|data-registry|settlement
 #   IMPL=solidity|stylus
 # ==============================================================================
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-# Any variable below can be set in a .env next to this script (gitignored).
-ENV_FILE="$(dirname "${BASH_SOURCE[0]}")/.env"
+# Any variable below can be set in a .env at the repo root (gitignored).
+ENV_FILE="$(dirname "${BASH_SOURCE[0]}")/../.env"
 if [ -f "$ENV_FILE" ]; then set -a; source "$ENV_FILE"; set +a; fi
 
 PRIVATE_KEY="${PRIVATE_KEY:?PRIVATE_KEY not set — export it or add it to .env}"
@@ -87,7 +95,11 @@ DATA_REGISTRY_ADDR="${DATA_REGISTRY_ADDR:-}"
 APP_REGISTRY_ADDR="${APP_REGISTRY_ADDR:-}"
 
 ZERO_ADDR="0x0000000000000000000000000000000000000000"
+# The proxy every Solidity contract sits behind (path is relative to solidity/)
+PROXY_CONTRACT="lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967Proxy.sol:ERC1967Proxy"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The repo root: solidity/, stylus/ and layout/ live there, one level up.
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 LOG_FILE="$(mktemp)"
 trap 'rm -f "$LOG_FILE"' EXIT
 
@@ -109,39 +121,60 @@ cast_send() {
         --rpc-url "$RPC_ENDPOINT" --private-key "$PRIVATE_KEY" > /dev/null
 }
 
+# Print the last deploy tool's log, and the address it reported after `marker`.
+deployed_address() {
+    cat "$LOG_FILE" >&2
+    local address
+    address=$(grep -i "$1" "$LOG_FILE" \
+        | grep -oE '0x[a-fA-F0-9]{40}' | head -n1 | tr -d '[:space:]')
+    [ -n "$address" ] || { echo "❌ No address in logs." >&2; exit 1; }
+    echo "$address"
+}
+
 # Deploy one contract with the chosen implementation. The first argument is the
-# crate name (app_registry | data_registry | settlement_registry); the rest are the
-# constructor arguments, which are the same for both implementations.
+# crate name (app_registry | data_registry | settlement_registry); the rest are its
+# initial arguments, which are the same for both implementations: a Stylus
+# constructor takes them, and so does a Solidity `initialize`.
 deploy_contract() {
     local name="$1"; shift
-    local marker
+    # This runs inside $(…), where bash switches `set -e` off: every step that can
+    # fail says `|| exit 1` itself.
+    local address
     if [ "$IMPL" = "stylus" ]; then
         echo "Deploying Stylus contract stylus/$name..." >&2
-        marker="deployed code at address:"
-        (cd "$SCRIPT_DIR/stylus/$name" && cargo stylus deploy \
+        (cd "$ROOT_DIR/stylus/$name" && cargo stylus deploy \
             --private-key "$PRIVATE_KEY" --endpoint "$RPC_ENDPOINT" \
             --max-fee-per-gas-gwei "$MAX_FEE" \
             --constructor-args "$@") > "$LOG_FILE" 2>&1 || { cat "$LOG_FILE" >&2; exit 1; }
+        address=$(deployed_address "deployed code at address:") || exit 1
     else
-        local contract
+        local contract init
         case "$name" in
-            app_registry)        contract="AppRegistry" ;;
-            data_registry)       contract="DataRegistry" ;;
-            settlement_registry) contract="SettlementRegistry" ;;
+            app_registry)        contract="AppRegistry";        init="initialize(address,address,uint256,address)" ;;
+            data_registry)       contract="DataRegistry";       init="initialize(address,uint256,address)" ;;
+            settlement_registry) contract="SettlementRegistry"; init="initialize(address,address,address)" ;;
             *) echo "❌ Unknown contract '$name'." >&2; exit 1 ;;
         esac
-        echo "Deploying Solidity contract solidity/src/$contract.sol..." >&2
-        marker="Deployed to:"
-        # --constructor-args takes everything after it, so it goes last.
-        (cd "$SCRIPT_DIR/solidity" && forge create "src/$contract.sol:$contract" \
+        echo "Deploying Solidity implementation solidity/src/$contract.sol..." >&2
+        (cd "$ROOT_DIR/solidity" && forge create "src/$contract.sol:$contract" \
+            --rpc-url "$RPC_ENDPOINT" --private-key "$PRIVATE_KEY" --broadcast) \
+            > "$LOG_FILE" 2>&1 || { cat "$LOG_FILE" >&2; exit 1; }
+        local implementation
+        implementation=$(deployed_address "Deployed to:") || exit 1
+
+        # The proxy's constructor runs `initialize` with the arguments, so the contract
+        # is never live and uninitialized. --constructor-args takes everything after
+        # it, so it goes last.
+        echo "Deploying its proxy (implementation $implementation)..." >&2
+        (cd "$ROOT_DIR/solidity" && forge create "$PROXY_CONTRACT" \
             --rpc-url "$RPC_ENDPOINT" --private-key "$PRIVATE_KEY" --broadcast \
-            --constructor-args "$@") > "$LOG_FILE" 2>&1 || { cat "$LOG_FILE" >&2; exit 1; }
+            --constructor-args "$implementation" "$(cast calldata "$init" "$@")") \
+            > "$LOG_FILE" 2>&1 || { cat "$LOG_FILE" >&2; exit 1; }
+        address=$(deployed_address "Deployed to:") || exit 1
+
+        # What upgrade.sh will compare the next implementation against.
+        "$SCRIPT_DIR/layout.sh" write "$contract" "$(cast chain-id --rpc-url "$RPC_ENDPOINT")" || exit 1
     fi
-    cat "$LOG_FILE" >&2
-    local address
-    address=$(grep -i "$marker" "$LOG_FILE" \
-        | grep -oE '0x[a-fA-F0-9]{40}' | head -n1 | tr -d '[:space:]')
-    [ -n "$address" ] || { echo "❌ No address in logs." >&2; exit 1; }
     echo "✅ Deployed: $address" >&2
     echo "$address"
 }
@@ -176,7 +209,7 @@ SETTLEMENT_REGISTRY=""
 APP_ID=""
 
 # ── 1. AppRegistry ────────────────────────────────────────────────────────────
-# First, because DataRegistry takes its address in the constructor. It needs a
+# First, because DataRegistry takes its address when it is created. It needs a
 # DataRegistry too (to check that app owners and publishers are registered), so:
 #   - alone: it is born pointing at the existing one, which must be given;
 #   - with a fresh DataRegistry: it is born unwired and pointed at it in step 3.
@@ -275,8 +308,8 @@ fi
 if [ "$TARGET" = "all" ] || [ "$TARGET" = "settlement" ]; then
     log_step "Deploying SettlementRegistry"
     # Groups are per-resource now, created by createResource — there is no group
-    # to verify at deploy time. The admin (takedown authority, may be the zero
-    # address for a registry nobody can administer) is the new constructor arg.
+    # to verify at deploy time. The admin (takedown and upgrade authority, may be
+    # the zero address for a registry nobody can administer) is the last argument.
     SETTLEMENT_REGISTRY=$(deploy_contract settlement_registry \
         "$USDC_ADDR" "$SEMAPHORE_ADDR" "$ADMIN_ADDR")
     echo "Verifying settlement registry admin..." >&2

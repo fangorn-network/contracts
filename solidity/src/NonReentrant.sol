@@ -8,10 +8,14 @@ pragma solidity ^0.8.24;
 abstract contract NonReentrant {
     error Reentrancy();
 
-    uint256 private _entered = 1;
+    /// 2 while a guarded function runs. Anything else means "not entered" — including
+    /// zero, which is what a proxy's storage holds before the first guarded call. The
+    /// flag is deliberately not initialized here: an initializer on a state variable
+    /// runs in the implementation's constructor, and would never reach the proxy.
+    uint256 private _entered;
 
     modifier nonReentrant() {
-        if (_entered != 1) revert Reentrancy();
+        if (_entered == 2) revert Reentrancy();
         _entered = 2;
         _;
         _entered = 1;

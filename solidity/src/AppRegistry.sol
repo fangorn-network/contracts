@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 import {NonReentrant} from "./NonReentrant.sol";
 
 /// AppRegistry
@@ -24,7 +26,12 @@ import {NonReentrant} from "./NonReentrant.sol";
 /// A port of `stylus/app_registry`. The ABI is the same — function, error and event
 /// names, argument order, and event field names — so the SDK and the workers talk to
 /// either without change.
-contract AppRegistry is NonReentrant {
+///
+/// Deployed behind an ERC-1967 proxy (UUPS): the proxy holds the state and the address,
+/// and the admin can point it at a new implementation. Storage is therefore
+/// append-only: add state variables after the last one and fields at the end of
+/// `App`, and never reorder, retype or remove what is there (`scripts/layout.sh` checks).
+contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     uint8 internal constant STATUS_UNREGISTERED = 0;
     uint8 internal constant STATUS_ACTIVE = 1;
     uint8 internal constant STATUS_SUSPENDED = 2;
@@ -71,6 +78,7 @@ contract AppRegistry is NonReentrant {
     /// timestamp (Unix seconds); the off-chain gate enforces the active window.
     event AppSubscribed(bytes32 indexed app_id, address indexed payer, uint64 paid_at);
     event SubscriptionFeeChanged(uint256 fee);
+    event AdminChanged(address previousAdmin, address newAdmin);
 
     /// The app registry admin
     address public admin;
@@ -107,7 +115,18 @@ contract AppRegistry is NonReentrant {
     /// app_id => publisher => the terms hash they actually accepted
     mapping(bytes32 => mapping(address => bytes32)) internal accepted;
 
-    constructor(address admin_, address usdc_, uint256 subscriptionFee_, address dataRegistry_) {
+    /// The implementation is only ever used through a proxy. Lock it, so nobody can
+    /// initialize it directly.
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// Takes the place of a constructor: runs once, in the proxy's storage, as part of
+    /// the proxy's deployment.
+    function initialize(address admin_, address usdc_, uint256 subscriptionFee_, address dataRegistry_)
+        external
+        initializer
+    {
         admin = admin_;
         usdc = usdc_;
         subscriptionFee = subscriptionFee_;
@@ -336,6 +355,16 @@ contract AppRegistry is NonReentrant {
     }
 
     // ── Protocol admin ────────────────────────────────────────────────────────
+
+    /// Hand the admin role to another address. The admin is also who may upgrade this
+    /// contract, so setting zero renounces both for good.
+    function setAdmin(address new_admin) external onlyAdmin {
+        emit AdminChanged(admin, new_admin);
+        admin = new_admin;
+    }
+
+    /// Only the admin may point the proxy at a new implementation.
+    function _authorizeUpgrade(address) internal override onlyAdmin {}
 
     function setSubscriptionFee(uint256 fee) external onlyAdmin {
         subscriptionFee = fee;

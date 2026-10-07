@@ -3,7 +3,8 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {SettlementRegistry} from "../src/SettlementRegistry.sol";
-import {MockUSDC, MockSemaphore, ShortSemaphore, MockHook} from "./Mocks.sol";
+import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {MockUSDC, MockSemaphore, ShortSemaphore, MockHook, Proxied} from "./Mocks.sol";
 
 /// A hook that settles once more from inside `afterSettle`. Once only: if the
 /// registry allowed it, the inner settle would succeed and so would the outer one.
@@ -25,6 +26,13 @@ contract ReenteringHook {
 
 /// The cases from `stylus/settlement_registry`'s tests.
 ///
+/// What an upgrade installs: the same contract, plus one function to tell it by.
+contract SettlementRegistryV2 is SettlementRegistry {
+    function version() external pure returns (uint256) {
+        return 2;
+    }
+}
+
 /// The Rust tests had to pin "which group, which recipient" indirectly, by mocking
 /// the exact calldata they expected and making it revert. These mocks record what
 /// they were called with, so the same properties are asserted directly.
@@ -55,7 +63,7 @@ contract SettlementRegistryTest is Test {
         usdc = new MockUSDC();
         semaphore = new MockSemaphore();
         hook = new MockHook();
-        registry = new SettlementRegistry(address(usdc), address(semaphore), ADMIN);
+        registry = Proxied.settlementRegistry(address(usdc), address(semaphore), ADMIN);
         vm.prank(OWNER);
         rid = registry.createResource(UID, PRICE, "ipfs://x");
     }
@@ -172,7 +180,7 @@ contract SettlementRegistryTest is Test {
     }
 
     function test_create_resource_fails_on_short_semaphore_return() public {
-        SettlementRegistry short = new SettlementRegistry(address(usdc), address(new ShortSemaphore()), ADMIN);
+        SettlementRegistry short = Proxied.settlementRegistry(address(usdc), address(new ShortSemaphore()), ADMIN);
         vm.prank(OWNER);
         vm.expectRevert(SettlementRegistry.SemaphoreCallFailed.selector);
         short.createResource(UID, PRICE, "");
@@ -422,7 +430,7 @@ contract SettlementRegistryTest is Test {
     /// With no admin configured, nobody but the owner can take a resource down —
     /// and a zero-address caller must not slip through the admin check.
     function test_a_registry_without_an_admin_has_no_takedown_authority() public {
-        SettlementRegistry adminless = new SettlementRegistry(address(usdc), address(semaphore), address(0));
+        SettlementRegistry adminless = Proxied.settlementRegistry(address(usdc), address(semaphore), address(0));
         vm.prank(OWNER);
         bytes32 r = adminless.createResource(UID, PRICE, "");
 
@@ -507,5 +515,55 @@ contract SettlementRegistryTest is Test {
         assertFalse(registry.isDisabled(unknown));
         assertFalse(registry.isSettled(STEALTH, unknown));
         assertFalse(registry.isRegistered(unknown, 1));
+    }
+
+    // ── upgrades ──────────────────────────────────────────────────────────────
+
+    /// A new implementation takes over the same address and the same state, and only
+    /// the admin can install one.
+    function test_an_upgrade_keeps_state_and_only_the_admin_can_do_it() public {
+        address v2 = address(new SettlementRegistryV2());
+
+        vm.prank(OWNER);
+        vm.expectRevert(SettlementRegistry.NotAdmin.selector);
+        registry.upgradeToAndCall(v2, "");
+
+        vm.prank(ADMIN);
+        registry.upgradeToAndCall(v2, "");
+
+        assertEq(SettlementRegistryV2(address(registry)).version(), 2);
+        assertEq(registry.getAdmin(), ADMIN);
+        assertEq(registry.getOwner(rid), OWNER);
+        assertEq(registry.getPrice(rid), PRICE);
+        assertEq(registry.getUri(rid), "ipfs://x");
+        assertEq(registry.getGroupId(rid), GROUP_A);
+
+        // The proxy is what Semaphore knows as each group's admin, so that survives
+        // too: the upgraded registry can still create a resource and its group.
+        vm.prank(OWNER);
+        registry.createResource(UID2, PRICE, "");
+        assertEq(registry.getGroupId(idOf(OWNER, UID2)), GROUP_B);
+    }
+
+    /// A registry with no admin can never be upgraded — and a zero-address caller
+    /// must not slip through the check.
+    function test_a_registry_without_an_admin_cannot_be_upgraded() public {
+        SettlementRegistry adminless = Proxied.settlementRegistry(address(usdc), address(semaphore), address(0));
+        address v2 = address(new SettlementRegistryV2());
+
+        vm.prank(address(0));
+        vm.expectRevert(SettlementRegistry.NotAdmin.selector);
+        adminless.upgradeToAndCall(v2, "");
+    }
+
+    /// `initialize` stands in for the constructor, so it runs exactly once — and never
+    /// on the bare implementation, which nobody should be able to take over.
+    function test_initialize_runs_once_and_never_on_the_implementation() public {
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        registry.initialize(address(usdc), address(semaphore), ATTACKER);
+
+        SettlementRegistry implementation = new SettlementRegistry();
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        implementation.initialize(address(usdc), address(semaphore), ATTACKER);
     }
 }

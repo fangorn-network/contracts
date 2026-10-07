@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
+
 /// DataRegistry
 ///
 /// The DataRegistry handles:
@@ -13,7 +16,12 @@ pragma solidity ^0.8.24;
 /// A port of `stylus/data_registry`. The ABI is the same — function, error and event
 /// names, argument order, and event field names — so the SDK and the workers talk to
 /// either without change.
-contract DataRegistry {
+///
+/// Deployed behind an ERC-1967 proxy (UUPS): the proxy holds the state and the address,
+/// and the admin can point it at a new implementation. Storage is therefore
+/// append-only: add state variables after the last one, and never reorder, retype or
+/// remove what is there (`scripts/layout.sh` checks).
+contract DataRegistry is Initializable, UUPSUpgradeable {
     uint8 internal constant STATUS_UNREGISTERED = 0;
     uint8 internal constant STATUS_ACTIVE = 1;
     uint8 internal constant STATUS_SUSPENDED = 2;
@@ -30,6 +38,7 @@ contract DataRegistry {
     event PublisherReactivated(address indexed publisher, bytes32 current_root);
     event PublisherSuspended(address indexed publisher);
     event RegistrationFeeChanged(uint256 fee);
+    event AdminChanged(address previousAdmin, address newAdmin);
     event StateCommitted(
         bytes32 indexed namespace_key,
         bytes32 indexed app_id,
@@ -53,7 +62,15 @@ contract DataRegistry {
     /// keccak256(app_id ‖ publisher ‖ subspace_id) => latest valid root
     mapping(bytes32 => bytes32) internal namespaceHeads;
 
-    constructor(address admin_, uint256 registrationFee_, address appRegistry_) {
+    /// The implementation is only ever used through a proxy. Lock it, so nobody can
+    /// initialize it directly.
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// Takes the place of a constructor: runs once, in the proxy's storage, as part of
+    /// the proxy's deployment.
+    function initialize(address admin_, uint256 registrationFee_, address appRegistry_) external initializer {
         admin = admin_;
         registrationFee = registrationFee_;
         appRegistry = appRegistry_;
@@ -125,6 +142,16 @@ contract DataRegistry {
     function setAppRegistry(address registry) external onlyAdmin {
         appRegistry = registry;
     }
+
+    /// Hand the admin role to another address. The admin is also who may upgrade this
+    /// contract, so setting zero renounces both for good.
+    function setAdmin(address new_admin) external onlyAdmin {
+        emit AdminChanged(admin, new_admin);
+        admin = new_admin;
+    }
+
+    /// Only the admin may point the proxy at a new implementation.
+    function _authorizeUpgrade(address) internal override onlyAdmin {}
 
     /// Restore one namespace head after a redeploy. Fill-only: it refuses a slot that
     /// already holds a root, so it cannot rewrite a live timeline.

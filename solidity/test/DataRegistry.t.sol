@@ -3,10 +3,18 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
-import {MockAppRegistry, Reverter} from "./Mocks.sol";
+import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {MockAppRegistry, Reverter, Proxied} from "./Mocks.sol";
 
 /// The cases from `stylus/data_registry`'s tests, plus the ones TestVM could not
 /// express (an AppRegistry that is missing or misbehaving).
+/// What an upgrade installs: the same contract, plus one function to tell it by.
+contract DataRegistryV2 is DataRegistry {
+    function version() external pure returns (uint256) {
+        return 2;
+    }
+}
+
 contract DataRegistryTest is Test {
     address constant ADMIN = 0x1111111111111111111111111111111111111111;
     address constant PUB = 0x2222222222222222222222222222222222222222;
@@ -35,7 +43,7 @@ contract DataRegistryTest is Test {
     /// An app with PUB joined, and PUB registered globally.
     function setUp() public {
         apps = new MockAppRegistry();
-        registry = new DataRegistry(ADMIN, FEE, address(apps));
+        registry = Proxied.dataRegistry(ADMIN, FEE, address(apps));
         apps.setMember(APP, PUB, true);
         vm.deal(PUB, 10 ether);
         vm.prank(PUB);
@@ -43,7 +51,7 @@ contract DataRegistryTest is Test {
     }
 
     function test_initialization() public {
-        DataRegistry fresh = new DataRegistry(ADMIN, FEE, address(apps));
+        DataRegistry fresh = Proxied.dataRegistry(ADMIN, FEE, address(apps));
         assertEq(fresh.admin(), ADMIN);
         assertEq(fresh.registrationFee(), FEE);
         assertEq(fresh.publisherCount(), 0);
@@ -264,5 +272,65 @@ contract DataRegistryTest is Test {
         vm.prank(ADMIN);
         registry.setRegistrationFee(0);
         assertEq(registry.registrationFee(), 0);
+    }
+
+    // ── upgrades ──────────────────────────────────────────────────────────────
+
+    /// A new implementation takes over the same address and the same state — every
+    /// registration and namespace head — and only the admin can install one.
+    function test_an_upgrade_keeps_state_and_only_the_admin_can_do_it() public {
+        vm.prank(PUB);
+        registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
+        address v2 = address(new DataRegistryV2());
+
+        vm.prank(PUB);
+        vm.expectRevert(DataRegistry.Unauthorized.selector);
+        registry.upgradeToAndCall(v2, "");
+
+        vm.prank(ADMIN);
+        registry.upgradeToAndCall(v2, "");
+
+        assertEq(DataRegistryV2(address(registry)).version(), 2);
+        assertEq(registry.admin(), ADMIN);
+        assertEq(registry.registrationFee(), FEE);
+        assertEq(registry.appRegistry(), address(apps));
+        assertEq(registry.publisherCount(), 1);
+        assertEq(registry.getPublisherStatus(PUB), STATUS_ACTIVE);
+        assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), ROOT_A);
+
+        // The timeline continues from where it was.
+        vm.prank(PUB);
+        registry.commitStateRoot(APP, SUB_A, ROOT_A, ROOT_B);
+        assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), ROOT_B);
+    }
+
+    /// `initialize` stands in for the constructor, so it runs exactly once — and never
+    /// on the bare implementation, which nobody should be able to take over.
+    function test_initialize_runs_once_and_never_on_the_implementation() public {
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        registry.initialize(PUB, 0, address(apps));
+
+        DataRegistry implementation = new DataRegistry();
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        implementation.initialize(PUB, 0, address(apps));
+    }
+
+    /// The admin role moves, and the right to upgrade moves with it.
+    function test_the_admin_role_can_be_handed_over() public {
+        address v2 = address(new DataRegistryV2());
+
+        vm.prank(PUB);
+        vm.expectRevert(DataRegistry.Unauthorized.selector);
+        registry.setAdmin(PUB);
+
+        vm.prank(ADMIN);
+        registry.setAdmin(PUB);
+        assertEq(registry.admin(), PUB);
+
+        vm.prank(ADMIN);
+        vm.expectRevert(DataRegistry.Unauthorized.selector);
+        registry.upgradeToAndCall(v2, "");
+        vm.prank(PUB);
+        registry.upgradeToAndCall(v2, "");
     }
 }
