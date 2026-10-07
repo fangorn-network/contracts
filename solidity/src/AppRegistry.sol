@@ -81,20 +81,27 @@ contract AppRegistry is NonReentrant {
     /// The DataRegistry queried for network-wide publisher registration.
     address public dataRegistry;
 
-    /// app_id => owner
-    mapping(bytes32 => address) internal apps;
-    /// app_id => hash of the app's current publisher terms. Zero means none are set.
-    mapping(bytes32 => bytes32) public appTerms;
-    /// app_id => URI to read the terms
-    mapping(bytes32 => string) public appTermsUri;
-    /// app_id => join fee, in wei. Can be zero.
-    mapping(bytes32 => uint256) public appFee;
-    /// app_id => URI of the app's ERC-8004 agent card. Empty means the app has none.
-    mapping(bytes32 => string) public appAgentUri;
-    /// app_id => admin takedown flag. A suspended app is dead for every publisher at once.
-    mapping(bytes32 => bool) public isAppSuspended;
-    /// app_id => block timestamp (Unix seconds) of the app's last subscription payment.
-    mapping(bytes32 => uint64) public subscribedAt;
+    struct App {
+        // The first three fields share one storage slot (20 + 1 + 8 bytes): keep them
+        // adjacent.
+        /// Zero means the app is unclaimed.
+        address owner;
+        /// Admin takedown flag. A suspended app is dead for every publisher at once.
+        bool isAppSuspended;
+        /// Block timestamp (Unix seconds) of the app's last subscription payment.
+        uint64 subscribedAt;
+        /// Hash of the app's current publisher terms. Zero means none are set.
+        bytes32 appTerms;
+        /// URI to read the terms
+        string appTermsUri;
+        /// Join fee, in wei. Can be zero.
+        uint256 joinFee;
+        /// URI of the app's ERC-8004 agent card. Empty means the app has none.
+        string appAgentUri;
+    }
+
+    /// app_id => app. Internal: the getters below keep the ABI the Stylus contract has.
+    mapping(bytes32 => App) internal apps;
     /// app_id => publisher => lifecycle status
     mapping(bytes32 => mapping(address => uint8)) internal statuses;
     /// app_id => publisher => the terms hash they actually accepted
@@ -128,15 +135,16 @@ contract AppRegistry is NonReentrant {
         external
         nonReentrant
     {
-        if (apps[app_id] != address(0)) revert AppAlreadyRegistered();
+        App storage app = apps[app_id];
+        if (app.owner != address(0)) revert AppAlreadyRegistered();
         address owner = msg.sender;
         if (!_isRegisteredGlobally(owner)) revert NotRegisteredGlobally();
         _paySubscription(app_id, owner);
 
-        apps[app_id] = owner;
-        appTerms[app_id] = terms_hash;
-        appTermsUri[app_id] = terms_uri;
-        appFee[app_id] = fee;
+        app.owner = owner;
+        app.appTerms = terms_hash;
+        app.appTermsUri = terms_uri;
+        app.joinFee = fee;
         _joinOwner(app_id, owner, terms_hash);
 
         emit AppRegistered(app_id, owner);
@@ -145,13 +153,13 @@ contract AppRegistry is NonReentrant {
     }
 
     function getAppOwner(bytes32 app_id) external view returns (address) {
-        return apps[app_id];
+        return apps[app_id].owner;
     }
 
     /// Renew an app's subscription: pays the fee again and re-stamps `now`.
     /// Only callable by the app owner. Renewing while still active is allowed.
     function renewApp(bytes32 app_id) external nonReentrant onlyAppOwner(app_id) {
-        _paySubscription(app_id, apps[app_id]);
+        _paySubscription(app_id, apps[app_id].owner);
     }
 
     /// Publish (or update) an app's publisher agreement. Only callable by the app owner.
@@ -162,23 +170,24 @@ contract AppRegistry is NonReentrant {
         external
         onlyAppOwner(app_id)
     {
-        appTerms[app_id] = terms_hash;
-        appTermsUri[app_id] = terms_uri;
+        App storage app = apps[app_id];
+        app.appTerms = terms_hash;
+        app.appTermsUri = terms_uri;
         // The owner accepts their own terms by publishing them. Without this they are
         // locked out of their own app by every edit.
-        _joinOwner(app_id, apps[app_id], terms_hash);
+        _joinOwner(app_id, app.owner, terms_hash);
         emit AppTermsChanged(app_id, terms_hash, terms_uri);
     }
 
     /// Set the app's join fee in wei
     function setAppFee(bytes32 app_id, uint256 fee) external onlyAppOwner(app_id) {
-        appFee[app_id] = fee;
+        apps[app_id].joinFee = fee;
         emit AppFeeChanged(app_id, fee);
     }
 
     /// Point at the app's ERC-8004 agent card. Only callable by the app owner.
     function setAppAgentUri(bytes32 app_id, string calldata agent_uri) external onlyAppOwner(app_id) {
-        appAgentUri[app_id] = agent_uri;
+        apps[app_id].appAgentUri = agent_uri;
         emit AppAgentChanged(app_id, agent_uri);
     }
 
@@ -213,12 +222,13 @@ contract AppRegistry is NonReentrant {
     /// Register to publish to an app. By registering, you are agreeing to the app's
     /// terms and conditions. The app owner must have added you first (`addPublisher`).
     function registerForApp(bytes32 app_id, bytes32 terms_hash) external payable nonReentrant {
-        address owner = apps[app_id];
+        App storage app = apps[app_id];
+        address owner = app.owner;
         if (owner == address(0)) revert AppNotFound();
-        if (isAppSuspended[app_id]) revert AppSuspendedErr();
+        if (app.isAppSuspended) revert AppSuspendedErr();
 
         // empty terms are invalid
-        bytes32 current = appTerms[app_id];
+        bytes32 current = app.appTerms;
         if (current == bytes32(0)) revert TermsNotSet();
         if (terms_hash != current) revert TermsMismatch();
 
@@ -230,7 +240,7 @@ contract AppRegistry is NonReentrant {
         if (status == STATUS_ACTIVE && accepted[app_id][msg.sender] == current) revert AlreadyRegistered();
 
         // do not charge the join fee when accepting new publishing terms
-        uint256 fee = status == STATUS_ACTIVE ? 0 : appFee[app_id];
+        uint256 fee = status == STATUS_ACTIVE ? 0 : app.joinFee;
         if (msg.value < fee) revert JoinFeeRequired();
 
         statuses[app_id][msg.sender] = STATUS_ACTIVE;
@@ -258,11 +268,36 @@ contract AppRegistry is NonReentrant {
 
     // ── Views ─────────────────────────────────────────────────────────────────
 
+    function appTerms(bytes32 app_id) external view returns (bytes32) {
+        return apps[app_id].appTerms;
+    }
+
+    function appTermsUri(bytes32 app_id) external view returns (string memory) {
+        return apps[app_id].appTermsUri;
+    }
+
+    function appFee(bytes32 app_id) external view returns (uint256) {
+        return apps[app_id].joinFee;
+    }
+
+    function appAgentUri(bytes32 app_id) external view returns (string memory) {
+        return apps[app_id].appAgentUri;
+    }
+
+    function isAppSuspended(bytes32 app_id) external view returns (bool) {
+        return apps[app_id].isAppSuspended;
+    }
+
+    function subscribedAt(bytes32 app_id) external view returns (uint64) {
+        return apps[app_id].subscribedAt;
+    }
+
     /// Is a publisher actively registered in an app? False if the publisher is
     /// suspended, merely invited, on stale terms, or the app is suspended.
     function isRegisteredForApp(bytes32 app_id, address publisher) public view returns (bool) {
-        bytes32 current = appTerms[app_id];
-        return !isAppSuspended[app_id] && current != bytes32(0) && statuses[app_id][publisher] == STATUS_ACTIVE
+        App storage app = apps[app_id];
+        bytes32 current = app.appTerms;
+        return !app.isAppSuspended && current != bytes32(0) && statuses[app_id][publisher] == STATUS_ACTIVE
             && accepted[app_id][publisher] == current;
     }
 
@@ -271,7 +306,8 @@ contract AppRegistry is NonReentrant {
     /// `paid_at` is the app's last subscription timestamp. The gate applies its own
     /// active-window policy off-chain.
     function access(bytes32 app_id, address publisher) external view returns (bool, address, uint64) {
-        return (isRegisteredForApp(app_id, publisher), apps[app_id], subscribedAt[app_id]);
+        App storage app = apps[app_id];
+        return (isRegisteredForApp(app_id, publisher), app.owner, app.subscribedAt);
     }
 
     /// An address's status in an app
@@ -289,10 +325,11 @@ contract AppRegistry is NonReentrant {
         view
         returns (bytes32, string memory, uint256, uint8, bool)
     {
+        App storage app = apps[app_id];
         return (
-            appTerms[app_id],
-            appTermsUri[app_id],
-            appFee[app_id],
+            app.appTerms,
+            app.appTermsUri,
+            app.joinFee,
             statuses[app_id][publisher],
             isRegisteredForApp(app_id, publisher)
         );
@@ -330,21 +367,22 @@ contract AppRegistry is NonReentrant {
         uint256 fee,
         string calldata agent_uri
     ) external onlyAdmin {
-        if (apps[app_id] != address(0)) revert AppAlreadyRegistered();
+        App storage app = apps[app_id];
+        if (app.owner != address(0)) revert AppAlreadyRegistered();
         // a zero owner would read as unclaimed
         if (owner == address(0)) revert AppNotFound();
 
-        apps[app_id] = owner;
-        appTerms[app_id] = terms_hash;
-        appTermsUri[app_id] = terms_uri;
-        appFee[app_id] = fee;
+        app.owner = owner;
+        app.appTerms = terms_hash;
+        app.appTermsUri = terms_uri;
+        app.joinFee = fee;
         _joinOwner(app_id, owner, terms_hash);
 
         emit AppRegistered(app_id, owner);
         emit AppTermsChanged(app_id, terms_hash, terms_uri);
         emit AppFeeChanged(app_id, fee);
         if (bytes(agent_uri).length != 0) {
-            appAgentUri[app_id] = agent_uri;
+            app.appAgentUri = agent_uri;
             emit AppAgentChanged(app_id, agent_uri);
         }
         _stampPaid(app_id, owner);
@@ -357,7 +395,7 @@ contract AppRegistry is NonReentrant {
         external
         onlyAdmin
     {
-        if (apps[app_id] == address(0)) revert AppNotFound();
+        if (apps[app_id].owner == address(0)) revert AppNotFound();
         if (statuses[app_id][publisher] != STATUS_UNREGISTERED) revert AlreadyRegistered();
         statuses[app_id][publisher] = status;
         accepted[app_id][publisher] = accepted_terms;
@@ -387,15 +425,16 @@ contract AppRegistry is NonReentrant {
     }
 
     modifier onlyAppOwner(bytes32 app_id) {
-        address owner = apps[app_id];
+        address owner = apps[app_id].owner;
         if (owner == address(0)) revert AppNotFound();
         if (msg.sender != owner) revert Unauthorized();
         _;
     }
 
     function _setAppSuspended(bytes32 app_id, bool suspended) private onlyAdmin {
-        if (apps[app_id] == address(0)) revert AppNotFound();
-        isAppSuspended[app_id] = suspended;
+        App storage app = apps[app_id];
+        if (app.owner == address(0)) revert AppNotFound();
+        app.isAppSuspended = suspended;
         emit AppSuspensionChanged(app_id, suspended);
     }
 
@@ -418,7 +457,7 @@ contract AppRegistry is NonReentrant {
     /// Stamp the app's subscription as paid now.
     function _stampPaid(bytes32 app_id, address payer) private {
         uint64 paidAt = uint64(block.timestamp);
-        subscribedAt[app_id] = paidAt;
+        apps[app_id].subscribedAt = paidAt;
         emit AppSubscribed(app_id, payer, paidAt);
     }
 
