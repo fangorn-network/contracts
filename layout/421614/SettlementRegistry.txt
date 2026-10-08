@@ -1,0 +1,13 @@
+_entered 0 0 uint256
+admin 3 0 address
+nullifiers 10 0 mapping(uint256 => bool)
+registrations 12 0 mapping(bytes32 => mapping(uint256 => bool))
+resourceDisabled 9 0 mapping(bytes32 => bool)
+resourceGroups 8 0 mapping(bytes32 => uint256)
+resourceHooks 7 0 mapping(bytes32 => address)
+resourceOwners 5 0 mapping(bytes32 => address)
+resourcePrice 4 0 mapping(bytes32 => uint256)
+resourceUris 6 0 mapping(bytes32 => string)
+semaphore 2 0 address
+settlements 11 0 mapping(address => mapping(bytes32 => bool))
+usdc 1 0 address
