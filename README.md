@@ -90,23 +90,18 @@ later.
 
 ## Layout
 
-| Path                              | What                                               |
-|-----------------------------------|----------------------------------------------------|
-| `solidity/src/AppRegistry.sol`    | AppRegistry                                        |
-| `solidity/src/DataRegistry.sol`   | DataRegistry                                       |
-| `solidity/src/SettlementRegistry.sol` | SettlementRegistry                             |
-| `solidity/src/NonReentrant.sol`   | Reentrancy guard shared by the ports               |
-| `solidity/test/`                  | Foundry tests and mocks                            |
-| `stylus/app_registry/`            | AppRegistry (cargo stylus crate)                   |
-| `stylus/data_registry/`           | DataRegistry (cargo stylus crate)                  |
-| `stylus/settlement_registry/`     | SettlementRegistry (cargo stylus crate)            |
-| `solidity/lib/`                   | `forge-std`, `openzeppelin-contracts` (submodules) |
-| `scripts/deploy.sh`               | Deploys either implementation (`IMPL=`)            |
-| `scripts/upgrade.sh`              | Admin: upgrade a deployed Solidity contract in place |
-| `scripts/layout.sh`               | Storage-layout check used by the two above         |
-| `scripts/migrate.sh`              | Admin: copy the registries' state into new ones    |
-| `scripts/set_subscription_fee.sh` | Admin: set the subscription fee on an AppRegistry  |
-| `layout/<chain-id>/`              | The storage layout live on each chain (generated)  |
+| Path                                    | What                                                    |
+|-----------------------------------------|---------------------------------------------------------|
+| `solidity/src/AppRegistry.sol`          | AppRegistry                                             |
+| `solidity/src/DataRegistry.sol`         | DataRegistry                                            |
+| `solidity/src/MembershipRegistry.sol`   | MembershipRegistry                                      |
+| `solidity/src/NonReentrant.sol`         | Reentrancy guard shared by the contracts                |
+| `solidity/test/`                        | Foundry tests and mocks                                 |
+| `solidity/script/Deploy.s.sol`          | Deploys the contracts, each behind a proxy              |
+| `solidity/script/Upgrade.s.sol`         | Admin: upgrade a deployed contract in place             |
+| `solidity/script/SetSubscriptionFee.s.sol` | Admin: set the subscription fee on the AppRegistry   |
+| `solidity/script/Deployments.sol`       | Each proxy's address, and each contract's current version |
+| `solidity/lib/`                         | `forge-std`, `openzeppelin-contracts-upgradeable`, `openzeppelin-foundry-upgrades` (submodules) |
 
 ## Two implementations
 
@@ -204,7 +199,7 @@ an app.
   status, accepted_terms)` restores one membership verbatim. Both are fill-only: they
   refuse an app that is already claimed, or a publisher the app already knows.
 - Admin, Solidity only: `setAdmin(new_admin)` hands the role over, and
-  `upgradeToAndCall` (through `upgrade.sh`) replaces the implementation. Setting a zero
+  `upgradeToAndCall` (through `script/Upgrade.s.sol`) replaces the implementation. Setting a zero
   admin renounces both for good.
 - `init(admin, usdc, subscription_fee, data_registry)`.
 
@@ -251,7 +246,7 @@ State: `admin`, `registration_fee`, `statuses` (0 unregistered / 1 active /
   registration without the fee. Fill-only: it refuses a wallet the registry already
   knows, so it cannot lift a suspension.
 - Admin, Solidity only: `setAdmin(new_admin)` hands the role over, and
-  `upgradeToAndCall` (through `upgrade.sh`) replaces the implementation. Setting a zero
+  `upgradeToAndCall` (through `script/Upgrade.s.sol`) replaces the implementation. Setting a zero
   admin renounces both for good.
 - `init(admin, registration_fee, app_registry)`.
 
@@ -298,15 +293,24 @@ forge build
 forge test
 ```
 
-Needs [Foundry](https://getfoundry.sh). `forge-std` and `openzeppelin-contracts`
-(v5.7.0, for the proxy and the upgrade logic) are git submodules under `solidity/lib/`:
-after a fresh clone run `git submodule update --init`.
+Needs [Foundry](https://getfoundry.sh) and [Node.js](https://nodejs.org). The
+libraries are git submodules under `solidity/lib/`; after a fresh clone run
+`git submodule update --init --recursive`. OpenZeppelin Contracts (v5.7.0) is the copy
+inside `openzeppelin-contracts-upgradeable`, which is how the
+[OpenZeppelin Foundry Upgrades](https://docs.openzeppelin.com/upgrades-plugins/foundry/foundry-upgrades)
+plugin is set up.
+
+Node.js is for that plugin: it checks upgrade safety by running
+`npx @openzeppelin/upgrades-core`, which is why `foundry.toml` turns on `ffi`. One test,
+`UpgradeSafety`, runs the check on the current version of every contract, so
+`forge test` needs network access the first time. The check needs a full build: if it
+fails with "not from a full compilation", run `forge clean` and try again.
 
 The tests cover every case the Rust tests do, and the ones the Stylus test VM cannot
 express: that ETH actually reaches the app owner, that a revert unwinds state, that a
 missing or reverting partner registry fails closed, and that a hook cannot re-enter
 `settle`. The AppRegistry tests run against the real DataRegistry rather than a mock.
-Every test deploys its contracts the way `deploy.sh` does, behind a proxy, and each
+Every test deploys its contracts behind a proxy, as the deploy script does, and each
 suite checks that an upgrade keeps the state, that only the admin can upgrade, and that
 `initialize` cannot run twice or on the bare implementation.
 
@@ -346,170 +350,131 @@ Solidity output includes them.
 When a contract changes, change both implementations and compare the two ABIs before
 touching the SDK.
 
-## Deploy (Arbitrum Sepolia)
+## Deploy
+
+Deploys, upgrades and admin calls are Forge scripts in `solidity/script/`. Run them
+from `solidity/`. There are no shell scripts.
 
 ```sh
-./scripts/deploy.sh                    # interactive: all, or one contract (Solidity by default)
-IMPL=stylus ./scripts/deploy.sh        # the Stylus crates instead
-TARGET=app-registry DATA_REGISTRY_ADDR=0x… ./scripts/deploy.sh   # new AppRegistry, same heads
-./scripts/set_subscription_fee.sh 5    # admin: set the live subscription fee, in USDC
+cd solidity
+forge script script/Deploy.s.sol --sig "all()" --force \
+  --rpc-url <rpc> --account <keystore> --sender <deployer address> --broadcast
 ```
 
-`deploy.sh` is for a contract that does not exist yet. To change one that is already
-deployed (Solidity), use `upgrade.sh` instead: see *Upgrade*.
+| `--sig`                                 | Deploys                                                        |
+|-----------------------------------------|----------------------------------------------------------------|
+| `"all()"`                               | AppRegistry and DataRegistry, wired to each other, and the default app claimed |
+| `"appRegistry(address)" <DataRegistry>` | A new AppRegistry in front of an existing DataRegistry, which is repointed at it |
+| `"dataRegistry(address)" <AppRegistry>` | A new DataRegistry behind an existing AppRegistry, which is repointed at it |
+| `"membershipRegistry(address)" <AppRegistry>` | A MembershipRegistry. The AppRegistry it reads app owners from cannot be changed later |
 
-A Solidity contract is two deployments: the implementation, then the ERC-1967 proxy,
-whose constructor runs `initialize` with the arguments. The proxy's address is the
-contract's address: it is what `deploy.sh` prints and what goes in the SDK. The script
-also records the storage layout it deployed in `layout/<chain-id>/`; commit those
-files.
+This is for a contract that does not exist yet. To change one that is already deployed,
+see *Upgrade*: a redeploy starts empty at a new address.
 
-`deploy.sh` deploys the AppRegistry, then the DataRegistry, points each at the other,
-registers the deployer as a publisher, and only then claims the default app
-(`fangorn`) — a claim needs a registered claimer. Deploying the AppRegistry alone
-requires `DATA_REGISTRY_ADDR`: the new contract is born pointing at it, and it is
-repointed at the new one. That works across implementations, so a Solidity AppRegistry
-can replace a Stylus one in front of a live Stylus DataRegistry.
+- **`--force` is required.** The upgrade-safety check needs a full build and refuses a
+  partial one.
+- **Signing.** Keep the key in a Foundry keystore (`cast wallet import <name>
+  --interactive`) and pass `--account <name> --sender <its address>`. No script reads a
+  private key from the environment, and none belongs in a `.env`.
+- **Nothing is sent unless everything would succeed.** Forge simulates the whole run
+  first. A failed check, or a signer who is not the admin, stops it before the first
+  transaction. Leave `--broadcast` off to only simulate.
+- **Parameters** are environment variables, listed with their defaults in
+  `solidity/.env.example` (Forge reads a `.env` in `solidity/`). `ADMIN_ADDR` is
+  required and has no default; for the two registries it must be the signer, because
+  the wiring calls are admin-only. `USDC_ADDR` and `SEMAPHORE_ADDR` default to the
+  Arbitrum Sepolia deployments on that chain and are required on any other.
 
-Config is env vars (or a gitignored `.env` at the repo root; `.env.example` lists every
-variable of every script, and a value in `.env` wins over the command line): `IMPL`, `TARGET`, `PRIVATE_KEY`,
-`RPC_ENDPOINT`, `ADMIN_ADDR`, `USDC_ADDR`, `SEMAPHORE_ADDR`, `REGISTRATION_FEE`,
-`SUBSCRIPTION_FEE`, `DATA_REGISTRY_ADDR`, `APP_REGISTRY_ADDR`, and `MAX_FEE` (Stylus
-only). `PRIVATE_KEY` and `ADMIN_ADDR` have no default and the script stops without them.
-Requires `cast`, plus `forge` and `jq` for Solidity or `cargo stylus` for Stylus.
+Each contract is two deployments: the implementation, then an ERC-1967 proxy (UUPS)
+whose constructor runs `initialize`. The proxy's address is the contract's address: it
+is what the script prints and what goes in the SDK. **Record it in
+`script/Deployments.sol`**, which is where the other scripts find it, and commit the
+broadcast log Forge writes under `solidity/broadcast/`.
 
-To try a deploy without spending anything, point it at a local chain. Move `.env` aside
-first: its `RPC_ENDPOINT` and `PRIVATE_KEY` win over the ones on the command line.
-
-```sh
-anvil &
-PRIVATE_KEY=<an anvil dev key> ADMIN_ADDR=<its address> \
-  RPC_ENDPOINT=http://127.0.0.1:8545 TARGET=all ./scripts/deploy.sh
-```
-
-**What a redeploy loses.** Each contract starts empty at a new address. This is what
-`upgrade.sh` avoids, so a redeploy is only for a first deployment, a storage-layout
-change, or a move between Stylus and Solidity.
-
-- AppRegistry and DataRegistry: everything, until `migrate.sh` copies it back (below).
-  With a non-zero `SUBSCRIPTION_FEE` the deployer needs that much USDC to claim the
-  default app.
-- SettlementRegistry: every resource, Semaphore group and settlement is gone, so
-  existing buyers lose access. Nothing migrates it.
-
-**Stylus size.** The Stylus AppRegistry compresses to about 28.3 KB, over the 24 KB
-single-contract limit, so `cargo stylus` deploys it as two fragments. Arbitrum Sepolia
-allows that (`ArbOwnerPublic.getMaxStylusContractFragments()` is 4); check the same
-call on any other chain before deploying there. The Solidity AppRegistry is about
-11.0 KB of runtime code.
+`all()` deploys the AppRegistry, then the DataRegistry, points each at the other,
+registers the deployer as a publisher, and only then claims the default app (`fangorn`):
+a claim needs a registered claimer. With a non-zero `SUBSCRIPTION_FEE` the deployer
+needs that much USDC.
 
 Deploying mints new addresses. They reach every consumer through one place:
 `fangorn/src/config.ts`. Publish the SDK, then bump it in the workers and the website.
 
-## Upgrade
+### Setting the subscription fee
 
 ```sh
-CONTRACT=AppRegistry PROXY=0x… ./scripts/upgrade.sh
+forge script script/SetSubscriptionFee.s.sol --sig "run(uint256)" 5000000 \
+  --rpc-url <rpc> --account <keystore> --sender <admin address> --broadcast
 ```
 
-Replaces the code of one deployed Solidity contract. It deploys a new implementation
-and points the existing proxy at it (`upgradeToAndCall`, admin-only). The address and
-all state stay, so there is nothing to migrate and nothing to repoint in the SDK, the
-workers or the other registry. If the ABI changed, the SDK still needs the new ABI.
+The fee is in USDC base units (6 decimals): `5000000` is 5 USDC. Admin only.
 
-`CONTRACT` is `AppRegistry`, `DataRegistry` or `SettlementRegistry`; `PROXY` is its
-address. Run it with the admin key. The script refuses to start if the key is not the
-contract's admin, if the address is not a proxy, or if the proxy is a different
-contract than `CONTRACT` names (that mix-up would leave it with no admin, for good).
+## Upgrade
 
-**Storage is append-only.** The proxy keeps its storage, so the new code must read
-every existing slot the way the old code wrote it:
+An upgrade replaces the code behind one proxy (`upgradeToAndCall`, admin-only). The
+address and all state stay, so there is nothing to migrate and nothing to repoint in the
+SDK, the workers or the other registry. If the ABI changed, the SDK still needs the new
+ABI.
+
+The OpenZeppelin Foundry Upgrades plugin checks every upgrade against the version it
+replaces, so that version's source has to stay in the repo. That makes an upgrade three
+steps:
+
+1. **Add the new version as a new file and a new contract name.** Copy the current
+   version, rename it, and name the version it replaces:
+
+   ```solidity
+   // src/DataRegistryV2.sol
+   /// @custom:oz-upgrades-from DataRegistry
+   contract DataRegistryV2 is Initializable, UUPSUpgradeable {
+   ```
+
+   Do not edit a version that is deployed. Its file is the reference the next version
+   is checked against, and nothing can tell if it stops matching what is live.
+
+2. **Make it the current version** in `script/Deployments.sol`
+   (`DATA_REGISTRY = "DataRegistryV2.sol:DataRegistryV2"`). From here `forge test`
+   checks it: the `UpgradeSafety` test fails on the pull request if a storage slot
+   moved, changed type or disappeared.
+
+3. **Run the upgrade**, signing as the contract's admin:
+
+   ```sh
+   forge script script/Upgrade.s.sol --sig "run(string)" DataRegistry --force \
+     --rpc-url <rpc> --account <keystore> --sender <admin address> --broadcast
+   ```
+
+   The name is `AppRegistry`, `DataRegistry` or `MembershipRegistry`. The script takes
+   the proxy's address and the new version from `Deployments.sol`, so one contract's
+   code cannot be pointed at another contract's proxy. It runs the same check again and
+   refuses a version that names no predecessor.
+
+**Storage is append-only.** The proxy keeps its storage, so the new code must read every
+existing slot the way the old code wrote it:
 
 - Add state variables after the last one. Add struct fields at the end of the struct
   (`App` is only ever a mapping value, so it can grow).
-- Never reorder, retype or remove a state variable or a struct field, and do not
-  change the order of the contracts a registry inherits from.
+- Never reorder, retype or remove a state variable or a struct field, and do not change
+  the order of the contracts a registry inherits from.
 - A constructor or an initial value on a state variable never reaches the proxy. New
-  state that needs a starting value gets a `reinitializer(n)` function; pass its
-  calldata as `INIT_DATA` and it runs in the same transaction as the upgrade.
+  state that needs a starting value gets a `reinitializer(n)` function. Pass the call to
+  it as a second argument and it runs in the upgrade transaction:
+  `--sig "run(string,bytes)" DataRegistry $(cast calldata "initializeV2()")`.
 
-`upgrade.sh` enforces the first two with `layout.sh`: it compares the working tree
-against `layout/<chain-id>/<Contract>.txt`, which `deploy.sh` and each upgrade write,
-and stops if a live slot moved, changed type or disappeared. A rename fails the check
-too; it is harmless, so confirm that is all it is and re-record with
-`./scripts/layout.sh write <Contract> <chain-id>`. Commit the snapshot after every deploy and
-upgrade.
+The plugin enforces the first two, and also refuses constructors, `selfdestruct` and
+`delegatecall` in a new version. A change that cannot keep the layout is a redeploy.
 
-A change that cannot keep the layout is a redeploy plus `migrate.sh`, as before.
+`MembershipRegistry` inherits OpenZeppelin's non-upgradeable `ERC721` and `EIP712`,
+whose constructors the plugin would refuse. It is live with that storage, so they stay,
+and `Deployments.options` allows them for that contract only; the comment there says why
+it is safe.
 
-To rehearse an upgrade, deploy to a local chain as shown under *Deploy*, then run
-`upgrade.sh` against it with the same key and `RPC_ENDPOINT`.
-
-## Migrate
+**Rehearse first.** Fork the chain locally and run the same command against the fork,
+signing as the admin's address without its key:
 
 ```sh
-APP_REGISTRY_ADDR=0x… DATA_REGISTRY_ADDR=0x… ./scripts/migrate.sh
-```
-
-Copies the old registries' state into new Solidity ones (the targets must have the seed
-functions). Run it after `deploy.sh`, with the admin key:
-
-- DataRegistry: every registered publisher (a suspended one stays suspended) and every
-  namespace head.
-- AppRegistry: every app, for its original owner, with its terms, join fee, agent card
-  and suspension flag; and every membership, with the terms hash that publisher
-  accepted.
-
-**Testnet only.** A migrated app pays no subscription fee and reads as paid at the
-moment it was seeded, whatever it had paid before.
-
-The old contracts' logs are only used to list which apps, publishers and namespaces
-exist. Each value is read from the old contracts' views, so the copy is their state now.
-
-It is safe to re-run: anything the new contracts already hold is left alone, and every
-item is compared with the old contracts whether or not it was copied in that run. It
-exits non-zero if anything differs. That includes an app `deploy.sh` claimed for a
-different owner than the old one, so keep the deployer the same or give the default app
-another name (`DEFAULT_APP_NAME`).
-
-When only the AppRegistry was redeployed, pass the DataRegistry it sits in front of as
-`DATA_REGISTRY_ADDR`: if that is the old one, the DataRegistry half is skipped.
-
-**Leaving a wallet behind.** When a wallet's key is lost or compromised, name it:
-
-```sh
-RETIRED_WALLET=0x… APP_REGISTRY_ADDR=0x… DATA_REGISTRY_ADDR=0x… ./scripts/migrate.sh
-```
-
-Nothing that wallet owns is carried over: not its publisher registration, its namespace
-heads, the apps it owns, or its memberships. An app it owned that the new contract
-already has keeps its new owner and is compared in everything else. That is how the
-default app changes hands: `deploy.sh` claims it for the new admin, and the migration
-then restores its other publishers. The summary counts what was left behind. It needs a
-new DataRegistry; it refuses to run against the old one.
-
-**The old contracts must be quiet.** The copy is a snapshot and the seed functions only
-fill empty slots, so a namespace head that moves on the old contract after it was copied
-shows up as a mismatch on the next run and cannot be corrected by the script. Stop
-publishing to the old contracts before the real migration, and point every publisher at
-the new ones before they publish again.
-
-Config is env vars (or the same `.env`): `PRIVATE_KEY`, `RPC_ENDPOINT`,
-`APP_REGISTRY_ADDR`, `DATA_REGISTRY_ADDR`, `OLD_APP_REGISTRY`, `OLD_DATA_REGISTRY`
-(both default to the Stylus deployment), `OLD_RPC_ENDPOINT` and `FROM_BLOCK`. Requires
-`cast` and `jq`.
-
-To rehearse it without spending anything, read the old state from Sepolia and write to
-a local chain. Move `.env` aside first: its `RPC_ENDPOINT` and `PRIVATE_KEY` win over
-the ones on the command line, and the rehearsal would run against the real chain.
-
-```sh
-anvil &
-PRIVATE_KEY=<an anvil dev key> ADMIN_ADDR=<its address> DEFAULT_APP_NAME=bootstrap \
-  RPC_ENDPOINT=http://127.0.0.1:8545 TARGET=all ./scripts/deploy.sh
-PRIVATE_KEY=<the same key> RPC_ENDPOINT=http://127.0.0.1:8545 \
-  OLD_RPC_ENDPOINT=https://sepolia-rollup.arbitrum.io/rpc \
-  APP_REGISTRY_ADDR=<new> DATA_REGISTRY_ADDR=<new> ./scripts/migrate.sh
+anvil --fork-url <rpc> --auto-impersonate
+forge script script/Upgrade.s.sol --sig "run(string)" DataRegistry --force \
+  --rpc-url http://127.0.0.1:8545 --unlocked --sender <admin address> --broadcast
 ```
 
 MVP, not audited.
