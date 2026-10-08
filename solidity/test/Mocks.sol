@@ -4,7 +4,6 @@ pragma solidity ^0.8.24;
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
-import {SettlementRegistry} from "../src/SettlementRegistry.sol";
 
 /// A fee token that records what it was asked to move and can be told to refuse.
 contract MockUSDC {
@@ -63,9 +62,31 @@ contract MockUSDC {
     ) external {
         _move(from, to, value);
     }
+
+    /// ERC-3009 receive: only `to` may redeem, and each nonce once.
+    mapping(bytes32 => bool) public usedNonce;
+    bytes32 public lastNonce;
+
+    function receiveWithAuthorization(
+        address from,
+        address to,
+        uint256 value,
+        uint256,
+        uint256,
+        bytes32 nonce,
+        uint8,
+        bytes32,
+        bytes32
+    ) external {
+        require(msg.sender == to, "usdc: caller must be the payee");
+        require(!usedNonce[nonce], "usdc: authorization used");
+        usedNonce[nonce] = true;
+        lastNonce = nonce;
+        _move(from, to, value);
+    }
 }
 
-/// Semaphore, as far as the SettlementRegistry can see it. Records every call so a
+/// Semaphore partial impl. Records every call so a
 /// test can assert which group and scope the registry actually used.
 contract MockSemaphore {
     uint256 public nextGroup = 7;
@@ -81,6 +102,7 @@ contract MockSemaphore {
     uint256 public lastProofGroup;
     uint256 public lastProofScope;
     uint256 public lastProofNullifier;
+    uint256 public lastProofMessage;
 
     struct SemaphoreProof {
         uint256 merkleTreeDepth;
@@ -115,6 +137,7 @@ contract MockSemaphore {
         lastProofGroup = groupId;
         lastProofScope = proof.scope;
         lastProofNullifier = proof.nullifier;
+        lastProofMessage = proof.message;
     }
 }
 
@@ -187,8 +210,4 @@ library Proxied {
         return DataRegistry(address(new ERC1967Proxy(address(new DataRegistry()), init)));
     }
 
-    function settlementRegistry(address usdc, address semaphore, address admin) internal returns (SettlementRegistry) {
-        bytes memory init = abi.encodeCall(SettlementRegistry.initialize, (usdc, semaphore, admin));
-        return SettlementRegistry(address(new ERC1967Proxy(address(new SettlementRegistry()), init)));
-    }
 }
