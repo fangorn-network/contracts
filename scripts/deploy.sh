@@ -73,7 +73,13 @@ case "$IMPL" in
     *) echo "❌ IMPL must be 'solidity' or 'stylus', got '$IMPL'." >&2; exit 1 ;;
 esac
 
-ADMIN_ADDR="${ADMIN_ADDR:-0x147c24c5Ea2f1EE1ac42AD16820De23bBba45Ef6}"
+# No default: the admin can change fees, take apps down and upgrade the contracts, so
+# it is never chosen for the caller. Zero is refused too: nobody could upgrade.
+ADMIN_ADDR="${ADMIN_ADDR:?ADMIN_ADDR not set — export it or add it to .env}"
+if [[ ! "$ADMIN_ADDR" =~ ^0x[0-9a-fA-F]{40}$ ]] || [[ "$ADMIN_ADDR" =~ ^0x0{40}$ ]]; then
+    echo "❌ ADMIN_ADDR must be a non-zero address, got '$ADMIN_ADDR'." >&2
+    exit 1
+fi
 REGISTRATION_FEE="${REGISTRATION_FEE:-0}"
 DEFAULT_APP_NAME="${DEFAULT_APP_NAME:-fangorn}"
 # The default app's publisher terms: sha256 of the terms document, and where it is

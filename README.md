@@ -375,7 +375,8 @@ Config is env vars (or a gitignored `.env` at the repo root; `.env.example` list
 variable of every script, and a value in `.env` wins over the command line): `IMPL`, `TARGET`, `PRIVATE_KEY`,
 `RPC_ENDPOINT`, `ADMIN_ADDR`, `USDC_ADDR`, `SEMAPHORE_ADDR`, `REGISTRATION_FEE`,
 `SUBSCRIPTION_FEE`, `DATA_REGISTRY_ADDR`, `APP_REGISTRY_ADDR`, and `MAX_FEE` (Stylus
-only). Requires `cast`, plus `forge` and `jq` for Solidity or `cargo stylus` for Stylus.
+only). `PRIVATE_KEY` and `ADMIN_ADDR` have no default and the script stops without them.
+Requires `cast`, plus `forge` and `jq` for Solidity or `cargo stylus` for Stylus.
 
 To try a deploy without spending anything, point it at a local chain. Move `.env` aside
 first: its `RPC_ENDPOINT` and `PRIVATE_KEY` win over the ones on the command line.
