@@ -1,0 +1,33 @@
+name: solidity
+
+on:
+  pull_request:
+    paths: ["solidity/**", ".github/workflows/solidity.yml"]
+  push:
+    branches: [main]
+    paths: ["solidity/**", ".github/workflows/solidity.yml"]
+
+defaults:
+  run:
+    working-directory: solidity
+
+jobs:
+  forge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - run: forge build --sizes
+
+      - run: forge test -vvv
+
+      - name: Coverage (>= 85% lines in src/)
+        run: |
+          forge coverage --report summary --no-match-coverage "(test|script)/" | tee coverage.txt
+          pct=$(grep -E '^\| Total' coverage.txt | grep -oE '[0-9]+\.[0-9]+%' | head -1 | tr -d %)
+          echo "Line coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit !(p >= 85) }' || { echo "::error::Line coverage ${pct}% is below 85%"; exit 1; }

@@ -15,7 +15,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RPC_ENDPOINT="${RPC_ENDPOINT:-https://sepolia-rollup.arbitrum.io/rpc}"
 PRIVATE_KEY="${PRIVATE_KEY:?PRIVATE_KEY (the admin) not set}"
-APP_OWNER_KEY="${APP_OWNER_KEY:?APP_OWNER_KEY (the app owner) not set}"
+# APP_OWNER_KEY="${APP_OWNER_KEY:?APP_OWNER_KEY (the app owner) not set}"
 APP="${APP:-quorum}"
 PRICE="${PRICE:-1000000}"
 PERIOD="${PERIOD:-2592000}"
@@ -34,7 +34,7 @@ proxy=$(forge create lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967P
     --constructor-args "$impl" "$init" | awk '/Deployed to/ {print $3}')
 echo "MembershipRegistry (proxy): $proxy"
 
-app_id=$(cast keccak "$(cast --from-utf8 "$APP")")
-cast send "$proxy" "setPlan(bytes32,uint256,uint64)" "$app_id" "$PRICE" "$PERIOD" \
-    --rpc-url "$RPC_ENDPOINT" --private-key "$APP_OWNER_KEY" >/dev/null
-echo "plan for $APP ($app_id): $(cast call "$proxy" "planOf(bytes32)(uint256,uint64)" "$app_id" --rpc-url "$RPC_ENDPOINT" | tr '\n' ' ')"
+# app_id=$(cast keccak "$(cast --from-utf8 "$APP")")
+# cast send "$proxy" "setPlan(bytes32,uint256,uint64)" "$app_id" "$PRICE" "$PERIOD" \
+#     --rpc-url "$RPC_ENDPOINT" --private-key "$APP_OWNER_KEY" >/dev/null
+# echo "plan for $APP ($app_id): $(cast call "$proxy" "planOf(bytes32)(uint256,uint64)" "$app_id" --rpc-url "$RPC_ENDPOINT" | tr '\n' ' ')"

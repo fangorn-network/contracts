@@ -67,6 +67,17 @@ contract MembershipRegistryTest is Test {
         assertEq(period, PERIOD);
     }
 
+    function test_setPlan_priceNeedsAPeriod() public {
+        vm.prank(OWNER);
+        vm.expectRevert(MembershipRegistry.NoPlan.selector);
+        reg.setPlan(APP, PRICE, 0);
+    }
+
+    function test_currentEpoch_noPlan() public {
+        vm.expectRevert(MembershipRegistry.NoPlan.selector);
+        reg.currentEpoch(keccak256("none"));
+    }
+
     // ── join ──
 
     function test_join_paysOwnerAndAddsMember() public {
@@ -157,6 +168,12 @@ contract MembershipRegistryTest is Test {
         claim(address(0x5EA1), 777);
     }
 
+    function test_claim_noPlan() public {
+        uint256[8] memory points;
+        vm.expectRevert(MembershipRegistry.NoPlan.selector);
+        reg.claim(keccak256("none"), 0, address(0x5EA1), 20, 99, 777, points);
+    }
+
     function test_claim_badProof() public {
         join(COMMIT);
         sem.setFail(false, false, true);
@@ -186,6 +203,36 @@ contract MembershipRegistryTest is Test {
         vm.warp(block.timestamp + PERIOD + 1);
         (, uint64 until) = reg.canRead(id, holder);
         assertLt(until, block.timestamp);
+    }
+
+    function test_canRead_nothingForUnmintedOrZero() public {
+        address holder = address(0x5EA1);
+        (, uint64 unminted) = reg.canRead(reg.tokenIdOf(APP, holder), holder);
+        assertEq(unminted, 0);
+        join(COMMIT);
+        uint256 id = claim(holder, 1);
+        (bytes32 app, uint64 zero) = reg.canRead(id, address(0));
+        assertEq(app, APP);
+        assertEq(zero, 0);
+        assertEq(reg.appOfToken(id), APP);
+    }
+
+    // ── ERC-5643 ──
+
+    function test_renewable_followsThePlan() public {
+        join(COMMIT);
+        uint256 id = claim(address(0x5EA1), 1);
+        assertTrue(reg.isRenewable(id));
+        vm.prank(OWNER);
+        reg.setPlan(APP, 0, PERIOD);
+        assertFalse(reg.isRenewable(id));
+    }
+
+    function test_renewAndCancel_pointToJoinAndClaim() public {
+        vm.expectRevert(MembershipRegistry.UseJoinAndClaim.selector);
+        reg.renewSubscription(1, PERIOD);
+        vm.expectRevert(MembershipRegistry.UseJoinAndClaim.selector);
+        reg.cancelSubscription(1);
     }
 
     // ── locked ──
@@ -267,6 +314,22 @@ contract MembershipRegistryTest is Test {
         assertTrue(reg.supportsInterface(type(IERC5643).interfaceId));
         assertTrue(reg.supportsInterface(0x80ac58cd)); // ERC-721
         assertEq(reg.name(), "Fangorn Membership");
+        assertEq(reg.symbol(), "FMEMBER");
+    }
+
+    function test_setAdmin_onlyAdmin_andHandsOverUpgrades() public {
+        address next = address(0xAD2);
+        vm.expectRevert(MembershipRegistry.Unauthorized.selector);
+        reg.setAdmin(next);
+        vm.prank(ADMIN);
+        reg.setAdmin(next);
+        assertEq(reg.admin(), next);
+        address impl = address(new MembershipRegistry());
+        vm.prank(ADMIN);
+        vm.expectRevert(MembershipRegistry.Unauthorized.selector);
+        reg.upgradeToAndCall(impl, "");
+        vm.prank(next);
+        reg.upgradeToAndCall(impl, "");
     }
 
     function test_upgrade_onlyAdmin() public {

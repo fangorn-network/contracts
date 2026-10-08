@@ -4,7 +4,6 @@ pragma solidity ^0.8.24;
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
-import {SettlementRegistry} from "../src/SettlementRegistry.sol";
 
 /// A fee token that records what it was asked to move and can be told to refuse.
 contract MockUSDC {
@@ -87,7 +86,7 @@ contract MockUSDC {
     }
 }
 
-/// Semaphore, as far as the SettlementRegistry can see it. Records every call so a
+/// Semaphore partial impl. Records every call so a
 /// test can assert which group and scope the registry actually used.
 contract MockSemaphore {
     uint256 public nextGroup = 7;
@@ -211,8 +210,4 @@ library Proxied {
         return DataRegistry(address(new ERC1967Proxy(address(new DataRegistry()), init)));
     }
 
-    function settlementRegistry(address usdc, address semaphore, address admin) internal returns (SettlementRegistry) {
-        bytes memory init = abi.encodeCall(SettlementRegistry.initialize, (usdc, semaphore, admin));
-        return SettlementRegistry(address(new ERC1967Proxy(address(new SettlementRegistry()), init)));
-    }
 }

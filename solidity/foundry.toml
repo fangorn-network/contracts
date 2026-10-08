@@ -15,4 +15,6 @@ extra_output = ["storageLayout"]
 [lint]
 # Argument and event-field names are snake_case on purpose: they mirror the Stylus
 # contracts' ABI, and the SDK reads event fields by those names.
-exclude_lints = ["mixed-case-variable", "unwrapped-modifier-logic", "asm-keccak256"]
+# block-timestamp: comparisons are membership expiries and permit deadlines (days),
+# so the few seconds of validator skew don't matter.
+exclude_lints = ["mixed-case-variable", "unwrapped-modifier-logic", "asm-keccak256", "block-timestamp"]
