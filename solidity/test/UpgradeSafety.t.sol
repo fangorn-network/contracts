@@ -23,7 +23,7 @@ contract UpgradeSafetyTest is Test {
             Options memory opts = Deployments.options(names[i]);
             opts.referenceBuildInfoDir = string.concat("deployed/", names[i]);
             opts.referenceContract = Deployments.deployed(names[i]);
-            Upgrades.validateImplementation(Deployments.current(names[i]), opts);
+            Upgrades.validateUpgrade(Deployments.current(names[i]), opts);
         }
     }
 }
