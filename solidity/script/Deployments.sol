@@ -16,6 +16,7 @@ import {Options} from "openzeppelin-foundry-upgrades/Options.sol";
 ///      reference the next one is checked against.
 ///   2. Point the constant below at the new file.
 ///   3. `forge script script/Upgrade.s.sol --sig "run(string)" DataRegistry --force …`
+///   4. Rebuild `deployed/DataRegistry/` from the new version and name it in `deployed`.
 library Deployments {
     uint256 internal constant ARBITRUM_SEPOLIA = 421614;
 
@@ -40,6 +41,19 @@ library Deployments {
         if (n == keccak256("AppRegistry")) return APP_REGISTRY;
         if (n == keccak256("DataRegistry")) return DATA_REGISTRY;
         if (n == keccak256("MembershipRegistry")) return MEMBERSHIP_REGISTRY;
+        revert UnknownContract(name);
+    }
+
+    /// The version of `name` that is live, as `<name>:<contract>`: the contract inside
+    /// the build committed under `deployed/<name>/`. The upgrade-safety test compares
+    /// the current version's storage with it, so an edit to a deployed version's file
+    /// fails there too. After an upgrade, rebuild that directory from the new version
+    /// and name its contract here (the README has the command).
+    function deployed(string memory name) internal pure returns (string memory) {
+        bytes32 n = keccak256(bytes(name));
+        if (n == keccak256("AppRegistry")) return "AppRegistry:AppRegistry";
+        if (n == keccak256("DataRegistry")) return "DataRegistry:DataRegistry";
+        if (n == keccak256("MembershipRegistry")) return "MembershipRegistry:MembershipRegistry";
         revert UnknownContract(name);
     }
 

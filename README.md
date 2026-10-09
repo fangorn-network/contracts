@@ -101,6 +101,7 @@ later.
 | `solidity/script/Upgrade.s.sol`         | Admin: upgrade a deployed contract in place             |
 | `solidity/script/SetSubscriptionFee.s.sol` | Admin: set the subscription fee on the AppRegistry   |
 | `solidity/script/Deployments.sol`       | Each proxy's address, and each contract's current version |
+| `solidity/deployed/`                    | The build of each contract that is live; what the upgrade-safety test compares storage with |
 | `solidity/lib/`                         | `forge-std`, `openzeppelin-contracts-upgradeable`, `openzeppelin-foundry-upgrades` (submodules) |
 
 ## Two implementations
@@ -302,7 +303,8 @@ plugin is set up.
 
 Node.js is for that plugin: it checks upgrade safety by running
 `npx @openzeppelin/upgrades-core`, which is why `foundry.toml` turns on `ffi`. One test,
-`UpgradeSafety`, runs the check on the current version of every contract, so
+`UpgradeSafety`, runs the check on the current version of every contract, and compares
+its storage with the build of that contract that is live (`solidity/deployed/`), so
 `forge test` needs network access the first time. The check needs a full build: if it
 fails with "not from a full compilation", run `forge clean` and try again.
 
@@ -416,7 +418,7 @@ SDK, the workers or the other registry. If the ABI changed, the SDK still needs 
 ABI.
 
 The OpenZeppelin Foundry Upgrades plugin checks every upgrade against the version it
-replaces, so that version's source has to stay in the repo. That makes an upgrade three
+replaces, so that version's source has to stay in the repo. That makes an upgrade four
 steps:
 
 1. **Add the new version as a new file and a new contract name.** Copy the current
@@ -428,13 +430,14 @@ steps:
    contract DataRegistryV2 is Initializable, UUPSUpgradeable {
    ```
 
-   Do not edit a version that is deployed. Its file is the reference the next version
-   is checked against, and nothing can tell if it stops matching what is live.
+   Do not edit a version that is deployed. Its file is the reference the upgrade
+   script checks the next version against. The `UpgradeSafety` test does catch a
+   storage change made there, because it compares with the build in `deployed/`.
 
 2. **Make it the current version** in `script/Deployments.sol`
    (`DATA_REGISTRY = "DataRegistryV2.sol:DataRegistryV2"`). From here `forge test`
-   checks it: the `UpgradeSafety` test fails on the pull request if a storage slot
-   moved, changed type or disappeared.
+   checks it against the live build in `deployed/`: the `UpgradeSafety` test fails on
+   the pull request if a storage slot moved, changed type or disappeared.
 
 3. **Run the upgrade**, signing as the contract's admin:
 
@@ -447,6 +450,18 @@ steps:
    the proxy's address and the new version from `Deployments.sol`, so one contract's
    code cannot be pointed at another contract's proxy. It runs the same check again and
    refuses a version that names no predecessor.
+
+4. **Record the new version as the live one**, in the same pull request as the
+   broadcast log. Rebuild its reference build, and name its contract in
+   `Deployments.deployed` (`"DataRegistry:DataRegistryV2"`):
+
+   ```sh
+   rm -r deployed/DataRegistry
+   forge build src/DataRegistryV2.sol --force --build-info --build-info-path deployed/DataRegistry
+   ```
+
+   Until this is done the test keeps comparing with the version that was replaced.
+   The first deployment of a new contract needs the same step.
 
 **Storage is append-only.** The proxy keeps its storage, so the new code must read every
 existing slot the way the old code wrote it:
