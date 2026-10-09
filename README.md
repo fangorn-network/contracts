@@ -3,16 +3,9 @@
 Three Solidity contracts on Arbitrum Sepolia: the AppRegistry, the DataRegistry and the
 MembershipRegistry. Sources, tests and scripts are in `solidity/`.
 
-**The contracts are upgradeable.** Each sits behind its own ERC-1967 proxy (UUPS): the
-proxy holds the address and the state, and the admin can swap the implementation behind
-it, so changing a contract needs no migration and no new address. See *Upgrade*. The
-three contracts are separate: when they need to talk, they do it with a plain
-cross-contract call to a stored address, not through shared storage.
+**The contracts are upgradeable.** Each implemented contract is behind its own ERC-1967 proxy (UUPS). See *Upgrade*.
 
-Almost nothing lives on-chain. A publisher's namespace is one `bytes32` in the
-DataRegistry — the sha256 digest of its latest commit block. The graph itself is
-content-addressed IPLD off-chain (IPFS/Pinata); the chain is the trusted pointer and
-the lock that keeps the timeline linear.
+Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak256(app_id || publisher || subspace_id)`, stored in the DataRegistry. The graph itself is content-addressed IPLD off-chain (IPFS/Pinata). The DataRegistry represents the onchain pointer to the latest head.
 
 ## Architecture
 
@@ -44,48 +37,23 @@ the lock that keeps the timeline linear.
                                  plan, and who is paid
 ```
 
-The two registries point at each other. The DataRegistry asks the AppRegistry who may
-publish under an app while the AppRegistry asks the DataRegistry whether a wallet is a
-registered publisher at all.
-Each stores the other's address and can be repointed by the admin (`setAppRegistry`,
-`setDataRegistry`), so replacing the one contract is a redeploy plus one call.
+The AppRegistry and DataRegistry point at each other. The DataRegistry asks the AppRegistry who may publish under an app while the AppRegistry asks the DataRegistry whether a wallet is a registered publisher at all.
+Each stores the other's address and can be repointed by the admin (`setAppRegistry`, `setDataRegistry`), so replacing one contract is an upgrade plus one call.
 
-### Why each registry knows about the other
+### Contract Communication
 
-The two directions do different jobs.
-
-| Direction                  | Asked when                           | Question                                               |
+| Direction                  | Called when                          | Question                                               |
 |----------------------------|--------------------------------------|--------------------------------------------------------|
 | DataRegistry → AppRegistry | every commit                         | May this wallet publish under this app?                |
 | AppRegistry → DataRegistry | claiming an app, adding a publisher  | Is this wallet a registered, unbanned publisher at all? |
 
-**DataRegistry → AppRegistry.** The DataRegistry is where publishing actually happens,
-so it is the only place app membership can be enforced on-chain.
-`commitStateRoot(app_id, …)` takes the app id from the caller, and before it moves
-the head it asks the AppRegistry whether the sender is an active publisher of that app.
-If not, it reverts `NotRegisteredForApp`.
+**DataRegistry → AppRegistry.** The DataRegistry is where publishing actually happens, so it is the only place app membership can be enforced on-chain. `commitStateRoot(app_id, …)` takes the app id from the caller, and before it moves the head it asks the AppRegistry whether the sender is an active publisher of that app. If not, it reverts `NotRegisteredForApp`.
 
-Without that call, any registered wallet could commit under any app id. It could not
-overwrite another publisher's data, because the namespace key includes the sender's
-address. But its commits would carry the app's id in `StateCommitted`, so they would
-appear in that app's commit stream for every reader and feed watching it. Everything
-the AppRegistry decides would then be advisory on-chain:
+Without that call, any registered wallet could commit under any app id. It could not overwrite another publisher's data, because the namespace key includes the sender's address. But its commits would carry the app's id in `StateCommitted`, so they would appear in that app's commit stream for every reader and feed watching it.
 
-- the owner's invitation,
-- acceptance of the current terms,
-- per-app suspension by the owner,
-- the admin's takedown of a whole app.
+The Worker cannot cover this on its own. It only gates uploads through Fangorn's hosted storage, and anyone can pin bytes elsewhere and call `commitStateRoot` directly. The contract cannot tell where the bytes were pinned.
 
-The Worker cannot cover this on its own. It only gates uploads through Fangorn's hosted
-storage, and anyone can pin bytes elsewhere and call `commitStateRoot` directly. The
-contract cannot tell where the bytes were pinned.
-
-**AppRegistry → DataRegistry.** The DataRegistry is where the protocol admin bans a
-publisher network-wide (`suspendPublisher`). The AppRegistry asks it before letting a
-wallet claim an app or be added to one, so a banned wallet cannot come back as an app
-owner or be brought in by one. This check runs when those calls are made, not
-continuously; see *Global bans* under AppRegistry for what happens to a wallet banned
-later.
+**AppRegistry → DataRegistry.** The DataRegistry is where the protocol admin bans a publisher network-wide (`suspendPublisher`). The AppRegistry asks it before letting a wallet claim an app or be added to one, so a banned wallet cannot come back as an app owner or be brought in by one. This check runs when those calls are made. See *Global bans* under AppRegistry for what happens to a wallet banned later.
 
 ## Layout
 
@@ -96,127 +64,61 @@ later.
 | `solidity/src/MembershipRegistry.sol`   | MembershipRegistry                                      |
 | `solidity/src/NonReentrant.sol`         | Reentrancy guard shared by the contracts                |
 | `solidity/test/`                        | Foundry tests and mocks                                 |
-| `solidity/script/Deploy.s.sol`          | Deploys the contracts, each behind a proxy              |
+| `solidity/script/Deploy.s.sol`          | Deploys the contracts behind their own UUPS proxy              |
 | `solidity/script/Upgrade.s.sol`         | Admin: upgrade a deployed contract in place             |
 | `solidity/script/SetSubscriptionFee.s.sol` | Admin: set the subscription fee on the AppRegistry   |
 | `solidity/script/Deployments.sol`       | Each proxy's address, and each contract's current version |
-| `solidity/deployed/`                    | The build of each contract that is live; what the upgrade-safety test compares storage with |
+| `solidity/deployed/`                    | The build of each contract that is live. What the upgrade-safety test compares storage with |
 | `solidity/lib/`                         | `forge-std`, `openzeppelin-contracts-upgradeable`, `openzeppelin-foundry-upgrades` (submodules) |
 
 ## Common to the contracts
 
-- *Names.* Functions are `camelCase`. Arguments and event fields are `snake_case`
-  (`app_id`, `new_root`), because the SDK reads event fields by those names.
-- *Reentrancy.* Every function that moves funds or makes a state-changing call to
-  another contract is guarded (`NonReentrant.sol`) and reverts `Reentrancy()` if
-  re-entered. Views are not guarded, and neither are functions whose only outside call
-  is a read of the other registry.
-- *Failed cross-calls.* The AppRegistry and DataRegistry treat anything but a clean
-  `true` from the other registry (a revert, no contract at the address, a malformed
-  return) as "no". They use low-level calls for this; a plain interface call would
-  revert on the last two instead.
-- *Upgradeability.* Each contract takes its initial arguments through `initialize(…)`
-  instead of a constructor, and has `upgradeToAndCall`, `proxiableUUID` and
-  `UPGRADE_INTERFACE_VERSION`, the `Initialized` and `Upgraded` events, and
-  OpenZeppelin's proxy errors. The SDK's ABI files do not list these.
-- *Admin.* One address per contract. It is also who may upgrade it. `setAdmin(new_admin)`
-  hands the role over and emits `AdminChanged`; setting the zero address renounces the
-  role, and with it upgrades, for good.
+- *Names.* Functions are `camelCase`. Arguments and event fields are `snake_case` (`app_id`, `new_root`), because the SDK reads event fields by those names.
+- *Reentrancy.* Every function that moves funds or makes a state-changing call to another contract is guarded (`NonReentrant.sol`) and reverts `Reentrancy()` if re-entered. Views are not guarded, and neither are functions whose only outside call is a read of the other registry.
+- *Failed cross-calls.* The AppRegistry and DataRegistry treat anything but a clean `true` from the other registry (a revert, no contract at the address, a malformed return) as "no". They use low-level calls for this since a plain interface call would revert on the last two instead.
+- *Upgradeability.* Each contract takes its initial arguments through `initialize(…)` instead of a constructor, and has `upgradeToAndCall`, `proxiableUUID` and `UPGRADE_INTERFACE_VERSION`, the `Initialized` and `Upgraded` events, and
+  OpenZeppelin's proxy errors.
+- *Admin.* One address per contract. It is also who may upgrade it. `setAdmin(new_admin)` hands the role over and emits `AdminChanged`. Setting the zero address **renounces the role and permanently stops upgrades**.
 
 ## AppRegistry
 
-Apps, who may publish under them, and who pays for their storage. **An app is a
-storage subscription**: there is no app without a payment, and no subscription without
-an app.
+Apps, who may publish under them, and who pays for their storage. **An app is synonymous to a storage subscription** so data availability has stronger guarantees.
 
-- `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id,
-  first-come-first-served. Pulls the subscription fee in **USDC** via
-  `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts
-  `SubscriptionFeeRequired`), stamps `subscribedAt(app_id)` as now, and makes the
-  claimer the app's first publisher. `fee` is the app's own join fee, in wei. The
-  claimer must be registered in the DataRegistry (`NotRegisteredGlobally` otherwise).
+- `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`), stamps `subscribedAt(app_id)` as now, and makes the claimer the app's first publisher. `fee` is the app's own join fee, in wei. The claimer must be registered in the DataRegistry (`NotRegisteredGlobally` otherwise).
 - `renewApp(app_id)` — owner-only. Pays the fee again and re-stamps `now`.
-- `addPublisher(app_id, publisher)` — owner-only. An **invitation**: status goes
-  `0 → 3`. Nobody can join an app uninvited. The publisher must be registered in the
-  DataRegistry (`NotRegisteredGlobally` otherwise).
-- `registerForApp(app_id, terms_hash)` — payable, called by the invited publisher.
-  Accepts the exact current terms hash and pays the join fee (forwarded to the app
-  owner). Reverts `NotInvited` for a wallet the owner never added. Re-accepting after a
-  terms change is free.
-- `setAppTerms`, `setAppFee`, `setAppAgentUri` — owner-only. Changing the terms
-  unregisters every publisher until they re-accept; the agent card carries no hash, so
-  moving it does not.
-- `suspendForApp` / `reinstateForApp` — owner-only, one publisher in one app.
-  Suspending an invited publisher is how an invitation is taken back.
+- `addPublisher(app_id, publisher)` — owner-only. An **invitation**: status goes `0 → 3`. Nobody can join an app uninvited. The publisher must be registered in the DataRegistry (`NotRegisteredGlobally` otherwise).
+- `registerForApp(app_id, terms_hash)` — payable, called by the invited publisher. Accepts the exact current terms hash and pays the join fee (forwarded to the app owner). Reverts `NotInvited` for a wallet the owner never added. Re-accepting after a terms change is free.
+- `setAppTerms`, `setAppFee`, `setAppAgentUri` — owner-only. Changing the terms unregisters every publisher until they re-accept; the agent card carries no hash, so moving it does not.
+- `suspendForApp` / `reinstateForApp` — owner-only, one publisher in one app. Suspending an invited publisher is how an invitation is taken back.
 - `suspendApp` / `reinstateApp` — admin-only takedown of a whole app.
-- `access(app_id, publisher) → (bool registered, address owner, uint64 paidAt)` — the
-  upload gate's single read. `registered` is `isRegisteredForApp`.
-- Views: `isRegisteredForApp`, `statusForApp`, `joinInfo`, `getAppOwner`,
-  `subscribedAt`, `subscriptionFee`, `usdc`, `dataRegistry`, `appTerms`,
-  `appTermsUri`, `appAgentUri`, `appFee`, `acceptedTerms`, `isAppSuspended`,
-  `admin`.
-- Admin: `setSubscriptionFee`, `setUsdc`, `setDataRegistry`, `withdrawUsdc`,
-  `withdrawEth`.
-- Admin, used once to carry state over from the previous contracts: `seedApp(app_id,
-  owner, terms_hash, terms_uri, fee, agent_uri)` recreates an app for its owner, pulls
-  **no** subscription fee and stamps it as paid now (a testnet shortcut); `seedPublisherForApp(app_id, publisher,
-  status, accepted_terms)` restores one membership verbatim. Both are fill-only: they
-  refuse an app that is already claimed, or a publisher the app already knows.
+- `access(app_id, publisher) → (bool registered, address owner, uint64 paidAt)` — the upload gate's single read. `registered` is `isRegisteredForApp`.
+- Views: `isRegisteredForApp`, `statusForApp`, `joinInfo`, `getAppOwner`, `subscribedAt`, `subscriptionFee`, `usdc`, `dataRegistry`, `appTerms`, `appTermsUri`, `appAgentUri`, `appFee`, `acceptedTerms`, `isAppSuspended`, `admin`.
+- Admin: `setSubscriptionFee`, `setUsdc`, `setDataRegistry`, `withdrawUsdc`, `withdrawEth`.
+- Admin, used once to carry state over from the previous contracts: `seedApp(app_id, owner, terms_hash, terms_uri, fee, agent_uri)` recreates an app for its owner, pulls **no** subscription fee and stamps it as paid now (a testnet shortcut); `seedPublisherForApp(app_id, publisher, status, accepted_terms)` restores one membership verbatim. Both are fill-only: they refuse an app that is already claimed, or a publisher the app already knows.
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
 - `initialize(admin, usdc, subscription_fee, data_registry)`.
 
-**Global bans.** "Registered in the DataRegistry" means status active, so a wallet the
-protocol admin has suspended can neither claim an app nor be added to one. The check
-runs when those calls are made. A publisher banned later already cannot commit (the
-DataRegistry refuses) or upload (the Worker refuses). An *owner* banned later keeps
-the app, and its other publishers keep publishing: take the app down with
-`suspendApp`.
+**Global bans.** "Registered in the DataRegistry" means status active, so a wallet the protocol admin has suspended can neither claim an app nor be added to one. The check runs when those calls are made. A publisher banned later already cannot commit (the DataRegistry refuses) or upload (the Worker refuses). An *owner* banned later keeps the app, and its other publishers keep publishing. The app can be taken down with `suspendApp`.
 
-An AppRegistry with no DataRegistry set treats every wallet as unregistered, so
-nothing can be claimed until it is wired.
+Per-app status codes: `0` unregistered, `1` active, `2` suspended, `3` invited. `isRegisteredForApp` is true only for an active publisher on the app's current terms hash, in an app that is not suspended.
 
-Per-app status codes: `0` unregistered, `1` active, `2` suspended, `3` invited.
-`isRegisteredForApp` is true only for an active publisher on the app's current terms
-hash, in an app that is not suspended.
-
-The active window is not on-chain — the contract only stores a timestamp. The Worker
-decides what counts as active (`SUBSCRIPTION_WINDOW_DAYS`, 30 days), so that policy is
-tunable without a redeploy. A lapsed app therefore still passes
-`isRegisteredForApp`: the lapse stops uploads at the Worker, not commits on-chain.
+The active window is not on-chain — the contract only stores a timestamp. The Worker decides what counts as active (`SUBSCRIPTION_WINDOW_DAYS`, 30 days), so that policy is tunable without a redeploy. A lapsed app therefore still passes `isRegisteredForApp`: the lapse stops uploads at the Worker, not commits on-chain.
 
 ## DataRegistry
 
 Network-wide publisher registration and the state-root timeline.
 
-State: `admin`, `registrationFee`, `statuses` (0 unregistered / 1 active /
-2 suspended), `publisherCount`, `appRegistry`, `namespaceHeads`
-(`keccak256(app_id ‖ publisher ‖ subspace_id) → bytes32`).
+State: `admin`, `registrationFee`, `statuses` (0 unregistered / 1 active / 2 suspended), `publisherCount`, `appRegistry`, `namespaceHeads` (`keccak256(app_id ‖ publisher ‖ subspace_id) → bytes32`).
 
-- `register()` — payable; pays the registration fee (native token) to become active. A
-  suspended account cannot re-register. Only the admin can bring it back
-  (`reinstateGlobal`), which preserves its heads.
-- `commitStateRoot(app_id, subspace_id, old_root, new_root)` — the only
-  graph-mutating route. Rejects unless the caller is active here **and**
-  `AppRegistry.isRegisteredForApp(app_id, caller)` (`NotRegisteredForApp`), then
-  compare-and-swaps the head (`StaleStateRoot`). That CAS is what enforces a linear
-  timeline. Emits `StateCommitted`, the single event the SDK's light-client watches.
-- Views: `getNamespaceHead`, `isRegistered`, `getPublisherStatus`,
-  `publisherCount`, `registrationFee`, `appRegistry`, `admin`.
-- Admin: `suspendPublisher`, `reinstateGlobal`, `setRegistrationFee`,
-  `setAppRegistry`, `seedNamespaceHead` (fill-only; replays heads after a redeploy).
-- Admin, used once to carry state over from the previous contracts:
-  `seedPublisher(publisher)` restores one registration without the fee. Fill-only: it refuses a wallet the registry already
-  knows, so it cannot lift a suspension.
+- `register()` — payable; pays the registration fee (native token) to become active.
+- `commitStateRoot(app_id, subspace_id, old_root, new_root)` — the only graph-mutating route. Rejects unless the caller is active here **and** registered in the appropriate app in the AppRegistry. It compare-and-swaps (CAS) the head which enforces a linear timeline. Emits `StateCommitted` the SDK's light-client watches.
+- Views: `getNamespaceHead`, `isRegistered`, `getPublisherStatus`, `publisherCount`, `registrationFee`, `appRegistry`, `admin`.
+- Admin: `suspendPublisher`, `reinstateGlobal`, `setRegistrationFee`, `setAppRegistry`, `seedNamespaceHead` (fill-only; replays heads after a redeploy).
+- Admin, used once to carry state over from the previous contracts: `seedPublisher(publisher)` restores a registration without the fee and refuses a wallet the registry already knows a suspension isn't lifted.
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
 - `initialize(admin, registration_fee, app_registry)`.
 
-So publishing takes two registrations, in this order: `register()` here, then
-membership of an app (claiming it, or being added by its owner and accepting its
-terms). The AppRegistry refuses the second without the first.
-
-`commitStateRoot` does not verify that `new_root` is a well-formed commit; it only
-checks the CAS. The contract is deliberately structure-agnostic — it moves a
-`bytes32`, and the SDK defines what that value means.
+Publishing takes two registrations, in this order: `register()` here, then membership of an app (claiming it, or being added by its owner and accepting its terms). `commitStateRoot` does not verify that `new_root` is a well-formed commit; it only checks the CAS. The contract is deliberately structure-agnostic. It only moves a `bytes32`, and the SDK defines what that value means.
 
 ## MembershipRegistry
 
@@ -255,7 +157,7 @@ holder)`. It is locked (ERC-5192): it can be minted, and every transfer and burn
 another `join` and `claim`, which keeps the payer unlinked from the holder, and a
 membership ends by not renewing.
 
-It replaces the SettlementRegistry, which is no longer in this repo.
+It replaces the old SettlementRegistry.
 
 ## Build and test
 
