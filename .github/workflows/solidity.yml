@@ -7,6 +7,10 @@ on:
     branches: [main]
     paths: ["solidity/**", ".github/workflows/solidity.yml"]
 
+# The job runs pull request code with ffi on, and fetches the upgrade validator from npm.
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: solidity
