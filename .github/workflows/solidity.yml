@@ -7,6 +7,10 @@ on:
     branches: [main]
     paths: ["solidity/**", ".github/workflows/solidity.yml"]
 
+# The job runs pull request code with ffi on, and fetches the upgrade validator from npm.
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: solidity
@@ -27,7 +31,8 @@ jobs:
 
       - name: Coverage (>= 85% lines in src/)
         run: |
-          forge coverage --report summary --no-match-coverage "(test|script)/" | tee coverage.txt
+          # UpgradeSafety is left out: the plugin cannot validate a coverage build.
+          forge coverage --report summary --no-match-coverage "(test|script)/" --no-match-contract UpgradeSafety | tee coverage.txt
           pct=$(grep -E '^\| Total' coverage.txt | grep -oE '[0-9]+\.[0-9]+%' | head -1 | tr -d %)
           echo "Line coverage: ${pct}%"
           awk -v p="$pct" 'BEGIN { exit !(p >= 85) }' || { echo "::error::Line coverage ${pct}% is below 85%"; exit 1; }

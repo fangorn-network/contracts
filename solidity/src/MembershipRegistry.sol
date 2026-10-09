@@ -153,6 +153,7 @@ contract MembershipRegistry is Initializable, UUPSUpgradeable, ERC721, EIP712, N
     /// ERC721's and EIP712's constructors only write the implementation's own storage and
     /// immutables: `name`/`symbol` are overridden below, and EIP712's values are immutables,
     /// which the proxy reads from this code.
+    /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() ERC721("", "") EIP712("Fangorn Membership", "1") {
         _disableInitializers();
     }

@@ -20,7 +20,8 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeab
 /// Deployed behind an ERC-1967 proxy (UUPS): the proxy holds the state and the address,
 /// and the admin can point it at a new implementation. Storage is therefore
 /// append-only: add state variables after the last one, and never reorder, retype or
-/// remove what is there (`scripts/layout.sh` checks).
+/// remove what is there. A new version is a new file that names this one as its
+/// predecessor; the upgrade tooling checks the rest.
 contract DataRegistry is Initializable, UUPSUpgradeable {
     uint8 internal constant STATUS_UNREGISTERED = 0;
     uint8 internal constant STATUS_ACTIVE = 1;
@@ -64,6 +65,7 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
 
     /// The implementation is only ever used through a proxy. Lock it, so nobody can
     /// initialize it directly.
+    /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }

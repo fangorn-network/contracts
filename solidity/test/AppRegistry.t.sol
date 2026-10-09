@@ -19,7 +19,7 @@ contract PennilessOwner {
 }
 
 /// What an upgrade installs: the same contract, plus one function to tell it by.
-contract AppRegistryV2 is AppRegistry {
+contract AppRegistryUpgradeMock is AppRegistry {
     function version() external pure returns (uint256) {
         return 2;
     }
@@ -615,7 +615,7 @@ contract AppRegistryTest is Test {
         openApp();
         join(PUBLISHER, APP, TERMS_V1, FEE);
         uint64 paidAt = apps.subscribedAt(APP);
-        address v2 = address(new AppRegistryV2());
+        address v2 = address(new AppRegistryUpgradeMock());
 
         vm.prank(APP_OWNER);
         vm.expectRevert(AppRegistry.Unauthorized.selector);
@@ -624,7 +624,7 @@ contract AppRegistryTest is Test {
         vm.prank(ADMIN);
         apps.upgradeToAndCall(v2, "");
 
-        assertEq(AppRegistryV2(address(apps)).version(), 2);
+        assertEq(AppRegistryUpgradeMock(address(apps)).version(), 2);
         assertEq(apps.admin(), ADMIN);
         assertEq(apps.dataRegistry(), address(data));
         assertEq(apps.getAppOwner(APP), APP_OWNER);
@@ -654,7 +654,7 @@ contract AppRegistryTest is Test {
 
     /// The admin role moves, and the right to upgrade moves with it.
     function test_the_admin_role_can_be_handed_over() public {
-        address v2 = address(new AppRegistryV2());
+        address v2 = address(new AppRegistryUpgradeMock());
 
         vm.prank(STRANGER);
         vm.expectRevert(AppRegistry.Unauthorized.selector);
