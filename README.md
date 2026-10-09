@@ -38,7 +38,7 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
 ```
 
 The AppRegistry and DataRegistry point at each other. The DataRegistry asks the AppRegistry who may publish under an app while the AppRegistry asks the DataRegistry whether a wallet is a registered publisher at all.
-Each stores the other's address and can be repointed by the admin (`setAppRegistry`, `setDataRegistry`), so replacing one contract is an upgrade plus one call.
+Each stores the other's address and can be repointed by the admin (`setAppRegistry`, `setDataRegistry`). If a new deploy needs to happen, rather than an upgrade, replacing one contract is a deploy plus one call.
 
 ### Contract Communication
 
