@@ -9,7 +9,12 @@ optimizer_runs = 200
 # "cancun": OpenZeppelin 5.7's ERC721 / EIP712 use mcopy. Arbitrum has run Cancun
 # since ArbOS 20 (2024), on Sepolia and One alike.
 evm_version = "cancun"
-# layout.sh reads each contract's storage layout from the build artifacts.
+# The OpenZeppelin Foundry Upgrades plugin checks every deploy and upgrade for upgrade
+# safety. It reads the storage layouts and ASTs from the build info, and runs its
+# validator (`npx @openzeppelin/upgrades-core`) through ffi, so it needs Node.js.
+ffi = true
+ast = true
+build_info = true
 extra_output = ["storageLayout"]
 
 [lint]

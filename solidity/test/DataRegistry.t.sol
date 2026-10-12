@@ -9,7 +9,7 @@ import {MockAppRegistry, Reverter, Proxied} from "./Mocks.sol";
 /// The cases from `stylus/data_registry`'s tests, plus the ones TestVM could not
 /// express (an AppRegistry that is missing or misbehaving).
 /// What an upgrade installs: the same contract, plus one function to tell it by.
-contract DataRegistryV2 is DataRegistry {
+contract DataRegistryUpgradeMock is DataRegistry {
     function version() external pure returns (uint256) {
         return 2;
     }
@@ -281,7 +281,7 @@ contract DataRegistryTest is Test {
     function test_an_upgrade_keeps_state_and_only_the_admin_can_do_it() public {
         vm.prank(PUB);
         registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
-        address v2 = address(new DataRegistryV2());
+        address v2 = address(new DataRegistryUpgradeMock());
 
         vm.prank(PUB);
         vm.expectRevert(DataRegistry.Unauthorized.selector);
@@ -290,7 +290,7 @@ contract DataRegistryTest is Test {
         vm.prank(ADMIN);
         registry.upgradeToAndCall(v2, "");
 
-        assertEq(DataRegistryV2(address(registry)).version(), 2);
+        assertEq(DataRegistryUpgradeMock(address(registry)).version(), 2);
         assertEq(registry.admin(), ADMIN);
         assertEq(registry.registrationFee(), FEE);
         assertEq(registry.appRegistry(), address(apps));
@@ -317,7 +317,7 @@ contract DataRegistryTest is Test {
 
     /// The admin role moves, and the right to upgrade moves with it.
     function test_the_admin_role_can_be_handed_over() public {
-        address v2 = address(new DataRegistryV2());
+        address v2 = address(new DataRegistryUpgradeMock());
 
         vm.prank(PUB);
         vm.expectRevert(DataRegistry.Unauthorized.selector);
