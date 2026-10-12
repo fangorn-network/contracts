@@ -37,7 +37,6 @@ import {Deployments} from "./Deployments.sol";
 ///                           because the wiring calls are admin-only.
 ///   USDC_ADDR, SEMAPHORE_ADDR
 ///                           default to Arbitrum Sepolia's; required on any other chain
-///   REGISTRATION_FEE        DataRegistry.register(), in wei. Default 0
 ///   SUBSCRIPTION_FEE        claiming an app, in USDC base units. Default 0
 ///   DEFAULT_APP_NAME, DEFAULT_APP_TERMS_HASH, DEFAULT_APP_TERMS_URI,
 ///   DEFAULT_APP_JOIN_FEE    the app claimed for the deployer. Defaults below
@@ -54,9 +53,9 @@ contract Deploy is Script {
         AppRegistry apps = _deployAppRegistry(admin, address(0));
         DataRegistry data = _deployDataRegistry(admin, address(apps));
         // Each registry consults the other. Until this is set the AppRegistry treats
-        // every wallet as unregistered, and no app can be claimed.
+        // every wallet as suspended, and no app can be claimed.
         apps.setDataRegistry(address(data));
-        _claimDefaultApp(apps, data);
+        _claimDefaultApp(apps);
         vm.stopBroadcast();
         _report(apps, data);
     }
@@ -69,7 +68,7 @@ contract Deploy is Script {
         // The existing DataRegistry still checks membership against the old AppRegistry.
         // Namespace heads stay; apps and memberships do not carry over.
         data.setAppRegistry(address(apps));
-        _claimDefaultApp(apps, data);
+        _claimDefaultApp(apps);
         vm.stopBroadcast();
         _report(apps, data);
     }
@@ -79,7 +78,7 @@ contract Deploy is Script {
         AppRegistry apps = AppRegistry(appRegistry_);
         vm.startBroadcast();
         DataRegistry data = _deployDataRegistry(admin, appRegistry_);
-        // Registrations and namespace heads do not carry over.
+        // Suspensions and namespace heads do not carry over.
         apps.setDataRegistry(address(data));
         vm.stopBroadcast();
         _report(apps, data);
@@ -123,24 +122,21 @@ contract Deploy is Script {
         return DataRegistry(
             Upgrades.deployUUPSProxy(
                 Deployments.DATA_REGISTRY,
-                abi.encodeCall(
-                    DataRegistry.initialize, (admin, vm.envOr("REGISTRATION_FEE", uint256(0)), appRegistry_)
-                ),
+                abi.encodeCall(DataRegistry.initialize, (admin, appRegistry_)),
                 Deployments.options("DataRegistry")
             )
         );
     }
 
-    /// Claims the default app for the deployer. After the wiring: a claim needs the
-    /// claimer to be a registered publisher, and pays the subscription fee.
-    function _claimDefaultApp(AppRegistry apps, DataRegistry data) internal {
+    /// Claims the default app for the deployer. After the wiring: a claim asks the
+    /// DataRegistry whether the claimer is suspended, and pays the subscription fee.
+    function _claimDefaultApp(AppRegistry apps) internal {
         bytes32 termsHash = vm.envOr("DEFAULT_APP_TERMS_HASH", DEFAULT_TERMS_HASH);
         // A zero terms hash leaves the app unjoinable, which reads on the website as
         // "registration is broken". Fail here instead, where the cause is obvious.
         require(termsHash != bytes32(0), "DEFAULT_APP_TERMS_HASH is zero: an app with no terms cannot be joined");
 
         (, address deployer,) = vm.readCallers();
-        if (!data.isRegistered(deployer)) data.register{value: data.registrationFee()}();
 
         uint256 fee = apps.subscriptionFee();
         if (fee != 0) IERC20(apps.usdc()).approve(address(apps), fee);

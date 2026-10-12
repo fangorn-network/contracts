@@ -7,38 +7,30 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeab
 /// DataRegistry
 ///
 /// The DataRegistry handles:
-/// - network-wide publisher registration, and the protocol admin's global ban
+/// - the protocol admin's network-wide ban: a map of suspended wallets
 /// - linear timeline state updates (compare-and-swap) for all multi-tenant namespaces
 ///
 /// Namespaces are hierarchical: `app_id:publisher:subspace_id`,
 /// flattened on-chain using keccak256(app_id ‖ publisher ‖ subspace_id).
 ///
-/// A port of `stylus/data_registry`. The ABI is the same — function, error and event
-/// names, argument order, and event field names — so the SDK and the workers talk to
-/// either without change.
+/// There is no publisher registration: a wallet publishes once it belongs to an app,
+/// which `commitStateRoot` asks the AppRegistry on every commit. The AppRegistry in
+/// turn reads `suspended` before it lets a wallet claim an app or be added to one.
 ///
 /// Deployed behind an ERC-1967 proxy (UUPS): the proxy holds the state and the address,
 /// and the admin can point it at a new implementation. Storage is therefore
 /// append-only: add state variables after the last one, and never reorder, retype or
-/// remove what is there. A new version is a new file that names this one as its
-/// predecessor; the upgrade tooling checks the rest.
+/// remove what is there. A new version is an edit to this file; the upgrade tooling
+/// checks its storage against the build of the live version, committed under
+/// `deployed/`.
 contract DataRegistry is Initializable, UUPSUpgradeable {
-    uint8 internal constant STATUS_UNREGISTERED = 0;
-    uint8 internal constant STATUS_ACTIVE = 1;
-    uint8 internal constant STATUS_SUSPENDED = 2;
-
-    error AlreadyRegistered();
-    error NotRegistered();
-    error RegistrationFeeRequired();
     error Unauthorized();
     error StaleStateRoot();
     error PublisherSuspendedErr();
     error NotRegisteredForApp();
 
-    event PublisherRegistered(address indexed publisher, bytes32 initial_root);
     event PublisherReactivated(address indexed publisher, bytes32 current_root);
     event PublisherSuspended(address indexed publisher);
-    event RegistrationFeeChanged(uint256 fee);
     event AdminChanged(address previousAdmin, address newAdmin);
     event StateCommitted(
         bytes32 indexed namespace_key,
@@ -51,17 +43,20 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
 
     /// Protocol admin (has global takedown authority)
     address public admin;
-    /// Registration fee, in the native token
-    uint256 public registrationFee;
-    /// Number of active global publishers
-    uint64 public publisherCount;
+    /// Left over from publisher registration, which an earlier version had, like
+    /// `publisherCount` and `statuses` below. Nothing reads or writes them, but they
+    /// stay declared: removing one would move every slot after it, and
+    /// `publisherCount` shares its slot with `appRegistry`.
+    uint256 private registrationFee;
+    uint64 private publisherCount;
     /// The AppRegistry consulted for per-app publisher membership
     address public appRegistry;
 
-    /// publisher => lifecycle status
-    mapping(address => uint8) internal statuses;
+    mapping(address => uint8) private statuses;
     /// keccak256(app_id ‖ publisher ‖ subspace_id) => latest valid root
     mapping(bytes32 => bytes32) internal namespaceHeads;
+    /// wallet => banned network-wide by the protocol admin
+    mapping(address => bool) public suspended;
 
     /// The implementation is only ever used through a proxy. Lock it, so nobody can
     /// initialize it directly.
@@ -72,23 +67,9 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
 
     /// Takes the place of a constructor: runs once, in the proxy's storage, as part of
     /// the proxy's deployment.
-    function initialize(address admin_, uint256 registrationFee_, address appRegistry_) external initializer {
+    function initialize(address admin_, address appRegistry_) external initializer {
         admin = admin_;
-        registrationFee = registrationFee_;
         appRegistry = appRegistry_;
-    }
-
-    /// Register as a new data publisher on the network.
-    /// A suspended publisher cannot register their way back into Fangorn.
-    function register() external payable {
-        uint8 status = statuses[msg.sender];
-        if (status == STATUS_ACTIVE) revert AlreadyRegistered();
-        if (status == STATUS_SUSPENDED) revert PublisherSuspendedErr();
-        if (msg.value < registrationFee) revert RegistrationFeeRequired();
-
-        statuses[msg.sender] = STATUS_ACTIVE;
-        publisherCount += 1;
-        emit PublisherRegistered(msg.sender, bytes32(0));
     }
 
     /// The only graph-mutating route.
@@ -96,10 +77,7 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
     /// Enforces linear timeline execution (compare-and-swap) over
     /// `app_id:sender:subspace_id`.
     function commitStateRoot(bytes32 app_id, bytes32 subspace_id, bytes32 old_root, bytes32 new_root) external {
-        // must be an active publisher
-        uint8 status = statuses[msg.sender];
-        if (status == STATUS_UNREGISTERED) revert NotRegistered();
-        if (status == STATUS_SUSPENDED) revert PublisherSuspendedErr();
+        if (suspended[msg.sender]) revert PublisherSuspendedErr();
 
         // fail if not an active publisher in the app registry for the given app
         if (!_isRegisteredForApp(app_id, msg.sender)) revert NotRegisteredForApp();
@@ -117,27 +95,17 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
         return namespaceHeads[_namespaceKey(app_id, publisher, subspace_id)];
     }
 
-    function getPublisherStatus(address publisher) external view returns (uint8) {
-        return statuses[publisher];
-    }
-
-    function isRegistered(address publisher) external view returns (bool) {
-        return statuses[publisher] == STATUS_ACTIVE;
-    }
-
+    /// Ban a wallet network-wide. Admin-only. Any address can be banned, including one
+    /// that has never published.
     function suspendPublisher(address publisher) external onlyAdmin {
-        if (statuses[publisher] != STATUS_ACTIVE) revert NotRegistered();
-        statuses[publisher] = STATUS_SUSPENDED;
-        if (publisherCount > 0) publisherCount -= 1;
+        suspended[publisher] = true;
         emit PublisherSuspended(publisher);
     }
 
     /// Lift a network-wide suspension. Admin-only.
     /// Suspension never clears namespace heads, so every timeline resumes where it left off.
     function reinstateGlobal(address publisher) external onlyAdmin {
-        if (statuses[publisher] != STATUS_SUSPENDED) revert NotRegistered();
-        statuses[publisher] = STATUS_ACTIVE;
-        publisherCount += 1;
+        suspended[publisher] = false;
         emit PublisherReactivated(publisher, bytes32(0));
     }
 
@@ -165,20 +133,6 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
         if (namespaceHeads[key] != bytes32(0)) revert StaleStateRoot();
         namespaceHeads[key] = root;
         emit StateCommitted(key, app_id, publisher, subspace_id, bytes32(0), root);
-    }
-
-    /// Restore one publisher registration after a redeploy. Fill-only: it refuses a
-    /// wallet this registry already knows, so it cannot lift a suspension.
-    function seedPublisher(address publisher) external onlyAdmin {
-        if (statuses[publisher] != STATUS_UNREGISTERED) revert AlreadyRegistered();
-        statuses[publisher] = STATUS_ACTIVE;
-        publisherCount += 1;
-        emit PublisherRegistered(publisher, bytes32(0));
-    }
-
-    function setRegistrationFee(uint256 fee) external onlyAdmin {
-        registrationFee = fee;
-        emit RegistrationFeeChanged(fee);
     }
 
     modifier onlyAdmin() {

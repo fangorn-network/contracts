@@ -16,18 +16,18 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
      │ renewApp()                  │  app → subscribedAt (the subscription)
      ▼                             │  (app, publisher) → status
                                    │
-                                   │ isRegistered(wallet)  ▼   on claim and on add
+                                   │ suspended(wallet)  ▼   on claim and on add
                                    │ isRegisteredForApp(app, sender)  ▲   on commit
                                    │  (static cross-calls, one each way)
-  Publisher ── register() ──▶  DataRegistry  ◀── commitStateRoot(app, subspace, old, new)
-  (wallet)                                         emits StateCommitted
+  Admin ── suspendPublisher() ──▶  DataRegistry  ◀── commitStateRoot(app, subspace, old, new)
+  (network-wide ban)                               emits StateCommitted
                                                          │
                                                          ▼
                                                    SDK light-client
                                                    (watches logs, no indexer)
 
   Upload gate (Cloudflare Worker) reads:
-    DataRegistry.getPublisherStatus(addr)        is this wallet a publisher at all?
+    DataRegistry.suspended(addr)                 is this wallet banned network-wide?
     AppRegistry.access(app, addr)                → (registered, owner, paidAt)
 
 
@@ -37,7 +37,7 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
                                  plan, and who is paid
 ```
 
-The AppRegistry and DataRegistry point at each other. The DataRegistry asks the AppRegistry who may publish under an app while the AppRegistry asks the DataRegistry whether a wallet is a registered publisher at all.
+The AppRegistry and DataRegistry point at each other. The DataRegistry asks the AppRegistry who may publish under an app while the AppRegistry asks the DataRegistry whether the protocol admin has banned a wallet.
 Each stores the other's address and can be repointed by the admin (`setAppRegistry`, `setDataRegistry`). If a new deploy needs to happen, rather than an upgrade, replacing one contract is a deploy plus one call.
 
 ### Contract Communication
@@ -45,11 +45,11 @@ Each stores the other's address and can be repointed by the admin (`setAppRegist
 | Direction                  | Called when                          | Question                                               |
 |----------------------------|--------------------------------------|--------------------------------------------------------|
 | DataRegistry → AppRegistry | every commit                         | May this wallet publish under this app?                |
-| AppRegistry → DataRegistry | claiming an app, adding a publisher  | Is this wallet a registered, unbanned publisher at all? |
+| AppRegistry → DataRegistry | claiming an app, adding a publisher  | Is this wallet banned network-wide?                    |
 
 **DataRegistry → AppRegistry.** The DataRegistry is where publishing actually happens, so it is the only place app membership can be enforced on-chain. `commitStateRoot(app_id, …)` takes the app id from the caller, and before it moves the head it asks the AppRegistry whether the sender is an active publisher of that app. If not, it reverts `NotRegisteredForApp`.
 
-Without that call, any registered wallet could commit under any app id. It could not overwrite another publisher's data, because the namespace key includes the sender's address. But its commits would carry the app's id in `StateCommitted`, so they would appear in that app's commit stream for every reader and feed watching it.
+Without that call, any wallet could commit under any app id. It could not overwrite another publisher's data, because the namespace key includes the sender's address. But its commits would carry the app's id in `StateCommitted`, so they would appear in that app's commit stream for every reader and feed watching it.
 
 The Worker cannot cover this on its own. It only gates uploads through Fangorn's hosted storage, and anyone can pin bytes elsewhere and call `commitStateRoot` directly. The contract cannot tell where the bytes were pinned.
 
@@ -67,15 +67,15 @@ The Worker cannot cover this on its own. It only gates uploads through Fangorn's
 | `solidity/script/Deploy.s.sol`          | Deploys the contracts behind their own UUPS proxy              |
 | `solidity/script/Upgrade.s.sol`         | Admin: upgrade a deployed contract in place             |
 | `solidity/script/SetSubscriptionFee.s.sol` | Admin: set the subscription fee on the AppRegistry   |
-| `solidity/script/Deployments.sol`       | Each proxy's address, and each contract's current version |
-| `solidity/deployed/`                    | The build of each contract that is live. What the upgrade-safety test compares storage with |
+| `solidity/script/Deployments.sol`       | Each proxy's address, and what each contract is upgraded with |
+| `solidity/deployed/`                    | The build of each contract that is live. What an upgrade, and the upgrade-safety test, compare storage with |
 | `solidity/lib/`                         | `forge-std`, `openzeppelin-contracts-upgradeable`, `openzeppelin-foundry-upgrades` (submodules) |
 
 ## Common to the contracts
 
 - *Names.* Functions are `camelCase`. Arguments and event fields are `snake_case` (`app_id`, `new_root`), because the SDK reads event fields by those names.
 - *Reentrancy.* Every function that moves funds or makes a state-changing call to another contract is guarded (`NonReentrant.sol`) and reverts `Reentrancy()` if re-entered. Views are not guarded, and neither are functions whose only outside call is a read of the other registry.
-- *Failed cross-calls.* The AppRegistry and DataRegistry treat anything but a clean `true` from the other registry (a revert, no contract at the address, a malformed return) as "no". They use low-level calls for this since a plain interface call would revert on the last two instead.
+- *Failed cross-calls.* Each registry treats anything but a clean answer from the other (a revert, no contract at the address, a malformed return) as the refusing one: the DataRegistry as "not a publisher of this app", the AppRegistry as "suspended". They use low-level calls for this since a plain interface call would revert on the last two instead.
 - *Upgradeability.* Each contract takes its initial arguments through `initialize(…)` instead of a constructor, and has `upgradeToAndCall`, `proxiableUUID` and `UPGRADE_INTERFACE_VERSION`, the `Initialized` and `Upgraded` events, and
   OpenZeppelin's proxy errors.
 - *Admin.* One address per contract. It is also who may upgrade it. `setAdmin(new_admin)` hands the role over and emits `AdminChanged`. Setting the zero address **renounces the role and permanently stops upgrades**.
@@ -84,9 +84,9 @@ The Worker cannot cover this on its own. It only gates uploads through Fangorn's
 
 Apps, who may publish under them, and who pays for their storage. **An app is synonymous to a storage subscription** so data availability has stronger guarantees.
 
-- `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`), stamps `subscribedAt(app_id)` as now, and makes the claimer the app's first publisher. `fee` is the app's own join fee, in wei. The claimer must be registered in the DataRegistry (`NotRegisteredGlobally` otherwise).
+- `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`), stamps `subscribedAt(app_id)` as now, and makes the claimer the app's first publisher. `fee` is the app's own join fee, in wei. The claimer must not be suspended in the DataRegistry (`PublisherSuspendedErr` otherwise).
 - `renewApp(app_id)` — owner-only. Pays the fee again and re-stamps `now`.
-- `addPublisher(app_id, publisher)` — owner-only. An **invitation**: status goes `0 → 3`. Nobody can join an app uninvited. The publisher must be registered in the DataRegistry (`NotRegisteredGlobally` otherwise).
+- `addPublisher(app_id, publisher)` — owner-only. An **invitation**: status goes `0 → 3`. Nobody can join an app uninvited. The publisher must not be suspended in the DataRegistry (`PublisherSuspendedErr` otherwise).
 - `registerForApp(app_id, terms_hash)` — payable, called by the invited publisher. Accepts the exact current terms hash and pays the join fee (forwarded to the app owner). Reverts `NotInvited` for a wallet the owner never added. Re-accepting after a terms change is free.
 - `setAppTerms`, `setAppFee`, `setAppAgentUri` — owner-only. Changing the terms unregisters every publisher until they re-accept; the agent card carries no hash, so moving it does not.
 - `suspendForApp` / `reinstateForApp` — owner-only, one publisher in one app. Suspending an invited publisher is how an invitation is taken back.
@@ -98,7 +98,7 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
 - `initialize(admin, usdc, subscription_fee, data_registry)`.
 
-**Global bans.** "Registered in the DataRegistry" means status active, so a wallet the protocol admin has suspended can neither claim an app nor be added to one. The check runs when those calls are made. A publisher banned later already cannot commit (the DataRegistry refuses) or upload (the Worker refuses). An *owner* banned later keeps the app, and its other publishers keep publishing. The app can be taken down with `suspendApp`.
+**Global bans.** A wallet the protocol admin has suspended in the DataRegistry can neither claim an app nor be added to one. There is nothing else to pass: no wallet registers with the DataRegistry first. The check runs when those calls are made, and an AppRegistry with no usable DataRegistry treats every wallet as suspended. A publisher banned later already cannot commit (the DataRegistry refuses) or upload (the Worker refuses). An *owner* banned later keeps the app, and its other publishers keep publishing. The app can be taken down with `suspendApp`.
 
 Per-app status codes: `0` unregistered, `1` active, `2` suspended, `3` invited. `isRegisteredForApp` is true only for an active publisher on the app's current terms hash, in an app that is not suspended.
 
@@ -106,19 +106,20 @@ The active window is not on-chain — the contract only stores a timestamp. The 
 
 ## DataRegistry
 
-Network-wide publisher registration and the state-root timeline.
+The protocol admin's network-wide ban and the state-root timeline.
 
-State: `admin`, `registrationFee`, `statuses` (0 unregistered / 1 active / 2 suspended), `publisherCount`, `appRegistry`, `namespaceHeads` (`keccak256(app_id ‖ publisher ‖ subspace_id) → bytes32`).
+State: `admin`, `appRegistry`, `suspended` (`address → bool`), `namespaceHeads` (`keccak256(app_id ‖ publisher ‖ subspace_id) → bytes32`). `registrationFee`, `publisherCount` and `statuses` are still declared, unused: they are left from publisher registration, and removing them would move the slots after them.
 
-- `register()` — payable; pays the registration fee (native token) to become active.
-- `commitStateRoot(app_id, subspace_id, old_root, new_root)` — the only graph-mutating route. Rejects unless the caller is active here **and** registered in the appropriate app in the AppRegistry. It compare-and-swaps (CAS) the head which enforces a linear timeline. Emits `StateCommitted` the SDK's light-client watches.
-- Views: `getNamespaceHead`, `isRegistered`, `getPublisherStatus`, `publisherCount`, `registrationFee`, `appRegistry`, `admin`.
-- Admin: `suspendPublisher`, `reinstateGlobal`, `setRegistrationFee`, `setAppRegistry`, `seedNamespaceHead` (fill-only; replays heads after a redeploy).
-- Admin, used once to carry state over from the previous contracts: `seedPublisher(publisher)` restores a registration without the fee and refuses a wallet the registry already knows a suspension isn't lifted.
+- `commitStateRoot(app_id, subspace_id, old_root, new_root)` — the only graph-mutating route. Rejects a suspended caller (`PublisherSuspendedErr`), and one who is not registered in the appropriate app in the AppRegistry (`NotRegisteredForApp`). It compare-and-swaps (CAS) the head which enforces a linear timeline. Emits `StateCommitted` the SDK's light-client watches.
+- Views: `suspended`, `getNamespaceHead`, `appRegistry`, `admin`.
+- Admin: `suspendPublisher(wallet)` bans any address network-wide, including one that has never published, and emits `PublisherSuspended`; `reinstateGlobal(wallet)` lifts it and emits `PublisherReactivated`. Neither touches namespace heads, so a reinstated publisher's timelines resume where they stopped.
+- Admin: `setAppRegistry`, `seedNamespaceHead` (fill-only; replays heads after a redeploy).
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
-- `initialize(admin, registration_fee, app_registry)`.
+- `initialize(admin, app_registry)`.
 
-Publishing takes two registrations, in this order: `register()` here, then membership of an app (claiming it, or being added by its owner and accepting its terms). `commitStateRoot` does not verify that `new_root` is a well-formed commit; it only checks the CAS. The contract is deliberately structure-agnostic. It only moves a `bytes32`, and the SDK defines what that value means.
+There is no publisher registration. An earlier version had `register()`, and all it bought was a place for the admin to ban a wallet everywhere at once; this one keeps the ban and drops the step, along with `isRegistered`, `getPublisherStatus`, `publisherCount`, `registrationFee`, `setRegistrationFee` and `seedPublisher`. Publishing takes membership of an app (claiming it, or being added by its owner and accepting its terms) and nothing else. A suspension made while registration existed is not carried into `suspended`: issue it again after that upgrade.
+
+`commitStateRoot` does not verify that `new_root` is a well-formed commit; it only checks the CAS. The contract is deliberately structure-agnostic. It only moves a `bytes32`, and the SDK defines what that value means.
 
 ## MembershipRegistry
 
@@ -176,8 +177,8 @@ plugin is set up.
 
 Node.js is for that plugin: it checks upgrade safety by running
 `npx @openzeppelin/upgrades-core`, which is why `foundry.toml` turns on `ffi`. One test,
-`UpgradeSafety`, runs the check on the current version of every contract, and compares
-its storage with the build of that contract that is live (`solidity/deployed/`), so
+`UpgradeSafety`, runs the check on every contract, and compares its storage with the
+build of that contract that is live (`solidity/deployed/`), so
 `forge test` needs network access the first time. The check needs a full build: if it
 fails with "not from a full compilation", run `forge clean` and try again.
 
@@ -236,10 +237,10 @@ is what the script prints and what goes in the SDK. **Record it in
 `script/Deployments.sol`**, which is where the other scripts find it, and commit the
 broadcast log Forge writes under `solidity/broadcast/`.
 
-`all()` deploys the AppRegistry, then the DataRegistry, points each at the other,
-registers the deployer as a publisher, and only then claims the default app (`fangorn`):
-a claim needs a registered claimer. With a non-zero `SUBSCRIPTION_FEE` the deployer
-needs that much USDC.
+`all()` deploys the AppRegistry, then the DataRegistry, points each at the other, and
+only then claims the default app (`fangorn`) for the deployer: until the AppRegistry has
+a DataRegistry to ask, it treats every wallet as suspended. With a non-zero
+`SUBSCRIPTION_FEE` the deployer needs that much USDC.
 
 Deploying mints new addresses. They reach every consumer through one place:
 `fangorn/src/config.ts`. Publish the SDK, then bump it in the workers and the website.
@@ -261,28 +262,17 @@ SDK, the workers or the other registry. If the ABI changed, the SDK still needs 
 ABI.
 
 The OpenZeppelin Foundry Upgrades plugin checks every upgrade against the version it
-replaces, so that version's source has to stay in the repo. That makes an upgrade four
-steps:
+replaces. A contract keeps its file and its name from one version to the next, so a pull
+request shows what changed and not a second copy of the contract. What the plugin
+compares with is therefore the build of the live version, committed under
+`solidity/deployed/<Contract>/<implementation address>/` (its `referenceBuildInfoDir`
+option; `Deployments.upgradeOptions` sets it). That makes an upgrade two steps:
 
-1. **Add the new version as a new file and a new contract name.** Copy the current
-   version, rename it, and name the version it replaces:
+1. **Edit the contract in place** (`src/DataRegistry.sol`). From here `forge test`
+   checks it against the builds in `deployed/`: the `UpgradeSafety` test fails on the
+   pull request if a storage slot moved, changed type or disappeared.
 
-   ```solidity
-   // src/DataRegistryV2.sol
-   /// @custom:oz-upgrades-from DataRegistry
-   contract DataRegistryV2 is Initializable, UUPSUpgradeable {
-   ```
-
-   Do not edit a version that is deployed. Its file is the reference the upgrade
-   script checks the next version against. The `UpgradeSafety` test does catch a
-   storage change made there, because it compares with the build in `deployed/`.
-
-2. **Make it the current version** in `script/Deployments.sol`
-   (`DATA_REGISTRY = "DataRegistryV2.sol:DataRegistryV2"`). From here `forge test`
-   checks it against the live build in `deployed/`: the `UpgradeSafety` test fails on
-   the pull request if a storage slot moved, changed type or disappeared.
-
-3. **Run the upgrade**, signing as the contract's admin:
+2. **Run the upgrade**, signing as the contract's admin:
 
    ```sh
    forge script script/Upgrade.s.sol --sig "run(string)" DataRegistry --force \
@@ -290,21 +280,45 @@ steps:
    ```
 
    The name is `AppRegistry`, `DataRegistry` or `MembershipRegistry`. The script takes
-   the proxy's address and the new version from `Deployments.sol`, so one contract's
-   code cannot be pointed at another contract's proxy. It runs the same check again and
-   refuses a version that names no predecessor.
+   the proxy's address and the contract from `Deployments.sol`, so one contract's code
+   cannot be pointed at another contract's proxy. It runs the same check again, after
+   confirming that the build it checks against is the code behind the proxy. If it is
+   not, the script stops before sending anything.
 
-4. **Record the new version as the live one**, in the same pull request as the
-   broadcast log. Rebuild its reference build, and name its contract in
-   `Deployments.deployed` (`"DataRegistry:DataRegistryV2"`):
+   The script also writes the build of the new version, to
+   `deployed/DataRegistry/<new implementation address>/`. Commit it with the broadcast
+   log. Nobody rebuilds a reference by hand, so there is no step to forget.
 
-   ```sh
-   rm -r deployed/DataRegistry
-   forge build src/DataRegistryV2.sol --force --build-info --build-info-path deployed/DataRegistry
-   ```
+**What is in `deployed/<Contract>/`.** One directory per build, named after the
+implementation it is the build of: the live one and, after an upgrade, the one it
+replaced, which the next upgrade removes. The new build is written next to the live one
+and not over it because the script runs before its transactions are sent. If they fail,
+the live build is untouched and the upgrade can simply be run again. Without
+`--broadcast` nothing is written. A rehearsal against a fork does write a build: delete
+it (`git clean -fd deployed`) or leave it for the real run to replace.
 
-   Until this is done the test keeps comparing with the version that was replaced.
-   The first deployment of a new contract needs the same step.
+To confirm, without a signer, that every contract has a build of its live code:
+
+```sh
+forge script script/Upgrade.s.sol --sig "check()" --rpc-url <rpc>
+```
+
+It compares runtime code, leaving out constructor-set immutables and the compiler's
+metadata hash, so a build from source that differs only in a comment passes and one from
+source with different logic does not. CI does not run it: nothing in the pipeline needs
+a chain.
+
+A first deployment (`Deploy.s.sol`) does not write its build. Record it once, from the
+commit that was deployed:
+
+```sh
+forge build src/DataRegistry.sol --force --build-info \
+  --build-info-path deployed/DataRegistry/<implementation address>
+```
+
+Between merging a change and running its upgrade, `src/` is ahead of the chain:
+`deployed/` is what says which code is live. Earlier versions of a contract are in the
+git history.
 
 **Storage is append-only.** The proxy keeps its storage, so the new code must read every
 existing slot the way the old code wrote it:

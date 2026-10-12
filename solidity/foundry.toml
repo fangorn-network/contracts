@@ -16,6 +16,11 @@ ffi = true
 ast = true
 build_info = true
 extra_output = ["storageLayout"]
+# "out" is Forge's default, which setting this replaces: the plugin reads artifacts there.
+# "deployed": Upgrade.s.sol reads the build of each live contract, to confirm it is what
+# is on-chain before it checks an upgrade against it, and removes the builds of versions
+# that are no longer live.
+fs_permissions = [{ access = "read", path = "out" }, { access = "read-write", path = "deployed" }]
 
 [lint]
 # Argument and event-field names are snake_case on purpose: they mirror the Stylus
