@@ -1,6 +1,6 @@
 # Fangorn contracts
 
-Three Solidity contracts on Arbitrum Sepolia: the AppRegistry, the DataRegistry and the
+The three core Fangorn contracts written in Solidity: the AppRegistry, the DataRegistry and the
 MembershipRegistry. Sources, tests and scripts are in `solidity/`.
 
 **The contracts are upgradeable.** Each implemented contract is behind its own ERC-1967 proxy (UUPS). See *Upgrade*.
