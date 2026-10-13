@@ -202,12 +202,8 @@ library Proxied {
         return AppRegistry(address(new ERC1967Proxy(address(new AppRegistry()), init)));
     }
 
-    function dataRegistry(address admin, uint256 registrationFee, address appRegistry_)
-        internal
-        returns (DataRegistry)
-    {
-        bytes memory init = abi.encodeCall(DataRegistry.initialize, (admin, registrationFee, appRegistry_));
+    function dataRegistry(address admin, address appRegistry_) internal returns (DataRegistry) {
+        bytes memory init = abi.encodeCall(DataRegistry.initialize, (admin, appRegistry_));
         return DataRegistry(address(new ERC1967Proxy(address(new DataRegistry()), init)));
     }
-
 }

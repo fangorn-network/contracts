@@ -9,10 +9,7 @@ import {MockUSDC, Reverter, Proxied} from "./Mocks.sol";
 
 /// An app owner that cannot receive ETH, so a join fee paid to it is undeliverable.
 contract PennilessOwner {
-    function claim(DataRegistry data, AppRegistry apps, bytes32 app, bytes32 terms, uint256 fee, address invitee)
-        external
-    {
-        data.register();
+    function claim(AppRegistry apps, bytes32 app, bytes32 terms, uint256 fee, address invitee) external {
         apps.registerApp(app, terms, "", fee);
         apps.addPublisher(app, invitee);
     }
@@ -25,17 +22,14 @@ contract AppRegistryUpgradeMock is AppRegistry {
     }
 }
 
-/// The cases from `stylus/app_registry`'s tests, against the real DataRegistry
-/// rather than a mock of it. Foundry also lets these assert what TestVM could not:
-/// that ETH actually moves, that a revert unwinds state, and that an unwired
-/// DataRegistry fails closed.
+/// Against the real DataRegistry rather than a mock of it. The tests assert that ETH
+/// actually moves, that a revert unwinds state, and that an unwired DataRegistry fails
+/// closed.
 contract AppRegistryTest is Test {
     address constant ADMIN = 0x1111111111111111111111111111111111111111;
     address constant APP_OWNER = 0x2222222222222222222222222222222222222222;
     address constant PUBLISHER = 0x3333333333333333333333333333333333333333;
     address constant STRANGER = 0x4444444444444444444444444444444444444444;
-    /// A wallet the DataRegistry does not know.
-    address constant OUTSIDER = 0x8888888888888888888888888888888888888888;
 
     bytes32 constant APP = bytes32(uint256(0xAA));
     bytes32 constant OTHER_APP = bytes32(uint256(0xBB));
@@ -54,18 +48,16 @@ contract AppRegistryTest is Test {
     MockUSDC usdc;
 
     /// Both registries, wired to each other. The subscription fee starts at zero.
-    /// Three everyday wallets are registered publishers; OUTSIDER is not.
+    /// Nobody registers anywhere: the three everyday wallets only hold ETH.
     function setUp() public {
         usdc = new MockUSDC();
-        data = Proxied.dataRegistry(ADMIN, 0, address(0));
+        data = Proxied.dataRegistry(ADMIN, address(0));
         apps = Proxied.appRegistry(ADMIN, address(usdc), 0, address(data));
         vm.prank(ADMIN);
         data.setAppRegistry(address(apps));
 
         address[3] memory everyday = [APP_OWNER, PUBLISHER, STRANGER];
         for (uint256 i = 0; i < everyday.length; i++) {
-            vm.prank(everyday[i]);
-            data.register();
             vm.deal(everyday[i], 10 ether);
         }
     }
@@ -275,7 +267,7 @@ contract AppRegistryTest is Test {
 
     function test_an_undeliverable_join_fee_aborts_the_registration() public {
         PennilessOwner owner = new PennilessOwner();
-        owner.claim(data, apps, OTHER_APP, TERMS_V1, FEE, PUBLISHER);
+        owner.claim(apps, OTHER_APP, TERMS_V1, FEE, PUBLISHER);
 
         vm.prank(PUBLISHER);
         vm.expectRevert(AppRegistry.TransferFailed.selector);
@@ -443,29 +435,20 @@ contract AppRegistryTest is Test {
 
     // ── the DataRegistry's say ────────────────────────────────────────────────
 
-    function test_claiming_and_adding_need_data_registry_registration() public {
+    /// A wallet the DataRegistry has never heard of can claim an app and be added to
+    /// one: there is no registration step in front of either.
+    function test_claiming_and_adding_need_no_registration() public {
         assertEq(apps.dataRegistry(), address(data));
+        address newcomer = makeAddr("newcomer");
 
-        // Never registered: no app for them.
-        vm.prank(OUTSIDER);
-        vm.expectRevert(AppRegistry.NotRegisteredGlobally.selector);
-        apps.registerApp(APP, TERMS_V1, "", 0);
-        assertEq(apps.getAppOwner(APP), address(0));
+        vm.prank(newcomer);
+        apps.registerApp(OTHER_APP, TERMS_V1, "", 0);
+        assertEq(apps.getAppOwner(OTHER_APP), newcomer);
 
-        // ...and an owner cannot bring one in either.
-        vm.startPrank(APP_OWNER);
-        apps.registerApp(APP, TERMS_V1, "", 0);
-        vm.expectRevert(AppRegistry.NotRegisteredGlobally.selector);
-        apps.addPublisher(APP, OUTSIDER);
-        vm.stopPrank();
-        assertEq(apps.statusForApp(APP, OUTSIDER), STATUS_UNREGISTERED);
-
-        // Once they register, both work.
-        vm.prank(OUTSIDER);
-        data.register();
+        openApp();
         vm.prank(APP_OWNER);
-        apps.addPublisher(APP, OUTSIDER);
-        assertEq(apps.statusForApp(APP, OUTSIDER), STATUS_INVITED);
+        apps.addPublisher(APP, newcomer);
+        assertEq(apps.statusForApp(APP, newcomer), STATUS_INVITED);
     }
 
     /// The reason the check exists: a wallet the protocol admin banned network-wide
@@ -475,21 +458,58 @@ contract AppRegistryTest is Test {
         data.suspendPublisher(STRANGER);
 
         vm.prank(STRANGER);
-        vm.expectRevert(AppRegistry.NotRegisteredGlobally.selector);
+        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
         apps.registerApp(OTHER_APP, TERMS_V1, "", 0);
+        assertEq(apps.getAppOwner(OTHER_APP), address(0));
 
         openApp();
         vm.prank(APP_OWNER);
-        vm.expectRevert(AppRegistry.NotRegisteredGlobally.selector);
+        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
         apps.addPublisher(APP, STRANGER);
+        assertEq(apps.statusForApp(APP, STRANGER), STATUS_UNREGISTERED);
 
         vm.prank(ADMIN);
         data.reinstateGlobal(STRANGER);
         vm.prank(APP_OWNER);
         apps.addPublisher(APP, STRANGER);
+        vm.prank(STRANGER);
+        apps.registerApp(OTHER_APP, TERMS_V1, "", 0);
     }
 
-    /// With no usable DataRegistry, nobody reads as registered: unset, an address
+    /// An invitation does not outlast a ban: a wallet banned after the owner added it
+    /// cannot accept, until the admin reinstates it.
+    function test_a_globally_banned_wallet_cannot_join() public {
+        openApp();
+        vm.prank(ADMIN);
+        data.suspendPublisher(PUBLISHER);
+
+        vm.prank(PUBLISHER);
+        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
+        apps.registerForApp{value: FEE}(APP, TERMS_V1);
+        assertEq(apps.statusForApp(APP, PUBLISHER), STATUS_INVITED);
+
+        vm.prank(ADMIN);
+        data.reinstateGlobal(PUBLISHER);
+        join(PUBLISHER, APP, TERMS_V1, FEE);
+        assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
+    }
+
+    /// Re-accepting changed terms goes through the same call, so a ban stops that too.
+    function test_a_globally_banned_publisher_cannot_accept_new_terms() public {
+        openApp();
+        join(PUBLISHER, APP, TERMS_V1, FEE);
+        vm.prank(APP_OWNER);
+        apps.setAppTerms(APP, TERMS_V2, "");
+        vm.prank(ADMIN);
+        data.suspendPublisher(PUBLISHER);
+
+        vm.prank(PUBLISHER);
+        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
+        apps.registerForApp(APP, TERMS_V2);
+        assertEq(apps.acceptedTerms(APP, PUBLISHER), TERMS_V1);
+    }
+
+    /// With no usable DataRegistry, every wallet reads as suspended: unset, an address
     /// with no code, and a registry that reverts all refuse the claim.
     function test_an_unwired_data_registry_fails_closed() public {
         vm.prank(STRANGER);
@@ -502,19 +522,19 @@ contract AppRegistryTest is Test {
             apps.setDataRegistry(broken[i]);
             assertEq(apps.dataRegistry(), broken[i]);
             vm.prank(APP_OWNER);
-            vm.expectRevert(AppRegistry.NotRegisteredGlobally.selector);
+            vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
             apps.registerApp(APP, TERMS_V1, "", 0);
         }
     }
 
-    /// The two registries together: a publisher can commit only once they are
-    /// registered, added, and joined — and loses it when the owner ejects them.
+    /// The two registries together: a publisher can commit only once they are added
+    /// and joined — and loses it when the owner ejects them, or the admin bans them.
     function test_commits_follow_app_membership_end_to_end() public {
         bytes32 sub = keccak256("docs");
         bytes32 root = bytes32(uint256(7));
         openApp();
 
-        // Registered and invited is not enough.
+        // Invited is not enough.
         vm.prank(PUBLISHER);
         vm.expectRevert(DataRegistry.NotRegisteredForApp.selector);
         data.commitStateRoot(APP, sub, bytes32(0), root);
@@ -529,6 +549,14 @@ contract AppRegistryTest is Test {
         vm.prank(PUBLISHER);
         vm.expectRevert(DataRegistry.NotRegisteredForApp.selector);
         data.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
+
+        // A network-wide ban is checked on every commit, so it stops an owner who
+        // claimed the app before being banned.
+        vm.prank(ADMIN);
+        data.suspendPublisher(APP_OWNER);
+        vm.prank(APP_OWNER);
+        vm.expectRevert(DataRegistry.PublisherSuspendedErr.selector);
+        data.commitStateRoot(APP, sub, bytes32(0), root);
     }
 
     // ── migration ─────────────────────────────────────────────────────────────

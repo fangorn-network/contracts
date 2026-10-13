@@ -3,26 +3,25 @@ pragma solidity ^0.8.24;
 
 import {Options} from "openzeppelin-foundry-upgrades/Options.sol";
 
-/// What is deployed, and which version of each contract is current.
+/// What is deployed, and what each contract is built from.
 ///
 /// The scripts and the upgrade-safety test all read from here, so a proxy and the code
 /// meant for it are named together, in one reviewed place, and nobody passes an address
 /// on the command line.
 ///
 /// Upgrading a contract (see the README):
-///   1. Add the new version as a NEW file and contract, e.g. `src/DataRegistryV2.sol`,
-///      carrying the `oz-upgrades-from` annotation that names the version it replaces
-///      (the README shows it). Never edit a version that is deployed: its file is the
-///      reference the next one is checked against.
-///   2. Point the constant below at the new file.
-///   3. `forge script script/Upgrade.s.sol --sig "run(string)" DataRegistry --force …`
-///   4. Rebuild `deployed/DataRegistry/` from the new version and name it in `deployed`.
+///   1. Edit the contract in place, e.g. `src/DataRegistry.sol`. The file and the
+///      contract keep their names, so the pull request shows what changed. What it is
+///      checked against is the build of the live version, in
+///      `deployed/DataRegistry/<implementation address>/`.
+///   2. `forge script script/Upgrade.s.sol --sig "run(string)" DataRegistry --force …`
+///      It records the build of the new version next to the old one. Commit it.
 library Deployments {
     uint256 internal constant ARBITRUM_SEPOLIA = 421614;
 
-    /// The current version of each contract: what a new proxy is deployed with, and what
-    /// an existing proxy is upgraded to. Written as `File.sol:Contract`, because a file
-    /// that also declares interfaces has more than one artifact.
+    /// Each contract's source: what a new proxy is deployed with, and what an existing
+    /// proxy is upgraded to. Written as `File.sol:Contract`, because a file that also
+    /// declares interfaces has more than one artifact.
     string internal constant APP_REGISTRY = "AppRegistry.sol:AppRegistry";
     string internal constant DATA_REGISTRY = "DataRegistry.sol:DataRegistry";
     string internal constant MEMBERSHIP_REGISTRY = "MembershipRegistry.sol:MembershipRegistry";
@@ -35,25 +34,12 @@ library Deployments {
         return ["AppRegistry", "DataRegistry", "MembershipRegistry"];
     }
 
-    /// The artifact of `name`'s current version.
+    /// The artifact of `name`, built from its source in `src/`.
     function current(string memory name) internal pure returns (string memory) {
         bytes32 n = keccak256(bytes(name));
         if (n == keccak256("AppRegistry")) return APP_REGISTRY;
         if (n == keccak256("DataRegistry")) return DATA_REGISTRY;
         if (n == keccak256("MembershipRegistry")) return MEMBERSHIP_REGISTRY;
-        revert UnknownContract(name);
-    }
-
-    /// The version of `name` that is live, as `<name>:<contract>`: the contract inside
-    /// the build committed under `deployed/<name>/`. The upgrade-safety test compares
-    /// the current version's storage with it, so an edit to a deployed version's file
-    /// fails there too. After an upgrade, rebuild that directory from the new version
-    /// and name its contract here (the README has the command).
-    function deployed(string memory name) internal pure returns (string memory) {
-        bytes32 n = keccak256(bytes(name));
-        if (n == keccak256("AppRegistry")) return "AppRegistry:AppRegistry";
-        if (n == keccak256("DataRegistry")) return "DataRegistry:DataRegistry";
-        if (n == keccak256("MembershipRegistry")) return "MembershipRegistry:MembershipRegistry";
         revert UnknownContract(name);
     }
 
@@ -78,5 +64,18 @@ library Deployments {
         // which a proxy reads from the implementation's code. The contract is live
         // with this storage, so its bases cannot be swapped for the upgradeable ones.
         if (keccak256(bytes(name)) == keccak256("MembershipRegistry")) opts.unsafeAllow = "constructor";
+    }
+
+    /// The options `name` is upgraded with: the ones above, plus what the new code is
+    /// checked against. That is a build of a deployed version, committed under
+    /// `deployed/<name>/<build>/`, and not a second copy of the source: the contract
+    /// keeps its file and its name from one version to the next. `build` is the address
+    /// of the implementation it is the build of; `Upgrade.s.sol` writes each one.
+    // ponytail: one chain. Add the chain id to the path when a second one is deployed.
+    function upgradeOptions(string memory name, string memory build) internal pure returns (Options memory opts) {
+        opts = options(name);
+        opts.referenceBuildInfoDir = string.concat("deployed/", name, "/", build);
+        // `<build directory>:<contract>`
+        opts.referenceContract = string.concat(build, ":", name);
     }
 }
