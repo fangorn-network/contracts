@@ -476,6 +476,39 @@ contract AppRegistryTest is Test {
         apps.registerApp(OTHER_APP, TERMS_V1, "", 0);
     }
 
+    /// An invitation does not outlast a ban: a wallet banned after the owner added it
+    /// cannot accept, until the admin reinstates it.
+    function test_a_globally_banned_wallet_cannot_join() public {
+        openApp();
+        vm.prank(ADMIN);
+        data.suspendPublisher(PUBLISHER);
+
+        vm.prank(PUBLISHER);
+        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
+        apps.registerForApp{value: FEE}(APP, TERMS_V1);
+        assertEq(apps.statusForApp(APP, PUBLISHER), STATUS_INVITED);
+
+        vm.prank(ADMIN);
+        data.reinstateGlobal(PUBLISHER);
+        join(PUBLISHER, APP, TERMS_V1, FEE);
+        assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
+    }
+
+    /// Re-accepting changed terms goes through the same call, so a ban stops that too.
+    function test_a_globally_banned_publisher_cannot_accept_new_terms() public {
+        openApp();
+        join(PUBLISHER, APP, TERMS_V1, FEE);
+        vm.prank(APP_OWNER);
+        apps.setAppTerms(APP, TERMS_V2, "");
+        vm.prank(ADMIN);
+        data.suspendPublisher(PUBLISHER);
+
+        vm.prank(PUBLISHER);
+        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
+        apps.registerForApp(APP, TERMS_V2);
+        assertEq(apps.acceptedTerms(APP, PUBLISHER), TERMS_V1);
+    }
+
     /// With no usable DataRegistry, every wallet reads as suspended: unset, an address
     /// with no code, and a registry that reverts all refuse the claim.
     function test_an_unwired_data_registry_fails_closed() public {

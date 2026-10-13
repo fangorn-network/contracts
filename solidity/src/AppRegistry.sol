@@ -151,9 +151,9 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
         nonReentrant
     {
         App storage app = apps[app_id];
-        if (app.owner != address(0)) revert AppAlreadyRegistered();
         address owner = msg.sender;
         if (_isSuspendedGlobally(owner)) revert PublisherSuspendedErr();
+        if (app.owner != address(0)) revert AppAlreadyRegistered();
         _paySubscription(app_id, owner);
 
         app.owner = owner;
@@ -238,6 +238,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// terms and conditions. The app owner must have added you first (`addPublisher`).
     function registerForApp(bytes32 app_id, bytes32 terms_hash) external payable nonReentrant {
         App storage app = apps[app_id];
+        if (_isSuspendedGlobally(msg.sender)) revert PublisherSuspendedErr();
         address owner = app.owner;
         if (owner == address(0)) revert AppNotFound();
         if (app.isAppSuspended) revert AppSuspendedErr();
