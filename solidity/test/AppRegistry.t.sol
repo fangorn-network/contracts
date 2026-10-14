@@ -525,7 +525,7 @@ contract AppRegistryTest is Test {
         apps.revokeInvitation(APP, PUBLISHER);
 
         vm.expectEmit(true, true, true, true, address(apps));
-        emit AppRegistry.InvitationRevoked(APP, PUBLISHER);
+        emit AppRegistry.PublisherInvitationRevoked(APP, PUBLISHER);
         vm.prank(APP_OWNER);
         apps.revokeInvitation(APP, PUBLISHER);
         assertEq(uint8(apps.statusForApp(APP, PUBLISHER)), STATUS_NONE);

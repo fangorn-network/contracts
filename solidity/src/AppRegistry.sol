@@ -63,22 +63,30 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         Invited
     }
 
-    // Errors, grouped like the functions below.
+    // Errors, grouped by topic.
 
     // Shared
+    /// The caller may not do this: not the admin, for an admin function; not the
+    /// app's owner, for an owner function or `cancelSubscription`
     error Unauthorized();
+    /// Sending ETH (`withdrawJoinFees`) or an ERC-20 (`withdrawToken`) failed
     error TransferFailed();
 
     // Apps
+    /// No app has been registered with this id
     error AppNotFound();
+    /// `registerApp`: an app with this id already exists
     error AppAlreadyRegistered();
     /// Claiming or setting terms: the terms hash is zero. An app always has terms, so
     /// that there is something to accept.
     error TermsNotSet();
     /// The protocol admin has taken the app down (`setAppSuspended`)
     error AppSuspended();
+    /// `withdrawJoinFees`: the caller is owed nothing
+    error NothingToWithdraw();
 
     // Membership
+    /// The wallet was never invited to this app, or its invitation was revoked
     error NotInvited();
     /// `invitePublisher`: the wallet is already invited to, a member of, or suspended from
     /// this app
@@ -97,8 +105,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     error TermsAlreadyAccepted();
     /// `joinApp`: `msg.value` is not exactly the app's join fee
     error JoinFeeMismatch();
-    /// `withdrawJoinFees`: the caller is owed nothing
-    error NothingToWithdraw();
     /// The app's owner has suspended the publisher from this app (`setPublisherSuspended`)
     error PublisherSuspendedApp();
     /// `setPublisherSuspended(…, false)`: the publisher is not suspended from this app
@@ -114,6 +120,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     error StaleStateRoot();
 
     // Subscription
+    /// The subscription fee could not be collected: the token refused the transfer,
+    /// usually because the payer's allowance or balance is too low
     error SubscriptionFeeRequired();
     /// `registerApp`: the subscription fee is above the most the caller agreed to pay
     error SubscriptionFeeTooHigh();
@@ -137,7 +145,10 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// The app's terms changed and every publisher on the old hash must accept the new
     /// terms before they can publish again
     event AppTermsChanged(bytes32 indexed app_id, bytes32 terms_hash, string terms_uri);
+    /// The app's join fee, in wei, was set: at registration, or by its owner
     event JoinFeeChanged(bytes32 indexed app_id, uint256 join_fee);
+    /// An app owner took out the join fees they were owed
+    event JoinFeesWithdrawn(address indexed owner, address to, uint256 amount);
     /// The app's agent card moved
     event AppAgentChanged(bytes32 indexed app_id, string agent_uri);
     /// The protocol admin suspended (or reinstated) an entire app
@@ -147,19 +158,19 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// An app owner added a publisher, who may now accept the terms and join
     event PublisherInvited(bytes32 indexed app_id, address indexed publisher);
     /// An app owner took back an invitation before it was accepted
-    event InvitationRevoked(bytes32 indexed app_id, address indexed publisher);
+    event PublisherInvitationRevoked(bytes32 indexed app_id, address indexed publisher);
     /// A publisher joined an app AND accepted `terms_hash`, paying `join_fee`
     event PublisherJoined(bytes32 indexed app_id, address indexed publisher, bytes32 terms_hash, uint256 join_fee);
     /// A member accepted the app's updated terms, `terms_hash`, and can publish again
     event UpdatedTermsAccepted(bytes32 indexed app_id, address indexed publisher, bytes32 terms_hash);
-    /// An app owner took out the join fees they were owed
-    event JoinFeesWithdrawn(address indexed owner, address to, uint256 amount);
     /// An app owner suspended a publisher from their app, or lifted the suspension
     event PublisherSuspensionChanged(bytes32 indexed app_id, address indexed publisher, bool suspended);
     /// The protocol admin banned a wallet network-wide, or lifted the ban
     event GlobalSuspensionChanged(address indexed publisher, bool suspended);
 
     // Protocol admin
+    /// The admin changed the subscription fee, in USDC base units: it applies from the
+    /// next claim or renewal
     event SubscriptionFeeChanged(uint256 fee);
     /// The admin changed the period: it applies from each app's next payment
     event SubscriptionPeriodChanged(uint64 period);
@@ -168,6 +179,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// The admin sent an ERC-20 the contract held: subscription fees, or a token sent
     /// here by mistake
     event TokenWithdrawn(address indexed token, address indexed to, uint256 amount);
+    /// The admin role moved to `new_admin`. Zero renounces it, and upgrades, for good.
     event AdminChanged(address previous_admin, address new_admin);
 
     /// The app registry admin
@@ -307,20 +319,22 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         emit JoinFeeChanged(app_id, join_fee);
     }
 
+    /// Take out every join fee owed to the caller, as the owner of one or more apps,
+    /// and send it to `to`. Join fees are credited to the owner when a publisher joins
+    /// (`joinApp`) and wait here until withdrawn. An owner that cannot receive ETH
+    /// itself names an address that can.
+    function withdrawJoinFees(address to) external nonReentrant {
+        uint256 amount = joinFeesOwed[msg.sender];
+        if (amount == 0) revert NothingToWithdraw();
+        joinFeesOwed[msg.sender] = 0;
+        _sendEth(to, amount);
+        emit JoinFeesWithdrawn(msg.sender, to, amount);
+    }
+
     /// Point at the app's ERC-8004 agent card. Only callable by the app owner.
     function setAppAgentUri(bytes32 app_id, string calldata agent_uri) external onlyAppOwner(app_id) {
         apps[app_id].appAgentUri = agent_uri;
         emit AppAgentChanged(app_id, agent_uri);
-    }
-
-    /// Take an app down for every publisher at once (`true`), or put it back (`false`).
-    /// Admin-only. Memberships are left intact, so putting it back restores them
-    /// exactly.
-    function setAppSuspended(bytes32 app_id, bool is_suspended) external onlyAdmin {
-        App storage app = apps[app_id];
-        if (app.owner == address(0)) revert AppNotFound();
-        app.isAppSuspended = is_suspended;
-        emit AppSuspensionChanged(app_id, is_suspended);
     }
 
     // ── Membership ────────────────────────────────────────────────────────────
@@ -338,6 +352,18 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         if (statusForApp[app_id][publisher] != Status.None) revert AlreadyInApp();
         statusForApp[app_id][publisher] = Status.Invited;
         emit PublisherInvited(app_id, publisher);
+    }
+
+    /// Take back an invitation the publisher has not accepted yet. They are as if never
+    /// invited: they cannot join, and the owner can invite them again (`invitePublisher`).
+    /// Only callable by the app owner. Reverts `NotInvited` for a wallet the app does not
+    /// know, and `AlreadyJoined` for one who has joined; a member is suspended instead.
+    function revokeInvitation(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
+        Status status = statusForApp[app_id][publisher];
+        if (status == Status.None) revert NotInvited();
+        if (status != Status.Invited) revert AlreadyJoined();
+        statusForApp[app_id][publisher] = Status.None;
+        emit PublisherInvitationRevoked(app_id, publisher);
     }
 
     /// Join an app as a publisher, once. By joining, you agree to the app's current terms
@@ -374,28 +400,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
         acceptedTerms[app_id][msg.sender] = current;
         emit UpdatedTermsAccepted(app_id, msg.sender, current);
-    }
-
-    /// Take out every join fee owed to you, the owner of one or more apps, and send it
-    /// to `to`. An owner that cannot receive ETH itself names an address that can.
-    function withdrawJoinFees(address to) external nonReentrant {
-        uint256 amount = joinFeesOwed[msg.sender];
-        if (amount == 0) revert NothingToWithdraw();
-        joinFeesOwed[msg.sender] = 0;
-        _sendEth(to, amount);
-        emit JoinFeesWithdrawn(msg.sender, to, amount);
-    }
-
-    /// Take back an invitation the publisher has not accepted yet. They are as if never
-    /// invited: they cannot join, and the owner can invite them again (`invitePublisher`).
-    /// Only callable by the app owner. Reverts `NotInvited` for a wallet the app does not
-    /// know, and `AlreadyJoined` for one who has joined; a member is suspended instead.
-    function revokeInvitation(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
-        Status status = statusForApp[app_id][publisher];
-        if (status == Status.None) revert NotInvited();
-        if (status != Status.Invited) revert AlreadyJoined();
-        statusForApp[app_id][publisher] = Status.None;
-        emit InvitationRevoked(app_id, publisher);
     }
 
     /// Suspend a member from this app (`true`), or lift the suspension (`false`). Only
@@ -590,6 +594,16 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         dataRegistry = registry;
     }
 
+    /// Take an app down for every publisher at once (`true`), or put it back (`false`).
+    /// Admin-only. Memberships are left intact, so putting it back restores them
+    /// exactly.
+    function setAppSuspended(bytes32 app_id, bool is_suspended) external onlyAdmin {
+        App storage app = apps[app_id];
+        if (app.owner == address(0)) revert AppNotFound();
+        app.isAppSuspended = is_suspended;
+        emit AppSuspensionChanged(app_id, is_suspended);
+    }
+
     /// Ban a wallet network-wide (`true`), or lift the ban (`false`). A banned wallet
     /// can no longer claim an app, be added to one, join one, or publish in any
     /// (`canPublish` turns false). Any address can be banned, including one that
@@ -653,13 +667,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         emit SubscriptionPeriodChanged(period);
     }
 
-    /// Call an ERC-20 and require a clean `true` back. A revert, no contract at the
-    /// address, or anything other than `true` is a failure.
-    function _tokenCall(address token, bytes memory data) private returns (bool) {
-        (bool ok, bytes memory ret) = token.call(data);
-        return ok && ret.length == 32 && abi.decode(ret, (uint256)) == 1;
-    }
-
     /// Reverts unless `publisher` may publish under `app_id`, with the first reason that
     /// applies, from the most basic to the most specific. `canPublish` is the
     /// same rules as a yes or no; change both together.
@@ -685,5 +692,12 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     function _sendEth(address to, uint256 amount) private {
         (bool ok,) = to.call{value: amount}("");
         if (!ok) revert TransferFailed();
+    }
+
+    /// Call an ERC-20 and require a clean `true` back. A revert, no contract at the
+    /// address, or anything other than `true` is a failure.
+    function _tokenCall(address token, bytes memory data) private returns (bool) {
+        (bool ok, bytes memory ret) = token.call(data);
+        return ok && ret.length == 32 && abi.decode(ret, (uint256)) == 1;
     }
 }
