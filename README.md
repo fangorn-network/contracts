@@ -90,7 +90,7 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
 - `expiresAt(token_id)`, `isRenewable(token_id)` — ERC-5643. Both revert for a token that does not exist (`ERC721NonexistentToken`). `isRenewable` is true once less than one period is left.
 - ERC-721: `ownerOf`, `balanceOf`, `approve`, `getApproved`, `setApprovalForAll`, `isApprovedForAll`, `name`, `symbol`, `tokenURI` (empty), `supportsInterface` (ERC-165, ERC-721, its metadata, and ERC-5643's `0x8c65f84d`). The transfer functions revert.
 - `invitePublisher(app_id, publisher)` — owner-only. Reverts `AlreadyInApp` for a wallet the app already knows. An **invitation**: status goes `0 → 3`. Nobody can join an app uninvited. The publisher must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
-- `joinApp(app_id, terms_hash)` — payable, called once by the invited publisher. Accepts the exact current terms hash and pays exactly the join fee (any other amount reverts `JoinFeeMismatch`). The fee is credited to the app owner, not sent: nothing runs in the joiner's transaction but this contract. Reverts `NotInvited` for a wallet the owner never added, `PublisherSuspendedApp` for one suspended from the app, and `PublisherSuspendedGlobal` for one banned network-wide. Joining is once: a member reverts `AlreadyJoined`.
+- `joinApp(app_id, terms_hash)` — payable, called once by the invited publisher. Accepts the exact current terms hash and pays exactly the join fee (any other amount reverts `JoinFeeMismatch`). The fee is credited to the app owner, not sent: nothing runs in the joiner's transaction but this contract. Reverts `NotInvited` for a wallet the owner never added, `PublisherSuspendedApp` for one suspended from the app, and `PublisherSuspendedGlobal` for one banned network-wide. Joining is once: a member reverts `AlreadyJoined`. Nobody can join an app whose subscription has expired (`SubscriptionExpired`).
 - `acceptUpdatedTerms(app_id, terms_hash)` — a member whose accepted terms the owner has since replaced accepts the current ones, and can publish again. Free, and not `payable`, so an owner cannot bill every member by editing the terms. Emits `UpdatedTermsAccepted`. Reverts `NotJoined` for a publisher who has only been invited, `TermsMismatch` for anything but the current terms, and `TermsAlreadyAccepted` if they already accepted them.
 - `setAppTerms`, `setJoinFee`, `setAppAgentUri` — owner-only. Changing the terms stops every publisher publishing until they accept the new ones (`acceptUpdatedTerms`, free); the agent card carries no hash, so moving it does not.
 - `revokeInvitation(app_id, publisher)` — owner-only. Takes back an invitation the publisher has not accepted: they are as if never invited, cannot join, and can be invited again. Emits `PublisherInvitationRevoked`. Reverts `NotInvited` for a wallet the app does not know, and `AlreadyJoined` for a member (suspend them instead).
@@ -104,13 +104,14 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
   | `AppNotFound` | names an app nobody has claimed |
   | `PublisherSuspendedGlobal` | is banned network-wide by the protocol admin |
   | `AppSuspended` | names an app the protocol admin has taken down |
+  | `SubscriptionExpired` | names an app whose subscription has expired or been cancelled (checked after the bans and takedown) |
   | `PublisherSuspendedApp` | is suspended from this app by its owner |
   | `NotInvited` | was never added to the app |
   | `NotJoined` | was added but has not joined (`joinApp`) |
   | `TermsMismatch` | accepted terms the app has since replaced; accept the new ones with `acceptUpdatedTerms` |
 
-  Otherwise it forwards the commit to the DataRegistry, which compare-and-swaps the head of `app_id:sender:subspace_id` (`StaleStateRoot` if `old_root` is not it) and emits `StateCommitted`. A lapsed subscription does not stop it: the Worker enforces that.
-- `access(app_id, publisher) → (bool can_publish, address owner, uint64 expires_at)` — the upload gate's single read. `can_publish` is `canPublish`; `expires_at` is the subscription's expiry, `0` for an unclaimed app or a cancelled subscription.
+  Otherwise it forwards the commit to the DataRegistry, which compare-and-swaps the head of `app_id:sender:subspace_id` (`StaleStateRoot` if `old_root` is not it) and emits `StateCommitted`.
+- `access(app_id, publisher) → (bool can_publish, address owner, uint64 expires_at)` — the upload gate's single read. `can_publish` is `canPublish`, so it is false once the subscription has expired; `expires_at` is the subscription's expiry, `0` for an unclaimed app or a cancelled subscription.
 - Views: `canPublish`, `statusForApp`, `joinFeesOwed`, `joinInfo`, `getAppOwner`, `subscriptionFee`, `subscriptionPeriod`, `usdc`, `dataRegistry`, `globalSuspensions`, `appTerms`, `appTermsUri`, `appAgentUri`, `joinFee`, `acceptedTerms`, `isAppSuspended`, `admin`.
 - `withdrawJoinFees(to)` — an app owner takes out every join fee their apps have collected (`joinFeesOwed(owner)`, one balance across all their apps) and sends it to `to`, so an owner contract that cannot take ETH names an address that can. Reverts `NothingToWithdraw` if nothing is owed; emits `JoinFeesWithdrawn`.
 - Admin: `setSubscriptionFee`, `setSubscriptionPeriod` (not zero, `ZeroPeriod`; applies from each app's next payment, emits `SubscriptionPeriodChanged`), `setDataRegistry` (emits `DataRegistryChanged`), `withdrawToken(token, to, amount)` (the collected USDC, or any ERC-20 sent here by mistake; emits `TokenWithdrawn`). The fee token is fixed at `initialize`. The contract's ETH is the join fees owed to owners and nothing else: it has no `receive`, and no other function takes ETH.
@@ -121,7 +122,7 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
 
 Per-app status (`statusForApp`, the `Status` enum, a `uint8` in the ABI): `0` none (never added), `1` active, `2` suspended, `3` invited. `canPublish` is true only for an active publisher on the app's current terms hash, in an app that is not suspended, and who is not banned network-wide.
 
-The expiry is on-chain, but nothing on-chain enforces it: a lapsed app still passes `canPublish`. The Worker compares `access`'s expiry with the time, so a lapse stops uploads, not commits.
+**Expiry is enforced on-chain.** Once an app's subscription has expired or been cancelled, nobody can commit to it (`canPublish` is false) or join it (`SubscriptionExpired`), so no join fee is paid into an app that cannot be used. Managing members (inviting, revoking, accepting updated terms, suspending) stays open, join fees already earned can still be withdrawn, and nothing is lost: renewing lifts all of it at once. There is no grace period.
 
 ## DataRegistry
 

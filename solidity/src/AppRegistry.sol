@@ -36,8 +36,12 @@ interface IDataRegistry {
 /// `uint256(app_id)`: the ERC-721 and ERC-5643 functions take the token id, the rest of
 /// the contract the app id. The token cannot be transferred.
 ///
-/// The expiry is recorded here but not enforced here: a lapsed or cancelled app can
-/// still commit. The upload gate refuses its uploads.
+/// The expiry is enforced here. Once an app's subscription has lapsed or been
+/// cancelled, nobody can commit to it and nobody can join it, so no join fee is paid
+/// into an app that cannot be used. Renewing lifts all of it at once, and nothing is
+/// lost meanwhile.
+/// Membership management (inviting, accepting updated terms, suspending) stays open,
+/// and fees already earned can still be withdrawn.
 ///
 /// Every commit goes through this contract (`commitStateRoot`). It checks that the
 /// sender may publish under the app — the protocol admin's network-wide ban is kept
@@ -135,6 +139,9 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     error NotTransferable();
     /// The subscription period cannot be zero
     error ZeroPeriod();
+    /// Committing or joining: the app's subscription has expired or been cancelled.
+    /// Renew it (`renewSubscription`).
+    error SubscriptionExpired();
 
     // Events, grouped the same way. The subscription's own event, `SubscriptionUpdate`,
     // is ERC-5643's, declared in `IERC5643`.
@@ -368,7 +375,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     /// Join an app as a publisher, once. By joining, you agree to the app's current terms
     /// (`terms_hash`) and pay exactly its join fee. The app owner must have added you
-    /// first (`invitePublisher`), and a wallet banned network-wide cannot join.
+    /// first (`invitePublisher`), and a wallet banned network-wide cannot join. Nobody
+    /// can join an app whose subscription has expired (`SubscriptionExpired`).
     ///
     /// The join fee is credited to the app owner, who takes it out with
     /// `withdrawJoinFees`. Nothing is sent during the join, so the owner's code never
@@ -376,6 +384,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     function joinApp(bytes32 app_id, bytes32 terms_hash) external payable {
         App storage app = apps[app_id];
         if (_validateForApp(app, app_id, msg.sender) == Status.Active) revert AlreadyJoined();
+        if (app.expiry <= block.timestamp) revert SubscriptionExpired();
         bytes32 current = app.appTerms;
         if (terms_hash != current) revert TermsMismatch();
         uint256 join_fee = app.joinFee;
@@ -436,8 +445,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// commit reverts with the reason (see `_validatePublisher`). The DataRegistry then
     /// compare-and-swaps the head of `app_id:sender:subspace_id`,
     /// reverting `StaleStateRoot` if `old_root` is not the current head, and emits
-    /// `StateCommitted`. A lapsed subscription does not stop a commit; the upload
-    /// Worker enforces it.
+    /// `StateCommitted`. An app whose subscription has expired takes no commits
+    /// (`SubscriptionExpired`) until it is renewed.
     function commitStateRoot(bytes32 app_id, bytes32 subspace_id, bytes32 old_root, bytes32 new_root)
         external
         nonReentrant
@@ -470,20 +479,20 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     /// May `publisher` publish to the app now? False if the publisher is banned
     /// network-wide or suspended from the app, merely invited, on stale terms, or the
-    /// app is suspended. `commitStateRoot` requires it.
+    /// app is suspended or its subscription has expired. `commitStateRoot` requires it.
     ///
     /// The same rules as `_validatePublisher`, but as a yes or no. Change both together:
     /// `test_each_refused_commit_says_why` checks that they agree.
     function canPublish(bytes32 app_id, address publisher) public view returns (bool) {
         App storage app = apps[app_id];
-        return !app.isAppSuspended && !globalSuspensions[publisher] && statusForApp[app_id][publisher] == Status.Active
-            && acceptedTerms[app_id][publisher] == app.appTerms;
+        return !app.isAppSuspended && app.expiry > block.timestamp && !globalSuspensions[publisher]
+            && statusForApp[app_id][publisher] == Status.Active && acceptedTerms[app_id][publisher] == app.appTerms;
     }
 
     /// The single oracle the upload gate reads: `(can_publish, owner, expires_at)`.
     /// `can_publish` is `canPublish`; `owner` is zero for an unclaimed app;
-    /// `expires_at` is when the app's subscription expires, which the gate compares
-    /// with the time.
+    /// `expires_at` is when the app's subscription expires; once it has passed,
+    /// `can_publish` is false.
     function access(bytes32 app_id, address publisher) external view returns (bool, address, uint64) {
         App storage app = apps[app_id];
         return (canPublish(app_id, publisher), app.owner, app.expiry);
@@ -672,7 +681,9 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// same rules as a yes or no; change both together.
     function _validatePublisher(bytes32 app_id, address publisher) private view {
         App storage app = apps[app_id];
-        if (_validateForApp(app, app_id, publisher) == Status.Invited) revert NotJoined();
+        Status status = _validateForApp(app, app_id, publisher);
+        if (app.expiry <= block.timestamp) revert SubscriptionExpired();
+        if (status == Status.Invited) revert NotJoined();
         if (acceptedTerms[app_id][publisher] != app.appTerms) revert TermsMismatch();
     }
 

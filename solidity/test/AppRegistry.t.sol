@@ -1069,6 +1069,61 @@ contract AppRegistryTest is Test {
         vm.prank(ADMIN);
         apps.setAppSuspended(APP, false);
         assertTrue(apps.canPublish(APP, PUBLISHER));
+
+        // An expired subscription, and a cancelled one, stop everyone until renewed.
+        vm.warp(apps.expiresAt(uint256(APP)));
+        assertRefused(PUBLISHER, APP, AppRegistry.SubscriptionExpired.selector);
+        assertRefused(APP_OWNER, APP, AppRegistry.SubscriptionExpired.selector);
+        vm.prank(APP_OWNER);
+        apps.renewSubscription(uint256(APP), PERIOD);
+        assertTrue(apps.canPublish(APP, PUBLISHER));
+        vm.prank(APP_OWNER);
+        apps.cancelSubscription(uint256(APP));
+        assertRefused(PUBLISHER, APP, AppRegistry.SubscriptionExpired.selector);
+        vm.prank(APP_OWNER);
+        apps.renewSubscription(uint256(APP), PERIOD);
+        assertTrue(apps.canPublish(APP, PUBLISHER));
+    }
+
+    /// A lapsed app takes no commits and no join fees, so nothing is paid into an app
+    /// that cannot be used. Managing its members stays open, fees already earned can
+    /// still be withdrawn, and renewing restores everything.
+    function test_an_expired_app_takes_no_commits_and_no_join_fees() public {
+        openApp();
+        vm.prank(APP_OWNER);
+        apps.invitePublisher(APP, STRANGER);
+        join(PUBLISHER, APP, TERMS_V1, FEE);
+        vm.warp(apps.expiresAt(uint256(APP)));
+
+        // The gate sees it in its one read.
+        (bool allowed,, uint64 expiry) = apps.access(APP, PUBLISHER);
+        assertFalse(allowed);
+        assertEq(expiry, block.timestamp);
+
+        vm.prank(STRANGER);
+        vm.expectRevert(AppRegistry.SubscriptionExpired.selector);
+        apps.joinApp{value: FEE}(APP, TERMS_V1);
+        vm.prank(PUBLISHER);
+        vm.expectRevert(AppRegistry.SubscriptionExpired.selector);
+        apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+
+        // Still open: changing terms, accepting them, inviting, and collecting what was
+        // earned while the app was live.
+        vm.startPrank(APP_OWNER);
+        apps.setAppTerms(APP, TERMS_V2, "");
+        apps.invitePublisher(APP, makeAddr("later"));
+        apps.withdrawJoinFees(APP_OWNER);
+        vm.stopPrank();
+        vm.prank(PUBLISHER);
+        apps.acceptUpdatedTerms(APP, TERMS_V2);
+
+        // Renewing lifts it at once.
+        vm.prank(APP_OWNER);
+        apps.renewSubscription(uint256(APP), PERIOD);
+        join(STRANGER, APP, TERMS_V2, FEE);
+        vm.prank(PUBLISHER);
+        apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+        assertEq(data.getNamespaceHead(APP, PUBLISHER, keccak256("docs")), bytes32(uint256(7)));
     }
 
     /// The DataRegistry takes commits from the AppRegistry only, so its checks cannot be
