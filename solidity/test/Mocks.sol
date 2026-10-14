@@ -175,7 +175,7 @@ contract MockHook {
 
 /// Deploys each registry the way `deploy.sh` does: an implementation, and the ERC-1967
 /// proxy that initializes it. What comes back is the proxy, so every test runs against
-/// proxy storage — including the reentrancy guard, which starts at zero there.
+/// proxy storage.
 library Proxied {
     function appRegistry(address admin, address usdc, uint256 subscriptionFee) internal returns (AppRegistry) {
         bytes memory init = abi.encodeCall(AppRegistry.initialize, (admin, usdc, subscriptionFee));

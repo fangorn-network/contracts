@@ -8,7 +8,7 @@ import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {NonReentrant} from "./NonReentrant.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
 interface ISemaphore {
     struct SemaphoreProof {
@@ -91,7 +91,7 @@ interface IERC5643 {
 /// `setUserBySig` lets a holder with no gas name it; anyone may submit the signature.
 ///
 /// Deployed behind an ERC-1967 proxy (UUPS). Storage is append-only.
-contract MembershipRegistry is Initializable, UUPSUpgradeable, ERC721, EIP712, NonReentrant, IERC4907, IERC5192, IERC5643 {
+contract MembershipRegistry is Initializable, UUPSUpgradeable, ERC721, EIP712, ReentrancyGuardTransient, IERC4907, IERC5192, IERC5643 {
     using SafeERC20 for IERC20;
 
     error Unauthorized();

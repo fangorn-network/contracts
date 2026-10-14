@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
-import {NonReentrant} from "./NonReentrant.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
 /// The DataRegistry's one write, which accepts calls from this contract only.
 interface IDataRegistry {
@@ -33,16 +33,21 @@ interface IDataRegistry {
 /// `App`, and never reorder, retype or remove what is there. A new version is an edit
 /// to this file; the upgrade tooling checks its storage against the build of the live
 /// version, committed under `deployed/`.
-contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
-    uint8 internal constant STATUS_UNREGISTERED = 0;
-    uint8 internal constant STATUS_ACTIVE = 1;
-    uint8 internal constant STATUS_SUSPENDED = 2;
-    /// Added by the app owner, terms not yet accepted.
-    uint8 internal constant STATUS_INVITED = 3;
+contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient {
+    /// A publisher's standing in one app. In the ABI it is a uint8, in this order.
+    enum Status {
+        Unregistered,
+        Active,
+        Suspended,
+        /// Added by the app owner, terms not yet accepted.
+        Invited
+    }
 
     error Unauthorized();
     error AppNotFound();
     error AppAlreadyRegistered();
+    /// Claiming or setting terms: the terms hash is zero. An app always has terms, so
+    /// that there is something to accept.
     error TermsNotSet();
     /// Joining: not the app's current terms. Committing: the terms the publisher
     /// accepted are no longer the app's; accept the new ones with `registerForApp`.
@@ -50,7 +55,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     error AlreadyRegistered();
     /// `reinstateForApp`: the publisher is not suspended from this app
     error PublisherNotSuspended();
-    /// The protocol admin has suspended the publisher network-wide (`suspendPublisher`)
+    /// The protocol admin has suspended the publisher network-wide (`setGlobalSuspension`)
     error PublisherSuspendedGlobal();
     /// The app's owner has suspended the publisher from this app (`suspendForApp`)
     error PublisherSuspendedApp();
@@ -82,8 +87,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     event PublisherSuspendedForApp(bytes32 indexed app_id, address indexed publisher);
     event PublisherReinstatedForApp(bytes32 indexed app_id, address indexed publisher);
     /// The protocol admin banned a wallet network-wide, or lifted the ban
-    event PublisherSuspended(address indexed publisher);
-    event PublisherReinstated(address indexed publisher);
+    event GlobalSuspensionChanged(address indexed publisher, bool suspended);
     /// The protocol admin suspended (or reinstated) an entire app
     event AppSuspensionChanged(bytes32 indexed app_id, bool suspended);
     /// An app owner added a publisher, who may now accept the terms and join
@@ -124,8 +128,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
 
     /// app_id => app. Internal: the getters below are the ABI the SDK reads.
     mapping(bytes32 => App) internal apps;
-    /// app_id => publisher => lifecycle status (the STATUS_ constants)
-    mapping(bytes32 => mapping(address => uint8)) public statusForApp;
+    /// app_id => publisher => standing in the app
+    mapping(bytes32 => mapping(address => Status)) public statusForApp;
     /// app_id => publisher => the terms hash they actually accepted
     mapping(bytes32 => mapping(address => bytes32)) public acceptedTerms;
     /// wallet => banned network-wide by the protocol admin
@@ -150,7 +154,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
 
     /// Claim a unique app id.
     ///
-    /// * `terms_hash`: the hash of the terms and conditions for using the app
+    /// * `terms_hash`: the hash of the terms and conditions for using the app. Not zero.
     /// * `terms_uri`: where the terms can be read. NOT the app's agent card — that
     ///   goes in `setAppAgentUri`, which carries no hash precisely so that moving it
     ///   does not unregister every publisher.
@@ -171,6 +175,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
         address owner = msg.sender;
         if (globalSuspensions[owner]) revert PublisherSuspendedGlobal();
         if (app.owner != address(0)) revert AppAlreadyRegistered();
+        if (terms_hash == bytes32(0)) revert TermsNotSet();
         _paySubscription(app_id, owner);
 
         app.owner = owner;
@@ -199,12 +204,13 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// Danger: every publisher who accepted the previous terms becomes unregistered
     /// until they accept the new ones.
     function setAppTerms(bytes32 app_id, bytes32 terms_hash, string calldata terms_uri) external onlyAppOwner(app_id) {
+        if (terms_hash == bytes32(0)) revert TermsNotSet();
         App storage app = apps[app_id];
         app.appTerms = terms_hash;
         app.appTermsUri = terms_uri;
         // The owner accepts their own terms by publishing them. Without this they are
         // locked out of their own app by every edit.
-        _joinOwner(app_id, app.owner, terms_hash);
+        _joinOwner(app_id, msg.sender, terms_hash);
         emit AppTermsChanged(app_id, terms_hash, terms_uri);
     }
 
@@ -242,8 +248,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// the protocol admin has banned.
     function addPublisher(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
         if (globalSuspensions[publisher]) revert PublisherSuspendedGlobal();
-        if (statusForApp[app_id][publisher] != STATUS_UNREGISTERED) revert AlreadyRegistered();
-        statusForApp[app_id][publisher] = STATUS_INVITED;
+        if (statusForApp[app_id][publisher] != Status.Unregistered) revert AlreadyRegistered();
+        statusForApp[app_id][publisher] = Status.Invited;
         emit PublisherInvited(app_id, publisher);
     }
 
@@ -252,40 +258,28 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// and a wallet banned network-wide cannot accept.
     function registerForApp(bytes32 app_id, bytes32 terms_hash) external payable nonReentrant {
         App storage app = apps[app_id];
-        if (globalSuspensions[msg.sender]) revert PublisherSuspendedGlobal();
-        address owner = app.owner;
-        if (owner == address(0)) revert AppNotFound();
-        if (app.isAppSuspended) revert AppSuspended();
-
-        // empty terms are invalid
+        Status status = _validateInvited(app, app_id, msg.sender);
         bytes32 current = app.appTerms;
-        if (current == bytes32(0)) revert TermsNotSet();
         if (terms_hash != current) revert TermsMismatch();
-
-        uint8 status = statusForApp[app_id][msg.sender];
-        // must have been added by the app owner
-        if (status == STATUS_UNREGISTERED) revert NotInvited();
-        // must not be suspended as a publisher
-        if (status == STATUS_SUSPENDED) revert PublisherSuspendedApp();
-        if (status == STATUS_ACTIVE && acceptedTerms[app_id][msg.sender] == current) revert AlreadyRegistered();
+        if (status == Status.Active && acceptedTerms[app_id][msg.sender] == current) revert AlreadyRegistered();
 
         // do not charge the join fee when accepting new publishing terms
-        uint256 fee = status == STATUS_ACTIVE ? 0 : app.joinFee;
+        uint256 fee = status == Status.Active ? 0 : app.joinFee;
         if (msg.value != fee) revert JoinFeeMismatch();
 
-        statusForApp[app_id][msg.sender] = STATUS_ACTIVE;
+        statusForApp[app_id][msg.sender] = Status.Active;
         acceptedTerms[app_id][msg.sender] = current;
 
         // paid directly to the app owner
-        if (fee != 0) _sendEth(owner, fee);
+        if (fee != 0) _sendEth(app.owner, fee);
 
         emit PublisherJoined(app_id, msg.sender, current, fee);
     }
 
     /// Suspend a publisher from only this app. Does not suspend globally.
     function suspendForApp(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
-        if (statusForApp[app_id][publisher] == STATUS_UNREGISTERED) revert NotInvited();
-        statusForApp[app_id][publisher] = STATUS_SUSPENDED;
+        if (statusForApp[app_id][publisher] == Status.Unregistered) revert NotInvited();
+        statusForApp[app_id][publisher] = Status.Suspended;
         emit PublisherSuspendedForApp(app_id, publisher);
     }
 
@@ -293,10 +287,10 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// whose invitation was taken back before they joined is invited again, and still
     /// has to accept the terms and pay the join fee.
     function reinstateForApp(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
-        if (statusForApp[app_id][publisher] != STATUS_SUSPENDED) revert PublisherNotSuspended();
+        if (statusForApp[app_id][publisher] != Status.Suspended) revert PublisherNotSuspended();
         // Joining always records the terms accepted, and terms are never zero.
         statusForApp[app_id][publisher] =
-            acceptedTerms[app_id][publisher] == bytes32(0) ? STATUS_INVITED : STATUS_ACTIVE;
+            acceptedTerms[app_id][publisher] == bytes32(0) ? Status.Invited : Status.Active;
         emit PublisherReinstatedForApp(app_id, publisher);
     }
 
@@ -353,9 +347,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// `test_each_refused_commit_says_why` checks that they agree.
     function isRegisteredForApp(bytes32 app_id, address publisher) public view returns (bool) {
         App storage app = apps[app_id];
-        bytes32 current = app.appTerms;
-        return !app.isAppSuspended && !globalSuspensions[publisher] && current != bytes32(0)
-            && statusForApp[app_id][publisher] == STATUS_ACTIVE && acceptedTerms[app_id][publisher] == current;
+        return !app.isAppSuspended && !globalSuspensions[publisher] && statusForApp[app_id][publisher] == Status.Active
+            && acceptedTerms[app_id][publisher] == app.appTerms;
     }
 
     /// The single oracle the upload gate reads: `(registered, owner, paid_at)`.
@@ -371,7 +364,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     function joinInfo(bytes32 app_id, address publisher)
         external
         view
-        returns (bytes32, string memory, uint256, uint8, bool)
+        returns (bytes32, string memory, uint256, Status, bool)
     {
         App storage app = apps[app_id];
         return (
@@ -405,20 +398,15 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
         dataRegistry = registry;
     }
 
-    /// Ban a wallet network-wide: it can no longer claim an app, be added to one, join
-    /// one, or publish in any (`isRegisteredForApp` turns false). Any address can be
-    /// banned, including one that has never published. Nothing else is touched, so
-    /// lifting the ban restores everything, and the wallet's timelines in the
-    /// DataRegistry resume where they stopped.
-    function suspendPublisher(address publisher) external onlyAdmin {
-        globalSuspensions[publisher] = true;
-        emit PublisherSuspended(publisher);
-    }
-
-    /// Lift a network-wide ban.
-    function reinstateGlobal(address publisher) external onlyAdmin {
-        globalSuspensions[publisher] = false;
-        emit PublisherReinstated(publisher);
+    /// Ban a wallet network-wide (`true`), or lift the ban (`false`). A banned wallet
+    /// can no longer claim an app, be added to one, join one, or publish in any
+    /// (`isRegisteredForApp` turns false). Any address can be banned, including one that
+    /// has never published. Nothing else is touched, so lifting the ban restores
+    /// everything, and the wallet's timelines in the DataRegistry resume where they
+    /// stopped.
+    function setGlobalSuspension(address publisher, bool is_suspended) external onlyAdmin {
+        globalSuspensions[publisher] = is_suspended;
+        emit GlobalSuspensionChanged(publisher, is_suspended);
     }
 
     /// Sweep `amount` of collected USDC to `to`.
@@ -442,7 +430,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
 
     /// Mark an app owner as an active publisher of their own app
     function _joinOwner(bytes32 app_id, address owner, bytes32 terms_hash) private {
-        statusForApp[app_id][owner] = STATUS_ACTIVE;
+        statusForApp[app_id][owner] = Status.Active;
         acceptedTerms[app_id][owner] = terms_hash;
     }
 
@@ -472,17 +460,21 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// same rules as a yes or no; change both together.
     function _validatePublisher(bytes32 app_id, address publisher) private view {
         App storage app = apps[app_id];
+        if (_validateInvited(app, app_id, publisher) == Status.Invited) revert NotRegisteredForApp();
+        if (acceptedTerms[app_id][publisher] != app.appTerms) revert TermsMismatch();
+    }
+
+    /// The checks joining and committing share, in the order both report them: the app
+    /// exists, the publisher is not banned network-wide, the app is not taken down, and
+    /// the publisher is in it and not suspended from it. Returns their status, which is
+    /// then Invited or Active.
+    function _validateInvited(App storage app, bytes32 app_id, address publisher) private view returns (Status status) {
         if (app.owner == address(0)) revert AppNotFound();
         if (globalSuspensions[publisher]) revert PublisherSuspendedGlobal();
         if (app.isAppSuspended) revert AppSuspended();
-        uint8 status = statusForApp[app_id][publisher];
-        if (status == STATUS_SUSPENDED) revert PublisherSuspendedApp();
-        if (status == STATUS_UNREGISTERED) revert NotInvited();
-        // Invited, the only other status
-        if (status != STATUS_ACTIVE) revert NotRegisteredForApp();
-        bytes32 current = app.appTerms;
-        if (current == bytes32(0)) revert TermsNotSet();
-        if (acceptedTerms[app_id][publisher] != current) revert TermsMismatch();
+        status = statusForApp[app_id][publisher];
+        if (status == Status.Suspended) revert PublisherSuspendedApp();
+        if (status == Status.Unregistered) revert NotInvited();
     }
 
     function _sendEth(address to, uint256 amount) private {

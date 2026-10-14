@@ -15,7 +15,7 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
      │ addPublisher(pub)           │  │  app → owner, terms, join fee
      │ renewApp()                  │  │  app → subscribedAt (the subscription)
      ▼                             │  │  (app, publisher) → status
-  Admin ── suspendPublisher() ─────┘  │  wallet → globalSuspensions (network-wide ban)
+  Admin ── setGlobalSuspension() ──┘  │  wallet → globalSuspensions (network-wide ban)
   (network-wide ban)                  │
                                       │ commitStateRoot(app, publisher, subspace, old, new)
                                       │  forwarded once the publisher is checked
@@ -59,7 +59,6 @@ The Worker cannot cover this on its own. It only gates uploads through Fangorn's
 | `solidity/src/AppRegistry.sol`          | AppRegistry                                             |
 | `solidity/src/DataRegistry.sol`         | DataRegistry                                            |
 | `solidity/src/MembershipRegistry.sol`   | MembershipRegistry                                      |
-| `solidity/src/NonReentrant.sol`         | Reentrancy guard shared by the contracts                |
 | `solidity/test/`                        | Foundry tests and mocks                                 |
 | `solidity/script/Deploy.s.sol`          | Deploys the contracts behind their own UUPS proxy              |
 | `solidity/script/Upgrade.s.sol`         | Admin: upgrade a deployed contract in place             |
@@ -72,7 +71,7 @@ The Worker cannot cover this on its own. It only gates uploads through Fangorn's
 ## Common to the contracts
 
 - *Names.* Functions are `camelCase`. Arguments and event fields are `snake_case` (`app_id`, `new_root`), because the SDK reads event fields by those names.
-- *Reentrancy.* Every function that moves funds or makes a state-changing call to another contract is guarded (`NonReentrant.sol`) and reverts `Reentrancy()` if re-entered. Views are not guarded. `AppRegistry.commitStateRoot` is, because it calls the DataRegistry.
+- *Reentrancy.* Every function that moves funds or makes a state-changing call to another contract is guarded with OpenZeppelin's `ReentrancyGuardTransient`, which keeps its flag in transient storage (EIP-1153) rather than a storage slot, and reverts `ReentrancyGuardReentrantCall()` if re-entered. Views are not guarded. `AppRegistry.commitStateRoot` is, because it calls the DataRegistry.
 - *Cross-calls.* There is one: `AppRegistry.commitStateRoot` calls `DataRegistry.commitStateRoot`. A refusal there (`StaleStateRoot`) reaches the caller unchanged, and the AppRegistry declares that error so it is in its ABI too. With no DataRegistry set, every commit reverts.
 - *Upgradeability.* Each contract takes its initial arguments through `initialize(…)` instead of a constructor, and has `upgradeToAndCall`, `proxiableUUID` and `UPGRADE_INTERFACE_VERSION`, the `Initialized` and `Upgraded` events, and
   OpenZeppelin's proxy errors.
@@ -82,14 +81,14 @@ The Worker cannot cover this on its own. It only gates uploads through Fangorn's
 
 Apps, who may publish under them, and who pays for their storage. **An app is synonymous to a storage subscription** so data availability has stronger guarantees.
 
-- `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`), stamps `subscribedAt(app_id)` as now, and makes the claimer the app's first publisher. `fee` is the app's own join fee, in wei. The claimer must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
+- `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`), stamps `subscribedAt(app_id)` as now, and makes the claimer the app's first publisher. `fee` is the app's own join fee, in wei. `terms_hash` must not be zero (`TermsNotSet`), here or in `setAppTerms`, so an app always has terms to accept. The claimer must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
 - `renewApp(app_id)` — owner-only. Pays the fee again and re-stamps `now`.
 - `addPublisher(app_id, publisher)` — owner-only. An **invitation**: status goes `0 → 3`. Nobody can join an app uninvited. The publisher must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
 - `registerForApp(app_id, terms_hash)` — payable, called by the invited publisher. Accepts the exact current terms hash and pays exactly the join fee (forwarded to the app owner; any other amount reverts `JoinFeeMismatch`). Reverts `NotInvited` for a wallet the owner never added, `PublisherSuspendedApp` for one suspended from the app, and `PublisherSuspendedGlobal` for one banned network-wide. Re-accepting after a terms change is free, and must send nothing.
 - `setAppTerms`, `setAppFee`, `setAppAgentUri` — owner-only. Changing the terms unregisters every publisher until they re-accept; the agent card carries no hash, so moving it does not.
 - `suspendForApp` / `reinstateForApp` — owner-only, one publisher in one app. Suspending an invited publisher is how an invitation is taken back; reinstating them makes them invited again, not a member. `suspendForApp` reverts `NotInvited` for a wallet the app does not know, and `reinstateForApp` reverts `PublisherNotSuspended` for one who is not suspended.
 - `setAppSuspended(app_id, bool)` — admin-only takedown of a whole app, and its undoing. Memberships are left intact.
-- `suspendPublisher(wallet)` / `reinstateGlobal(wallet)` — admin-only network-wide ban of any address, including one that has never published. They emit `PublisherSuspended` and `PublisherReinstated`, and touch nothing else, so lifting a ban restores everything as it was, namespace heads in the DataRegistry included.
+- `setGlobalSuspension(wallet, bool)` — admin-only network-wide ban of any address, including one that has never published, and its lifting. It emits `GlobalSuspensionChanged` and touches nothing else, so lifting a ban restores everything as it was, namespace heads in the DataRegistry included.
 - `commitStateRoot(app_id, subspace_id, old_root, new_root)` — the only way to publish. Unless the sender `isRegisteredForApp`, it reverts with the first reason that applies:
 
   | Error | The sender… |
@@ -100,7 +99,6 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
   | `PublisherSuspendedApp` | is suspended from this app by its owner |
   | `NotInvited` | was never added to the app |
   | `NotRegisteredForApp` | was added but has not joined (`registerForApp`) |
-  | `TermsNotSet` | names an app with no terms |
   | `TermsMismatch` | accepted terms the app has since replaced; accept the new ones |
 
   Otherwise it forwards the commit to the DataRegistry, which compare-and-swaps the head of `app_id:sender:subspace_id` (`StaleStateRoot` if `old_root` is not it) and emits `StateCommitted`. A lapsed subscription does not stop it: the Worker enforces that.
@@ -112,7 +110,7 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
 
 **Global bans.** A wallet the protocol admin has banned can neither claim an app, be added to one, nor accept an invitation. There is nothing else to pass: no wallet registers anywhere first. A wallet banned later reads as not registered in every app (`isRegisteredForApp`), so it cannot commit (`PublisherSuspendedGlobal`) or upload (the Worker refuses). An *owner* banned later keeps the app, and its other publishers keep publishing. The app can be taken down with `setAppSuspended`.
 
-Per-app status codes: `0` unregistered, `1` active, `2` suspended, `3` invited. `isRegisteredForApp` is true only for an active publisher on the app's current terms hash, in an app that is not suspended, and who is not banned network-wide.
+Per-app status (`statusForApp`, the `Status` enum, a `uint8` in the ABI): `0` unregistered, `1` active, `2` suspended, `3` invited. `isRegisteredForApp` is true only for an active publisher on the app's current terms hash, in an app that is not suspended, and who is not banned network-wide.
 
 The active window is not on-chain — the contract only stores a timestamp. The Worker decides what counts as active (`SUBSCRIPTION_WINDOW_DAYS`, 30 days), so that policy is tunable without a redeploy. A lapsed app therefore still passes `isRegisteredForApp`: the lapse stops uploads at the Worker, not commits on-chain.
 
