@@ -63,60 +63,75 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         Invited
     }
 
+    // Errors, grouped like the functions below.
+
+    // Shared
     error Unauthorized();
+    error TransferFailed();
+
+    // Apps
     error AppNotFound();
     error AppAlreadyRegistered();
     /// Claiming or setting terms: the terms hash is zero. An app always has terms, so
     /// that there is something to accept.
     error TermsNotSet();
+    /// The protocol admin has taken the app down (`setAppSuspended`)
+    error AppSuspended();
+
+    // Membership
+    error NotInvited();
+    /// `invitePublisher`: the wallet is already invited to, a member of, or suspended from
+    /// this app
+    error AlreadyInApp();
+    /// Committing, accepting updated terms or being suspended: invited, but has not
+    /// joined (`joinApp`). An invitation is taken back with `revokeInvitation`.
+    error NotJoined();
+    /// `joinApp`: the publisher has already joined. After the terms change, a member
+    /// accepts the new ones with `acceptUpdatedTerms`, not by joining again.
+    error AlreadyJoined();
     /// Joining or accepting updated terms: not the app's current terms. Committing: the
     /// terms the publisher accepted are no longer the app's; accept the new ones with
     /// `acceptUpdatedTerms`.
     error TermsMismatch();
-    /// `invitePublisher`: the wallet is already invited to, a member of, or suspended from
-    /// this app
-    error AlreadyInApp();
-    /// `joinApp`: the publisher has already joined. After the terms change, a member
-    /// accepts the new ones with `acceptUpdatedTerms`, not by joining again.
-    error AlreadyJoined();
     /// `acceptUpdatedTerms`: the publisher has already accepted the app's current terms
     error TermsAlreadyAccepted();
+    /// `joinApp`: `msg.value` is not exactly the app's join fee
+    error JoinFeeMismatch();
+    /// `withdrawJoinFees`: the caller is owed nothing
+    error NothingToWithdraw();
+    /// The app's owner has suspended the publisher from this app (`setPublisherSuspended`)
+    error PublisherSuspendedApp();
     /// `setPublisherSuspended(…, false)`: the publisher is not suspended from this app
     error PublisherNotSuspended();
     /// `setPublisherSuspended`: an app's owner cannot suspend themselves from it
     error CannotSuspendOwner();
     /// The protocol admin has suspended the publisher network-wide (`setGlobalSuspension`)
     error PublisherSuspendedGlobal();
-    /// The app's owner has suspended the publisher from this app (`setPublisherSuspended`)
-    error PublisherSuspendedApp();
-    /// The protocol admin has taken the app down (`setAppSuspended`)
-    error AppSuspended();
-    /// `joinApp`: `msg.value` is not exactly the app's join fee
-    error JoinFeeMismatch();
-    error TransferFailed();
-    error NotInvited();
+
+    // Publishing
+    /// Raised by the DataRegistry and passed through by `commitStateRoot`: `old_root` is
+    /// not the current head. Declared here so it is in this contract's ABI.
+    error StaleStateRoot();
+
+    // Subscription
     error SubscriptionFeeRequired();
-    /// An app's token cannot be transferred or burned
-    error NotTransferable();
+    /// `registerApp`: the subscription fee is above the most the caller agreed to pay
+    error SubscriptionFeeTooHigh();
     /// The subscription has a period or more left; renew it once less than that remains
     error SubscriptionNotRenewable();
     /// `renewSubscription`: `duration` is not the subscription period
     error DurationMismatch();
     /// The subscription is paid in USDC; renewing or cancelling takes no ETH
     error EthNotAccepted();
+    /// An app's token cannot be transferred or burned
+    error NotTransferable();
     /// The subscription period cannot be zero
     error ZeroPeriod();
-    /// `registerApp`: the subscription fee is above the most the caller agreed to pay
-    error SubscriptionFeeTooHigh();
-    /// `withdrawJoinFees`: the caller is owed nothing
-    error NothingToWithdraw();
-    /// Committing, accepting updated terms or being suspended: invited, but has not
-    /// joined (`joinApp`). An invitation is taken back with `revokeInvitation`.
-    error NotJoined();
-    /// Raised by the DataRegistry and passed through by `commitStateRoot`: `old_root` is
-    /// not the current head. Declared here so it is in this contract's ABI.
-    error StaleStateRoot();
 
+    // Events, grouped the same way. The subscription's own event, `SubscriptionUpdate`,
+    // is ERC-5643's, declared in `IERC5643`.
+
+    // Apps
     /// A wallet claimed an app
     event AppRegistered(bytes32 indexed app_id, address indexed owner);
     /// The app's terms changed and every publisher on the old hash must accept the new
@@ -125,31 +140,35 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     event JoinFeeChanged(bytes32 indexed app_id, uint256 join_fee);
     /// The app's agent card moved
     event AppAgentChanged(bytes32 indexed app_id, string agent_uri);
-    /// A publisher joined an app AND accepted `terms_hash`, paying `join_fee`
-    event PublisherJoined(bytes32 indexed app_id, address indexed publisher, bytes32 terms_hash, uint256 join_fee);
-    /// A member accepted the app's updated terms, `terms_hash`, and can publish again
-    event UpdatedTermsAccepted(bytes32 indexed app_id, address indexed publisher, bytes32 terms_hash);
-    /// An app owner suspended a publisher from their app, or lifted the suspension
-    event PublisherSuspensionChanged(bytes32 indexed app_id, address indexed publisher, bool suspended);
-    /// The protocol admin banned a wallet network-wide, or lifted the ban
-    event GlobalSuspensionChanged(address indexed publisher, bool suspended);
     /// The protocol admin suspended (or reinstated) an entire app
     event AppSuspensionChanged(bytes32 indexed app_id, bool suspended);
+
+    // Membership
     /// An app owner added a publisher, who may now accept the terms and join
     event PublisherInvited(bytes32 indexed app_id, address indexed publisher);
     /// An app owner took back an invitation before it was accepted
     event InvitationRevoked(bytes32 indexed app_id, address indexed publisher);
-    event SubscriptionFeeChanged(uint256 fee);
+    /// A publisher joined an app AND accepted `terms_hash`, paying `join_fee`
+    event PublisherJoined(bytes32 indexed app_id, address indexed publisher, bytes32 terms_hash, uint256 join_fee);
+    /// A member accepted the app's updated terms, `terms_hash`, and can publish again
+    event UpdatedTermsAccepted(bytes32 indexed app_id, address indexed publisher, bytes32 terms_hash);
     /// An app owner took out the join fees they were owed
     event JoinFeesWithdrawn(address indexed owner, address to, uint256 amount);
+    /// An app owner suspended a publisher from their app, or lifted the suspension
+    event PublisherSuspensionChanged(bytes32 indexed app_id, address indexed publisher, bool suspended);
+    /// The protocol admin banned a wallet network-wide, or lifted the ban
+    event GlobalSuspensionChanged(address indexed publisher, bool suspended);
+
+    // Protocol admin
+    event SubscriptionFeeChanged(uint256 fee);
     /// The admin changed the period: it applies from each app's next payment
     event SubscriptionPeriodChanged(uint64 period);
-    event AdminChanged(address previous_admin, address new_admin);
     /// The admin pointed commits at another DataRegistry
     event DataRegistryChanged(address previous_registry, address new_registry);
     /// The admin sent an ERC-20 the contract held: subscription fees, or a token sent
     /// here by mistake
     event TokenWithdrawn(address indexed token, address indexed to, uint256 amount);
+    event AdminChanged(address previous_admin, address new_admin);
 
     /// The app registry admin
     address public admin;
