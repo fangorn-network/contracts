@@ -173,23 +173,6 @@ contract MockHook {
     }
 }
 
-/// The AppRegistry, as far as the DataRegistry can see it: one settable answer per
-/// (app, publisher).
-contract MockAppRegistry {
-    mapping(bytes32 => mapping(address => bool)) public isRegisteredForApp;
-
-    function setMember(bytes32 appId, address publisher, bool joined) external {
-        isRegisteredForApp[appId][publisher] = joined;
-    }
-}
-
-/// Reverts on every call, including the views the registries cross-call.
-contract Reverter {
-    fallback() external payable {
-        revert("no");
-    }
-}
-
 /// Deploys each registry the way `deploy.sh` does: an implementation, and the ERC-1967
 /// proxy that initializes it. What comes back is the proxy, so every test runs against
 /// proxy storage — including the reentrancy guard, which starts at zero there.

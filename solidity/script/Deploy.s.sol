@@ -18,12 +18,13 @@ import {Deployments} from "./Deployments.sol";
 ///
 /// `--force` is not optional: the upgrade-safety check needs a full build.
 ///
-///   all()                               all three registries, the DataRegistry and
-///                                       MembershipRegistry pointing at the AppRegistry,
-///                                       and the default app claimed
+///   all()                               all three registries, the AppRegistry and the
+///                                       DataRegistry wired to each other, and the
+///                                       default app claimed
 ///   appRegistry(address dataRegistry)   a new AppRegistry in front of an existing
 ///                                       DataRegistry, which is repointed at it
-///   dataRegistry(address appRegistry)   a new DataRegistry behind an existing AppRegistry
+///   dataRegistry(address appRegistry)   a new DataRegistry behind an existing
+///                                       AppRegistry, which is repointed at it
 ///   membershipRegistry(address appRegistry)
 ///
 /// With --broadcast, each new contract's build is written under
@@ -39,9 +40,9 @@ import {Deployments} from "./Deployments.sol";
 /// signer who is not the admin, stops it with nothing deployed.
 ///
 /// Parameters are environment variables (Forge also reads a `.env` in this directory):
-///   ADMIN_ADDR              required. Fees, bans, takedowns and upgrades. For
-///                           appRegistry() it must be the signer, because repointing
-///                           the DataRegistry is admin-only.
+///   ADMIN_ADDR              required. Fees, bans, takedowns and upgrades. For all(),
+///                           appRegistry() and dataRegistry() it must be the signer,
+///                           because the wiring calls are admin-only.
 ///   USDC_ADDR, SEMAPHORE_ADDR
 ///                           default to Arbitrum Sepolia's; required on any other chain
 ///   SUBSCRIPTION_FEE        claiming an app, in USDC base units. Default 0
@@ -59,6 +60,9 @@ contract Deploy is Builds {
         vm.startBroadcast();
         AppRegistry apps = _deployAppRegistry(admin);
         DataRegistry data = _deployDataRegistry(admin, address(apps));
+        // Commits go through the AppRegistry, which forwards them here; the DataRegistry
+        // takes them from that AppRegistry only. Until this is set, nobody can commit.
+        apps.setDataRegistry(address(data));
         address membership = _deployMembershipRegistry(admin, address(apps));
         _claimDefaultApp(apps);
         vm.stopBroadcast();
@@ -74,8 +78,9 @@ contract Deploy is Builds {
         DataRegistry data = DataRegistry(dataRegistry_);
         vm.startBroadcast();
         AppRegistry apps = _deployAppRegistry(admin);
-        // The existing DataRegistry still checks membership against the old AppRegistry.
+        // The existing DataRegistry still takes commits from the old AppRegistry only.
         // Namespace heads stay; apps, memberships and bans do not carry over.
+        apps.setDataRegistry(dataRegistry_);
         data.setAppRegistry(address(apps));
         _claimDefaultApp(apps);
         vm.stopBroadcast();
@@ -89,6 +94,7 @@ contract Deploy is Builds {
         vm.startBroadcast();
         // Namespace heads do not carry over.
         DataRegistry data = _deployDataRegistry(admin, appRegistry_);
+        apps.setDataRegistry(address(data));
         vm.stopBroadcast();
         _report(apps, data);
         _recordBuild("DataRegistry", address(data));
@@ -163,6 +169,7 @@ contract Deploy is Builds {
         address admin = _admin();
         require(apps.admin() == admin, "AppRegistry admin");
         require(data.admin() == admin, "DataRegistry admin");
+        require(apps.dataRegistry() == address(data), "AppRegistry does not point at the DataRegistry");
         require(data.appRegistry() == address(apps), "DataRegistry does not point at the AppRegistry");
         console.log("AppRegistry:  %s", address(apps));
         console.log("DataRegistry: %s", address(data));

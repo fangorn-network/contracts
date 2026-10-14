@@ -11,16 +11,17 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
 
 ```
   App owner ── registerApp() ──▶  AppRegistry  ◀── registerForApp() ── Publisher
-  (wallet, USDC)                   ▲             (invited first)
-     │ addPublisher(pub)           │  app → owner, terms, join fee
-     │ renewApp()                  │  app → subscribedAt (the subscription)
-     ▼                             │  (app, publisher) → status
-  Admin ── suspendPublisher() ─────┤  wallet → suspended (network-wide ban)
-  (network-wide ban)               │
-                                   │ isRegisteredForApp(app, sender)   on commit
-                                   │  (static call, the only one between them)
-                                 DataRegistry  ◀── commitStateRoot(app, subspace, old, new)
-                                                   emits StateCommitted
+  (wallet, USDC)                   ▲  │          ◀── commitStateRoot(app, subspace, old, new)
+     │ addPublisher(pub)           │  │  app → owner, terms, join fee
+     │ renewApp()                  │  │  app → subscribedAt (the subscription)
+     ▼                             │  │  (app, publisher) → status
+  Admin ── suspendPublisher() ─────┘  │  wallet → suspended (network-wide ban)
+  (network-wide ban)                  │
+                                      │ commitStateRoot(app, publisher, subspace, old, new)
+                                      │  forwarded once the publisher is checked
+                                      ▼
+                                 DataRegistry   accepts commits from the AppRegistry only
+                                                emits StateCommitted
                                                          │
                                                          ▼
                                                    SDK light-client
@@ -37,21 +38,19 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
                                  plan, and who is paid
 ```
 
-The DataRegistry asks the AppRegistry who may publish under an app, and the AppRegistry asks no one: apps, memberships and the protocol admin's network-wide ban all live in it. The DataRegistry stores the AppRegistry's address, and the admin can repoint it (`setAppRegistry`), so replacing the AppRegistry is a deploy plus one call.
+Publishers commit through the AppRegistry. It decides who may publish (apps, memberships and the protocol admin's network-wide ban all live in it) and forwards each commit it allows to the DataRegistry, which accepts commits from that AppRegistry and no one else. Each stores the other's address and the admin can repoint either (`setDataRegistry`, `setAppRegistry`), so replacing one contract is a deploy plus two calls.
 
 ### Contract Communication
 
-| Direction                  | Called when                          | Question                                               |
+| Direction                  | Called when                          | What                                                   |
 |----------------------------|--------------------------------------|--------------------------------------------------------|
-| DataRegistry → AppRegistry | every commit                         | May this wallet publish under this app?                |
+| AppRegistry → DataRegistry | every commit                         | Move this publisher's head; the AppRegistry has checked they may |
 
-**DataRegistry → AppRegistry.** The DataRegistry is where publishing actually happens, so it is the only place app membership can be enforced on-chain. `commitStateRoot(app_id, …)` takes the app id from the caller, and before it moves the head it asks the AppRegistry whether the sender is an active publisher of that app. If not, it reverts `NotRegisteredForApp`.
+**Why commits go through the AppRegistry.** The DataRegistry is where the head moves, so it has to refuse a commit nobody checked. `AppRegistry.commitStateRoot(app_id, …)` requires the sender to be an active publisher of that app (`isRegisteredForApp`: invited, joined on the current terms, not suspended from the app or banned network-wide, in an app that is not suspended), else it reverts with the reason (see `commitStateRoot` under AppRegistry). It then calls `DataRegistry.commitStateRoot` with the sender's address as the publisher. The DataRegistry trusts that address because only the AppRegistry may call it (`Unauthorized` otherwise), so all of the checks live in one contract and the DataRegistry needs no view of apps at all.
 
-The answer is no for a wallet the protocol admin has banned network-wide, so the ban stops commits without a check of its own in the DataRegistry.
+Without that, any wallet could commit under any app id. It could not overwrite another publisher's data, because the namespace key includes the publisher's address. But its commits would carry the app's id in `StateCommitted`, so they would appear in that app's commit stream for every reader and feed watching it.
 
-Without that call, any wallet could commit under any app id. It could not overwrite another publisher's data, because the namespace key includes the sender's address. But its commits would carry the app's id in `StateCommitted`, so they would appear in that app's commit stream for every reader and feed watching it.
-
-The Worker cannot cover this on its own. It only gates uploads through Fangorn's hosted storage, and anyone can pin bytes elsewhere and call `commitStateRoot` directly. The contract cannot tell where the bytes were pinned.
+The Worker cannot cover this on its own. It only gates uploads through Fangorn's hosted storage, and anyone can pin bytes elsewhere and commit them on-chain. The contract cannot tell where the bytes were pinned.
 
 ## Layout
 
@@ -73,8 +72,8 @@ The Worker cannot cover this on its own. It only gates uploads through Fangorn's
 ## Common to the contracts
 
 - *Names.* Functions are `camelCase`. Arguments and event fields are `snake_case` (`app_id`, `new_root`), because the SDK reads event fields by those names.
-- *Reentrancy.* Every function that moves funds or makes a state-changing call to another contract is guarded (`NonReentrant.sol`) and reverts `Reentrancy()` if re-entered. Views are not guarded, and neither is `commitStateRoot`, whose only outside call is a read of the AppRegistry.
-- *Failed cross-calls.* The DataRegistry treats anything but a clean `true` from the AppRegistry (a revert, no contract at the address, a malformed return) as "not a publisher of this app". It uses a low-level call for this since a plain interface call would revert on the last two instead.
+- *Reentrancy.* Every function that moves funds or makes a state-changing call to another contract is guarded (`NonReentrant.sol`) and reverts `Reentrancy()` if re-entered. Views are not guarded. `AppRegistry.commitStateRoot` is, because it calls the DataRegistry.
+- *Cross-calls.* There is one: `AppRegistry.commitStateRoot` calls `DataRegistry.commitStateRoot`. A refusal there (`StaleStateRoot`) reaches the caller unchanged, and the AppRegistry declares that error so it is in its ABI too. With no DataRegistry set, every commit reverts.
 - *Upgradeability.* Each contract takes its initial arguments through `initialize(…)` instead of a constructor, and has `upgradeToAndCall`, `proxiableUUID` and `UPGRADE_INTERFACE_VERSION`, the `Initialized` and `Upgraded` events, and
   OpenZeppelin's proxy errors.
 - *Admin.* One address per contract. It is also who may upgrade it. `setAdmin(new_admin)` hands the role over and emits `AdminChanged`. Setting the zero address **renounces the role and permanently stops upgrades**.
@@ -83,22 +82,36 @@ The Worker cannot cover this on its own. It only gates uploads through Fangorn's
 
 Apps, who may publish under them, and who pays for their storage. **An app is synonymous to a storage subscription** so data availability has stronger guarantees.
 
-- `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`), stamps `subscribedAt(app_id)` as now, and makes the claimer the app's first publisher. `fee` is the app's own join fee, in wei. The claimer must not be banned network-wide (`PublisherSuspendedErr` otherwise).
+- `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`), stamps `subscribedAt(app_id)` as now, and makes the claimer the app's first publisher. `fee` is the app's own join fee, in wei. The claimer must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
 - `renewApp(app_id)` — owner-only. Pays the fee again and re-stamps `now`.
-- `addPublisher(app_id, publisher)` — owner-only. An **invitation**: status goes `0 → 3`. Nobody can join an app uninvited. The publisher must not be banned network-wide (`PublisherSuspendedErr` otherwise).
-- `registerForApp(app_id, terms_hash)` — payable, called by the invited publisher. Accepts the exact current terms hash and pays the join fee (forwarded to the app owner). Reverts `NotInvited` for a wallet the owner never added, and `PublisherSuspendedErr` for one suspended from the app or banned network-wide. Re-accepting after a terms change is free.
+- `addPublisher(app_id, publisher)` — owner-only. An **invitation**: status goes `0 → 3`. Nobody can join an app uninvited. The publisher must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
+- `registerForApp(app_id, terms_hash)` — payable, called by the invited publisher. Accepts the exact current terms hash and pays the join fee (forwarded to the app owner). Reverts `NotInvited` for a wallet the owner never added, `PublisherSuspendedApp` for one suspended from the app, and `PublisherSuspendedGlobal` for one banned network-wide. Re-accepting after a terms change is free.
 - `setAppTerms`, `setAppFee`, `setAppAgentUri` — owner-only. Changing the terms unregisters every publisher until they re-accept; the agent card carries no hash, so moving it does not.
 - `suspendForApp` / `reinstateForApp` — owner-only, one publisher in one app. Suspending an invited publisher is how an invitation is taken back.
 - `suspendApp` / `reinstateApp` — admin-only takedown of a whole app.
 - `suspendPublisher(wallet)` / `reinstateGlobal(wallet)` — admin-only network-wide ban of any address, including one that has never published. They emit `PublisherSuspended` and `PublisherReinstated`, and touch nothing else, so lifting a ban restores everything as it was, namespace heads in the DataRegistry included.
+- `commitStateRoot(app_id, subspace_id, old_root, new_root)` — the only way to publish. Unless the sender `isRegisteredForApp`, it reverts with the first reason that applies:
+
+  | Error | The sender… |
+  |---|---|
+  | `AppNotFound` | names an app nobody has claimed |
+  | `PublisherSuspendedGlobal` | is banned network-wide by the protocol admin |
+  | `AppSuspendedErr` | names an app the protocol admin has taken down |
+  | `PublisherSuspendedApp` | is suspended from this app by its owner |
+  | `NotInvited` | was never added to the app |
+  | `NotRegisteredForApp` | was added but has not joined (`registerForApp`) |
+  | `TermsNotSet` | names an app with no terms |
+  | `TermsMismatch` | accepted terms the app has since replaced; accept the new ones |
+
+  Otherwise it forwards the commit to the DataRegistry, which compare-and-swaps the head of `app_id:sender:subspace_id` (`StaleStateRoot` if `old_root` is not it) and emits `StateCommitted`. A lapsed subscription does not stop it: the Worker enforces that.
 - `access(app_id, publisher) → (bool registered, address owner, uint64 paidAt)` — the upload gate's single read. `registered` is `isRegisteredForApp`.
-- Views: `isRegisteredForApp`, `statusForApp`, `joinInfo`, `getAppOwner`, `subscribedAt`, `subscriptionFee`, `usdc`, `suspended`, `appTerms`, `appTermsUri`, `appAgentUri`, `appFee`, `acceptedTerms`, `isAppSuspended`, `admin`.
-- Admin: `setSubscriptionFee`, `setUsdc`, `withdrawUsdc`, `withdrawEth`.
+- Views: `isRegisteredForApp`, `statusForApp`, `joinInfo`, `getAppOwner`, `subscribedAt`, `subscriptionFee`, `usdc`, `dataRegistry`, `suspended`, `appTerms`, `appTermsUri`, `appAgentUri`, `appFee`, `acceptedTerms`, `isAppSuspended`, `admin`.
+- Admin: `setSubscriptionFee`, `setUsdc`, `setDataRegistry`, `withdrawUsdc`, `withdrawEth`.
 - Admin, used once to carry state over from the previous contracts: `seedApp(app_id, owner, terms_hash, terms_uri, fee, agent_uri)` recreates an app for its owner, pulls **no** subscription fee and stamps it as paid now (a testnet shortcut); `seedPublisherForApp(app_id, publisher, status, accepted_terms)` restores one membership verbatim. Both are fill-only: they refuse an app that is already claimed, or a publisher the app already knows.
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
 - `initialize(admin, usdc, subscription_fee)`.
 
-**Global bans.** A wallet the protocol admin has banned can neither claim an app, be added to one, nor accept an invitation. There is nothing else to pass: no wallet registers anywhere first. A wallet banned later reads as not registered in every app (`isRegisteredForApp`), so it cannot commit (the DataRegistry refuses with `NotRegisteredForApp`) or upload (the Worker refuses). An *owner* banned later keeps the app, and its other publishers keep publishing. The app can be taken down with `suspendApp`.
+**Global bans.** A wallet the protocol admin has banned can neither claim an app, be added to one, nor accept an invitation. There is nothing else to pass: no wallet registers anywhere first. A wallet banned later reads as not registered in every app (`isRegisteredForApp`), so it cannot commit (`PublisherSuspendedGlobal`) or upload (the Worker refuses). An *owner* banned later keeps the app, and its other publishers keep publishing. The app can be taken down with `suspendApp`.
 
 Per-app status codes: `0` unregistered, `1` active, `2` suspended, `3` invited. `isRegisteredForApp` is true only for an active publisher on the app's current terms hash, in an app that is not suspended, and who is not banned network-wide.
 
@@ -110,9 +123,9 @@ The state-root timeline.
 
 State: `admin`, `appRegistry`, `namespaceHeads` (`keccak256(app_id ‖ publisher ‖ subspace_id) → bytes32`).
 
-- `commitStateRoot(app_id, subspace_id, old_root, new_root)` — the only graph-mutating route. Rejects a caller who is not registered in the appropriate app in the AppRegistry, which includes one banned network-wide (`NotRegisteredForApp`). It compare-and-swaps (CAS) the head which enforces a linear timeline. Emits `StateCommitted` the SDK's light-client watches.
+- `commitStateRoot(app_id, publisher, subspace_id, old_root, new_root)` — the only graph-mutating route, callable by the AppRegistry only (`Unauthorized` otherwise), which has checked that `publisher` may publish under `app_id`. Publishers call `AppRegistry.commitStateRoot`. It compare-and-swaps (CAS) the head which enforces a linear timeline. Emits `StateCommitted` the SDK's light-client watches.
 - Views: `getNamespaceHead`, `appRegistry`, `admin`.
-- Admin: `setAppRegistry`, `seedNamespaceHead` (fill-only; replays heads after a redeploy).
+- Admin: `setAppRegistry` (the one address that may commit; until it is set, nobody can), `seedNamespaceHead` (fill-only; replays heads after a redeploy).
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
 - `initialize(admin, app_registry)`.
 
@@ -182,7 +195,7 @@ build of that contract that is live (`solidity/deployed/`), so
 fails with "not from a full compilation", run `forge clean` and try again.
 
 The tests check, among the rest, that ETH actually reaches the app owner, that a revert
-unwinds state, and that a missing or reverting AppRegistry fails closed. The
+unwinds state, and that the DataRegistry takes commits from the AppRegistry only. The
 AppRegistry tests run against the real DataRegistry rather than a mock; USDC and
 Semaphore are mocks. Every test deploys its contracts behind a proxy, as the deploy
 script does, and each suite checks that only the admin can upgrade.
@@ -208,9 +221,9 @@ forge script script/Deploy.s.sol --sig "all()" --force \
 
 | `--sig`                                 | Deploys                                                        |
 |-----------------------------------------|----------------------------------------------------------------|
-| `"all()"`                               | All three registries, the other two pointing at the AppRegistry, and the default app claimed |
+| `"all()"`                               | All three registries, the AppRegistry and DataRegistry wired to each other, and the default app claimed |
 | `"appRegistry(address)" <DataRegistry>` | A new AppRegistry in front of an existing DataRegistry, which is repointed at it |
-| `"dataRegistry(address)" <AppRegistry>` | A new DataRegistry behind an existing AppRegistry |
+| `"dataRegistry(address)" <AppRegistry>` | A new DataRegistry behind an existing AppRegistry, which is repointed at it |
 | `"membershipRegistry(address)" <AppRegistry>` | A MembershipRegistry. The AppRegistry it reads app owners from cannot be changed later |
 
 This is for a contract that does not exist yet. To change one that is already deployed,
@@ -226,8 +239,8 @@ see *Upgrade*: a redeploy starts empty at a new address.
   transaction. Leave `--broadcast` off to only simulate.
 - **Parameters** are environment variables, listed with their defaults in
   `solidity/.env.example` (Forge reads a `.env` in `solidity/`). `ADMIN_ADDR` is
-  required and has no default; for `appRegistry(address)` it must be the signer,
-  because repointing the DataRegistry is admin-only. `USDC_ADDR` and `SEMAPHORE_ADDR` default to the
+  required and has no default; for the two registries it must be the signer, because
+  the wiring calls are admin-only. `USDC_ADDR` and `SEMAPHORE_ADDR` default to the
   Arbitrum Sepolia deployments on that chain and are required on any other.
 
 Each contract is two deployments: the implementation, then an ERC-1967 proxy (UUPS)
@@ -242,8 +255,8 @@ together with the addresses in `Deployments.sol` and the broadcast log Forge wri
 under `solidity/broadcast/`. The `UpgradeSafety` test fails while the two disagree: a
 contract has builds exactly when `Deployments.sol` records its proxy.
 
-`all()` deploys the AppRegistry, then the DataRegistry and the MembershipRegistry
-pointing at it, and claims the default app (`fangorn`) for the deployer. With a non-zero
+`all()` deploys the AppRegistry, then the DataRegistry, points each at the other, then
+deploys the MembershipRegistry and claims the default app (`fangorn`) for the deployer. With a non-zero
 `SUBSCRIPTION_FEE` the deployer needs that much USDC.
 
 Deploying mints new addresses. They reach every consumer through one place:

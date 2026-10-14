@@ -5,6 +5,12 @@ import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.s
 import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 import {NonReentrant} from "./NonReentrant.sol";
 
+/// The DataRegistry's one write, which accepts calls from this contract only.
+interface IDataRegistry {
+    function commitStateRoot(bytes32 app_id, address publisher, bytes32 subspace_id, bytes32 old_root, bytes32 new_root)
+        external;
+}
+
 /// AppRegistry
 ///
 /// An application is a named domain and a set of agreements for associating data with
@@ -16,9 +22,10 @@ import {NonReentrant} from "./NonReentrant.sol";
 /// publishers. Membership is by invitation — the owner adds a publisher, who then
 /// accepts the terms.
 ///
-/// The protocol admin's network-wide ban is kept here too, so this contract calls no
-/// other registry. The DataRegistry asks it on every commit whether the sender may
-/// publish under the app (`isRegisteredForApp`), and a banned wallet may not.
+/// Every commit goes through this contract (`commitStateRoot`). It checks that the
+/// sender may publish under the app — the protocol admin's network-wide ban is kept
+/// here too — and forwards the commit to the DataRegistry, which accepts commits from
+/// this contract alone.
 ///
 /// Deployed behind an ERC-1967 proxy (UUPS): the proxy holds the state and the address,
 /// and the admin can point it at a new implementation. Storage is therefore
@@ -37,17 +44,25 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     error AppNotFound();
     error AppAlreadyRegistered();
     error TermsNotSet();
+    /// Joining: not the app's current terms. Committing: the terms the publisher
+    /// accepted are no longer the app's; accept the new ones with `registerForApp`.
     error TermsMismatch();
     error AlreadyRegistered();
     error NotRegistered();
-    /// The publisher is suspended: from this app by its owner, or network-wide by the
-    /// protocol admin.
-    error PublisherSuspendedErr();
+    /// The protocol admin has suspended the publisher network-wide (`suspendPublisher`)
+    error PublisherSuspendedGlobal();
+    /// The app's owner has suspended the publisher from this app (`suspendForApp`)
+    error PublisherSuspendedApp();
     error AppSuspendedErr();
     error JoinFeeRequired();
     error TransferFailed();
     error NotInvited();
     error SubscriptionFeeRequired();
+    /// Committing: invited, but has not joined (`registerForApp`)
+    error NotRegisteredForApp();
+    /// Raised by the DataRegistry and passed through by `commitStateRoot`: `old_root` is
+    /// not the current head. Declared here so it is in this contract's ABI.
+    error StaleStateRoot();
 
     /// A new app was registered
     event AppRegistered(bytes32 indexed app_id, address indexed owner);
@@ -81,6 +96,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     address public usdc;
     /// Subscription fee, denominated in USDC base units (6 decimals).
     uint256 public subscriptionFee;
+    /// The DataRegistry that commits are forwarded to
+    address public dataRegistry;
 
     struct App {
         // The first three fields share one storage slot (20 + 1 + 8 bytes): keep them
@@ -148,7 +165,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     {
         App storage app = apps[app_id];
         address owner = msg.sender;
-        if (suspended[owner]) revert PublisherSuspendedErr();
+        if (suspended[owner]) revert PublisherSuspendedGlobal();
         if (app.owner != address(0)) revert AppAlreadyRegistered();
         _paySubscription(app_id, owner);
 
@@ -221,7 +238,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// The publisher must not be banned network-wide: an owner cannot bring in a wallet
     /// the protocol admin has banned.
     function addPublisher(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
-        if (suspended[publisher]) revert PublisherSuspendedErr();
+        if (suspended[publisher]) revert PublisherSuspendedGlobal();
         if (statuses[app_id][publisher] != STATUS_UNREGISTERED) revert AlreadyRegistered();
         statuses[app_id][publisher] = STATUS_INVITED;
         emit PublisherInvited(app_id, publisher);
@@ -232,7 +249,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// and a wallet banned network-wide cannot accept.
     function registerForApp(bytes32 app_id, bytes32 terms_hash) external payable nonReentrant {
         App storage app = apps[app_id];
-        if (suspended[msg.sender]) revert PublisherSuspendedErr();
+        if (suspended[msg.sender]) revert PublisherSuspendedGlobal();
         address owner = app.owner;
         if (owner == address(0)) revert AppNotFound();
         if (app.isAppSuspended) revert AppSuspendedErr();
@@ -246,7 +263,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
         // must have been added by the app owner
         if (status == STATUS_UNREGISTERED) revert NotInvited();
         // must not be suspended as a publisher
-        if (status == STATUS_SUSPENDED) revert PublisherSuspendedErr();
+        if (status == STATUS_SUSPENDED) revert PublisherSuspendedApp();
         if (status == STATUS_ACTIVE && accepted[app_id][msg.sender] == current) revert AlreadyRegistered();
 
         // do not charge the join fee when accepting new publishing terms
@@ -274,6 +291,25 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
         if (statuses[app_id][publisher] != STATUS_SUSPENDED) revert NotRegistered();
         statuses[app_id][publisher] = STATUS_ACTIVE;
         emit PublisherReinstatedForApp(app_id, publisher);
+    }
+
+    // ── Publishing ────────────────────────────────────────────────────────────
+
+    /// Commit a new state root for one of your subspaces in an app. This is the only
+    /// way to publish: the DataRegistry accepts commits from this contract alone.
+    ///
+    /// The sender must be an active publisher of the app (`isRegisteredForApp`), or the
+    /// commit reverts with the reason (see `_validatePublisher`). The DataRegistry then
+    /// compare-and-swaps the head of `app_id:sender:subspace_id`,
+    /// reverting `StaleStateRoot` if `old_root` is not the current head, and emits
+    /// `StateCommitted`. A lapsed subscription does not stop a commit; the upload
+    /// Worker enforces it.
+    function commitStateRoot(bytes32 app_id, bytes32 subspace_id, bytes32 old_root, bytes32 new_root)
+        external
+        nonReentrant
+    {
+        _validatePublisher(app_id, msg.sender);
+        IDataRegistry(dataRegistry).commitStateRoot(app_id, msg.sender, subspace_id, old_root, new_root);
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
@@ -304,7 +340,10 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
 
     /// Is a publisher actively registered in an app? False if the publisher is banned
     /// network-wide or suspended from the app, merely invited, on stale terms, or the
-    /// app is suspended. This is what the DataRegistry asks on every commit.
+    /// app is suspended. `commitStateRoot` requires it.
+    ///
+    /// The same rules as `_validatePublisher`, as a yes or no. Change both together:
+    /// `test_each_refused_commit_says_why` checks that they agree.
     function isRegisteredForApp(bytes32 app_id, address publisher) public view returns (bool) {
         App storage app = apps[app_id];
         bytes32 current = app.appTerms;
@@ -366,6 +405,11 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// Update the fee token address (USDC).
     function setUsdc(address token) external onlyAdmin {
         usdc = token;
+    }
+
+    /// Point commits at a DataRegistry. Until one is set, every commit reverts.
+    function setDataRegistry(address registry) external onlyAdmin {
+        dataRegistry = registry;
     }
 
     /// Ban a wallet network-wide: it can no longer claim an app, be added to one, join
@@ -499,6 +543,24 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     function _tokenCall(bytes memory data) private returns (bool) {
         (bool ok, bytes memory ret) = usdc.call(data);
         return ok && ret.length == 32 && abi.decode(ret, (uint256)) == 1;
+    }
+
+    /// Reverts unless `publisher` may publish under `app_id`, with the first reason that
+    /// applies, from the most basic to the most specific. `isRegisteredForApp` is the
+    /// same rules as a yes or no; change both together.
+    function _validatePublisher(bytes32 app_id, address publisher) private view {
+        App storage app = apps[app_id];
+        if (app.owner == address(0)) revert AppNotFound();
+        if (suspended[publisher]) revert PublisherSuspendedGlobal();
+        if (app.isAppSuspended) revert AppSuspendedErr();
+        uint8 status = statuses[app_id][publisher];
+        if (status == STATUS_SUSPENDED) revert PublisherSuspendedApp();
+        if (status == STATUS_UNREGISTERED) revert NotInvited();
+        // Invited, or a status no function sets (only seedPublisherForApp could).
+        if (status != STATUS_ACTIVE) revert NotRegisteredForApp();
+        bytes32 current = app.appTerms;
+        if (current == bytes32(0)) revert TermsNotSet();
+        if (accepted[app_id][publisher] != current) revert TermsMismatch();
     }
 
     function _sendEth(address to, uint256 amount) private {

@@ -52,6 +52,8 @@ contract AppRegistryTest is Test {
         usdc = new MockUSDC();
         apps = Proxied.appRegistry(ADMIN, address(usdc), 0);
         data = Proxied.dataRegistry(ADMIN, address(apps));
+        vm.prank(ADMIN);
+        apps.setDataRegistry(address(data));
 
         address[3] memory everyday = [APP_OWNER, PUBLISHER, STRANGER];
         for (uint256 i = 0; i < everyday.length; i++) {
@@ -215,7 +217,7 @@ contract AppRegistryTest is Test {
         apps.suspendForApp(APP, STRANGER);
         vm.stopPrank();
         vm.prank(STRANGER);
-        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
+        vm.expectRevert(AppRegistry.PublisherSuspendedApp.selector);
         apps.registerForApp{value: FEE}(APP, TERMS_V1);
     }
 
@@ -325,7 +327,7 @@ contract AppRegistryTest is Test {
 
         // Paying again is not a way back in.
         vm.prank(PUBLISHER);
-        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
+        vm.expectRevert(AppRegistry.PublisherSuspendedApp.selector);
         apps.registerForApp{value: FEE}(APP, TERMS_V1);
 
         vm.startPrank(APP_OWNER);
@@ -481,13 +483,13 @@ contract AppRegistryTest is Test {
         apps.suspendPublisher(STRANGER);
 
         vm.prank(STRANGER);
-        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
+        vm.expectRevert(AppRegistry.PublisherSuspendedGlobal.selector);
         apps.registerApp(OTHER_APP, TERMS_V1, "", 0);
         assertEq(apps.getAppOwner(OTHER_APP), address(0));
 
         openApp();
         vm.prank(APP_OWNER);
-        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
+        vm.expectRevert(AppRegistry.PublisherSuspendedGlobal.selector);
         apps.addPublisher(APP, STRANGER);
         assertEq(apps.statusForApp(APP, STRANGER), STATUS_UNREGISTERED);
 
@@ -507,7 +509,7 @@ contract AppRegistryTest is Test {
         apps.suspendPublisher(PUBLISHER);
 
         vm.prank(PUBLISHER);
-        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
+        vm.expectRevert(AppRegistry.PublisherSuspendedGlobal.selector);
         apps.registerForApp{value: FEE}(APP, TERMS_V1);
         assertEq(apps.statusForApp(APP, PUBLISHER), STATUS_INVITED);
 
@@ -527,10 +529,12 @@ contract AppRegistryTest is Test {
         apps.suspendPublisher(PUBLISHER);
 
         vm.prank(PUBLISHER);
-        vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
+        vm.expectRevert(AppRegistry.PublisherSuspendedGlobal.selector);
         apps.registerForApp(APP, TERMS_V2);
         assertEq(apps.acceptedTerms(APP, PUBLISHER), TERMS_V1);
     }
+
+    // ── publishing ────────────────────────────────────────────────────────────
 
     /// The two registries together: a publisher can commit only once they are added
     /// and joined — and loses it when the owner ejects them, or the admin bans them.
@@ -541,37 +545,140 @@ contract AppRegistryTest is Test {
 
         // Invited is not enough.
         vm.prank(PUBLISHER);
-        vm.expectRevert(DataRegistry.NotRegisteredForApp.selector);
-        data.commitStateRoot(APP, sub, bytes32(0), root);
+        vm.expectRevert(AppRegistry.NotRegisteredForApp.selector);
+        apps.commitStateRoot(APP, sub, bytes32(0), root);
 
         join(PUBLISHER, APP, TERMS_V1, FEE);
         vm.prank(PUBLISHER);
-        data.commitStateRoot(APP, sub, bytes32(0), root);
+        apps.commitStateRoot(APP, sub, bytes32(0), root);
         assertEq(data.getNamespaceHead(APP, PUBLISHER, sub), root);
+        // Written under the sender only.
+        assertEq(data.getNamespaceHead(APP, APP_OWNER, sub), bytes32(0));
 
         vm.prank(APP_OWNER);
         apps.suspendForApp(APP, PUBLISHER);
         vm.prank(PUBLISHER);
-        vm.expectRevert(DataRegistry.NotRegisteredForApp.selector);
-        data.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
+        vm.expectRevert(AppRegistry.PublisherSuspendedApp.selector);
+        apps.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
 
         // A network-wide ban is part of the membership answer, so it stops an owner who
         // claimed the app before being banned, on every commit.
         vm.prank(APP_OWNER);
-        data.commitStateRoot(APP, sub, bytes32(0), root);
+        apps.commitStateRoot(APP, sub, bytes32(0), root);
         vm.prank(ADMIN);
         apps.suspendPublisher(APP_OWNER);
         assertFalse(apps.isRegisteredForApp(APP, APP_OWNER));
         vm.prank(APP_OWNER);
-        vm.expectRevert(DataRegistry.NotRegisteredForApp.selector);
-        data.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
+        vm.expectRevert(AppRegistry.PublisherSuspendedGlobal.selector);
+        apps.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
 
         // Lifting the ban touches nothing else: the timeline resumes from its head.
         vm.prank(ADMIN);
         apps.reinstateGlobal(APP_OWNER);
         vm.prank(APP_OWNER);
-        data.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
+        apps.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
         assertEq(data.getNamespaceHead(APP, APP_OWNER, sub), bytes32(uint256(8)));
+    }
+
+    /// `who` may not commit to `app`, for the reason `err` names, and
+    /// `isRegisteredForApp` agrees.
+    function assertRefused(address who, bytes32 app, bytes4 err) internal {
+        assertFalse(apps.isRegisteredForApp(app, who));
+        vm.prank(who);
+        vm.expectRevert(err);
+        apps.commitStateRoot(app, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+    }
+
+    /// A refused commit says why, so the publisher knows whom to ask: the app owner,
+    /// the protocol admin, or themselves.
+    function test_each_refused_commit_says_why() public {
+        assertRefused(PUBLISHER, GHOST_APP, AppRegistry.AppNotFound.selector);
+        openApp();
+        assertRefused(STRANGER, APP, AppRegistry.NotInvited.selector);
+        assertRefused(PUBLISHER, APP, AppRegistry.NotRegisteredForApp.selector); // invited only
+        join(PUBLISHER, APP, TERMS_V1, FEE);
+        assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
+
+        vm.prank(APP_OWNER);
+        apps.setAppTerms(APP, TERMS_V2, "");
+        assertRefused(PUBLISHER, APP, AppRegistry.TermsMismatch.selector);
+        join(PUBLISHER, APP, TERMS_V2, 0);
+
+        // Each case below differs from a registered publisher in one way only, so each
+        // also checks `isRegisteredForApp` against `commitStateRoot` on its own.
+        vm.prank(APP_OWNER);
+        apps.suspendForApp(APP, PUBLISHER);
+        assertRefused(PUBLISHER, APP, AppRegistry.PublisherSuspendedApp.selector);
+        vm.prank(APP_OWNER);
+        apps.reinstateForApp(APP, PUBLISHER);
+
+        vm.prank(ADMIN);
+        apps.suspendPublisher(PUBLISHER);
+        assertRefused(PUBLISHER, APP, AppRegistry.PublisherSuspendedGlobal.selector);
+        // Banned both ways, the network-wide ban is named first; lifting it leaves the
+        // app's.
+        vm.prank(APP_OWNER);
+        apps.suspendForApp(APP, PUBLISHER);
+        assertRefused(PUBLISHER, APP, AppRegistry.PublisherSuspendedGlobal.selector);
+        vm.prank(ADMIN);
+        apps.reinstateGlobal(PUBLISHER);
+        assertRefused(PUBLISHER, APP, AppRegistry.PublisherSuspendedApp.selector);
+        vm.prank(APP_OWNER);
+        apps.reinstateForApp(APP, PUBLISHER);
+        assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
+
+        vm.prank(ADMIN);
+        apps.suspendApp(APP);
+        assertRefused(PUBLISHER, APP, AppRegistry.AppSuspendedErr.selector);
+        assertRefused(APP_OWNER, APP, AppRegistry.AppSuspendedErr.selector);
+        vm.prank(ADMIN);
+        apps.reinstateApp(APP);
+        assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
+
+        // An app claimed with no terms: even its owner cannot publish until it has some.
+        vm.prank(STRANGER);
+        apps.registerApp(OTHER_APP, bytes32(0), "", 0);
+        assertRefused(STRANGER, OTHER_APP, AppRegistry.TermsNotSet.selector);
+
+        // A status no function sets reads as not joined.
+        vm.prank(ADMIN);
+        apps.seedPublisherForApp(APP, STRANGER, 7, TERMS_V2);
+        assertRefused(STRANGER, APP, AppRegistry.NotRegisteredForApp.selector);
+    }
+
+    /// The DataRegistry takes commits from the AppRegistry only, so its checks cannot be
+    /// skipped, even by a publisher who would pass them.
+    function test_the_data_registry_cannot_be_called_directly() public {
+        openApp();
+        join(PUBLISHER, APP, TERMS_V1, FEE);
+        vm.prank(PUBLISHER);
+        vm.expectRevert(DataRegistry.Unauthorized.selector);
+        data.commitStateRoot(APP, PUBLISHER, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+    }
+
+    /// The compare-and-swap is the DataRegistry's, and its refusal reaches the caller
+    /// as an error in the AppRegistry's ABI.
+    function test_a_stale_root_is_refused_through_the_app_registry() public {
+        openApp();
+        vm.prank(APP_OWNER);
+        vm.expectRevert(AppRegistry.StaleStateRoot.selector);
+        apps.commitStateRoot(APP, keccak256("docs"), bytes32(uint256(1)), bytes32(uint256(7)));
+    }
+
+    /// Only the admin points commits at a DataRegistry. Until one is set, nobody can
+    /// commit, member or not.
+    function test_commits_need_a_data_registry() public {
+        vm.prank(STRANGER);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.setDataRegistry(STRANGER);
+
+        openApp();
+        vm.prank(ADMIN);
+        apps.setDataRegistry(address(0));
+        assertEq(apps.dataRegistry(), address(0));
+        vm.prank(APP_OWNER);
+        vm.expectRevert();
+        apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
     }
 
     // ── migration ─────────────────────────────────────────────────────────────
@@ -646,7 +753,7 @@ contract AppRegistryTest is Test {
 
         // Restored without paying the join fee, and able to publish.
         vm.prank(PUBLISHER);
-        data.commitStateRoot(APP, sub, bytes32(0), root);
+        apps.commitStateRoot(APP, sub, bytes32(0), root);
         assertEq(data.getNamespaceHead(APP, PUBLISHER, sub), root);
     }
 
@@ -669,6 +776,7 @@ contract AppRegistryTest is Test {
 
         assertEq(AppRegistryUpgradeMock(address(apps)).version(), 2);
         assertEq(apps.admin(), ADMIN);
+        assertEq(apps.dataRegistry(), address(data));
         assertEq(apps.getAppOwner(APP), APP_OWNER);
         assertEq(apps.appTerms(APP), TERMS_V1);
         assertEq(apps.appTermsUri(APP), "https://tabs.example/terms");
@@ -676,9 +784,9 @@ contract AppRegistryTest is Test {
         assertEq(apps.subscribedAt(APP), paidAt);
         assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
 
-        // Still the contract the DataRegistry asks, and still writable.
+        // Still the contract the DataRegistry takes commits from.
         vm.prank(PUBLISHER);
-        data.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+        apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
         vm.prank(APP_OWNER);
         apps.renewApp(APP);
     }

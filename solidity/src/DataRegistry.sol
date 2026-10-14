@@ -11,10 +11,11 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeab
 /// Namespaces are hierarchical: `app_id:publisher:subspace_id`,
 /// flattened on-chain using keccak256(app_id ‖ publisher ‖ subspace_id).
 ///
-/// Who may publish is the AppRegistry's to say. There is no publisher registration: a
-/// wallet publishes once it belongs to an app, which `commitStateRoot` asks the
-/// AppRegistry on every commit. The answer is no for a wallet the protocol admin has
-/// banned network-wide, which is kept there too.
+/// Only the AppRegistry writes here. Publishers commit through it
+/// (`AppRegistry.commitStateRoot`), which checks that the sender may publish under the
+/// app and forwards the commit with the sender's address. This contract trusts that
+/// address and refuses a commit from anyone else, so who may publish is decided in one
+/// place.
 ///
 /// Deployed behind an ERC-1967 proxy (UUPS): the proxy holds the state and the address,
 /// and the admin can point it at a new implementation. Storage is therefore
@@ -25,7 +26,6 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeab
 contract DataRegistry is Initializable, UUPSUpgradeable {
     error Unauthorized();
     error StaleStateRoot();
-    error NotRegisteredForApp();
 
     event AdminChanged(address previousAdmin, address newAdmin);
     event StateCommitted(
@@ -39,7 +39,7 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
 
     /// Protocol admin: upgrades, and repoints the AppRegistry
     address public admin;
-    /// The AppRegistry consulted for per-app publisher membership
+    /// The AppRegistry: the only address that may commit
     address public appRegistry;
 
     /// keccak256(app_id ‖ publisher ‖ subspace_id) => latest valid root
@@ -59,21 +59,22 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
         appRegistry = appRegistry_;
     }
 
-    /// The only graph-mutating route.
+    /// The only graph-mutating route, and only for the AppRegistry, which has already
+    /// checked that `publisher` may publish under `app_id`.
     ///
     /// Enforces linear timeline execution (compare-and-swap) over
-    /// `app_id:sender:subspace_id`.
-    function commitStateRoot(bytes32 app_id, bytes32 subspace_id, bytes32 old_root, bytes32 new_root) external {
-        // fail if not an active publisher in the app registry for the given app (which
-        // includes not being banned network-wide)
-        if (!_isRegisteredForApp(app_id, msg.sender)) revert NotRegisteredForApp();
+    /// `app_id:publisher:subspace_id`.
+    function commitStateRoot(bytes32 app_id, address publisher, bytes32 subspace_id, bytes32 old_root, bytes32 new_root)
+        external
+    {
+        if (msg.sender != appRegistry) revert Unauthorized();
 
         // validate linear sequence progress for this subspace only
-        bytes32 key = _namespaceKey(app_id, msg.sender, subspace_id);
+        bytes32 key = _namespaceKey(app_id, publisher, subspace_id);
         if (namespaceHeads[key] != old_root) revert StaleStateRoot();
 
         namespaceHeads[key] = new_root;
-        emit StateCommitted(key, app_id, msg.sender, subspace_id, old_root, new_root);
+        emit StateCommitted(key, app_id, publisher, subspace_id, old_root, new_root);
     }
 
     /// Get the latest head for a specific publisher's subspace within an application
@@ -81,6 +82,7 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
         return namespaceHeads[_namespaceKey(app_id, publisher, subspace_id)];
     }
 
+    /// Repoint the one writer. Until it is set, nobody can commit.
     function setAppRegistry(address registry) external onlyAdmin {
         appRegistry = registry;
     }
@@ -115,14 +117,5 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
     /// keccak256(app_id ‖ publisher ‖ subspace_id)
     function _namespaceKey(bytes32 app_id, address publisher, bytes32 subspace_id) private pure returns (bytes32) {
         return keccak256(abi.encodePacked(app_id, publisher, subspace_id));
-    }
-
-    /// Cross-contract check: is `publisher` an active publisher of `app_id`? Anything
-    /// but a clean `true` — a revert, no contract at the address, a malformed return —
-    /// counts as no. A plain interface call would revert on the last two instead.
-    function _isRegisteredForApp(bytes32 app_id, address publisher) private view returns (bool) {
-        (bool ok, bytes memory ret) =
-            appRegistry.staticcall(abi.encodeWithSignature("isRegisteredForApp(bytes32,address)", app_id, publisher));
-        return ok && ret.length == 32 && abi.decode(ret, (uint256)) == 1;
     }
 }

@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
-import {MockAppRegistry, Reverter, Proxied} from "./Mocks.sol";
+import {Proxied} from "./Mocks.sol";
 
 /// What an upgrade installs: the same contract, plus one function to tell it by.
 contract DataRegistryUpgradeMock is DataRegistry {
@@ -13,11 +13,12 @@ contract DataRegistryUpgradeMock is DataRegistry {
     }
 }
 
-/// The DataRegistry against a mock AppRegistry, including one that is missing or
-/// misbehaving.
+/// The DataRegistry on its own. WRITER stands in for the AppRegistry, the one address
+/// that may commit; who may publish is the AppRegistry's check, tested with it.
 contract DataRegistryTest is Test {
     address constant ADMIN = 0x1111111111111111111111111111111111111111;
     address constant PUB = 0x2222222222222222222222222222222222222222;
+    address constant WRITER = 0x3333333333333333333333333333333333333333;
     bytes32 constant APP = bytes32(uint256(1));
     bytes32 constant SUB_A = bytes32(uint256(2));
     bytes32 constant SUB_B = bytes32(uint256(3));
@@ -34,25 +35,58 @@ contract DataRegistryTest is Test {
     );
 
     DataRegistry registry;
-    MockAppRegistry apps;
 
-    /// An app with PUB joined. PUB has never called the DataRegistry.
     function setUp() public {
-        apps = new MockAppRegistry();
-        registry = Proxied.dataRegistry(ADMIN, address(apps));
-        apps.setMember(APP, PUB, true);
+        registry = Proxied.dataRegistry(ADMIN, WRITER);
+    }
+
+    /// A commit for PUB, as the AppRegistry forwards it.
+    function commit(bytes32 subspace, bytes32 oldRoot, bytes32 newRoot) internal {
+        vm.prank(WRITER);
+        registry.commitStateRoot(APP, PUB, subspace, oldRoot, newRoot);
     }
 
     function test_initialization() public view {
         assertEq(registry.admin(), ADMIN);
-        assertEq(registry.appRegistry(), address(apps));
+        assertEq(registry.appRegistry(), WRITER);
     }
 
-    /// App membership is all it takes: there is nothing to register for first.
-    function test_an_app_member_commits_without_registering() public {
-        vm.prank(PUB);
-        registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
+    /// Nobody but the AppRegistry commits: not the publisher, not the admin.
+    function test_only_the_app_registry_commits() public {
+        address[2] memory others = [PUB, ADMIN];
+        for (uint256 i = 0; i < others.length; i++) {
+            vm.prank(others[i]);
+            vm.expectRevert(DataRegistry.Unauthorized.selector);
+            registry.commitStateRoot(APP, PUB, SUB_A, bytes32(0), ROOT_A);
+        }
+        assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), bytes32(0));
+
+        commit(SUB_A, bytes32(0), ROOT_A);
         assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), ROOT_A);
+    }
+
+    /// Repointing moves the right to commit, and only the admin can do it.
+    function test_repointing_moves_the_right_to_commit() public {
+        address next = makeAddr("next");
+        vm.prank(PUB);
+        vm.expectRevert(DataRegistry.Unauthorized.selector);
+        registry.setAppRegistry(PUB);
+
+        vm.prank(ADMIN);
+        registry.setAppRegistry(next);
+        assertEq(registry.appRegistry(), next);
+        vm.prank(WRITER);
+        vm.expectRevert(DataRegistry.Unauthorized.selector);
+        registry.commitStateRoot(APP, PUB, SUB_A, bytes32(0), ROOT_A);
+        vm.prank(next);
+        registry.commitStateRoot(APP, PUB, SUB_A, bytes32(0), ROOT_A);
+
+        // Unset, it belongs to nobody: no transaction comes from the zero address.
+        vm.prank(ADMIN);
+        registry.setAppRegistry(address(0));
+        vm.prank(next);
+        vm.expectRevert(DataRegistry.Unauthorized.selector);
+        registry.commitStateRoot(APP, PUB, SUB_A, ROOT_A, ROOT_B);
     }
 
     /// Golden fixture shared with the SDK (`namespace-key.test.ts`). The client derives
@@ -63,7 +97,6 @@ contract DataRegistryTest is Test {
         bytes32 subspaceId = keccak256("docs");
         assertEq(appId, 0xe9cb5c7e3e8fb962393e314a9387731152c9b2e3cfb1fcbfe79c0c3038b2ed37);
         assertEq(subspaceId, 0x6bf9054545420e9e9f4aa4f353a32c7d0d52c11dbcdda56c53be8375cafeebb1);
-        apps.setMember(appId, PUB, true);
 
         vm.expectEmit(true, true, true, true, address(registry));
         emit StateCommitted(
@@ -74,41 +107,8 @@ contract DataRegistryTest is Test {
             bytes32(0),
             ROOT_A
         );
-        vm.prank(PUB);
-        registry.commitStateRoot(appId, subspaceId, bytes32(0), ROOT_A);
-    }
-
-    /// A wallet that never joined the app must not be able to write under it. An app
-    /// nobody claimed is an app nobody joined: same branch.
-    function test_publisher_not_registered_for_app_is_rejected() public {
-        apps.setMember(APP, PUB, false);
-        vm.prank(PUB);
-        vm.expectRevert(DataRegistry.NotRegisteredForApp.selector);
-        registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
-    }
-
-    /// Anything but a clean `true` from the AppRegistry is a no: no contract at the
-    /// address, a registry that reverts, and an unset registry all refuse the commit
-    /// rather than reverting some other way or letting it through.
-    function test_a_missing_or_broken_app_registry_fails_closed() public {
-        address[3] memory broken = [address(0), makeAddr("no-code"), address(new Reverter())];
-        for (uint256 i = 0; i < broken.length; i++) {
-            vm.prank(ADMIN);
-            registry.setAppRegistry(broken[i]);
-            vm.prank(PUB);
-            vm.expectRevert(DataRegistry.NotRegisteredForApp.selector);
-            registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
-        }
-    }
-
-    function test_only_the_admin_repoints_the_app_registry() public {
-        vm.prank(PUB);
-        vm.expectRevert(DataRegistry.Unauthorized.selector);
-        registry.setAppRegistry(PUB);
-
-        vm.prank(ADMIN);
-        registry.setAppRegistry(PUB);
-        assertEq(registry.appRegistry(), PUB);
+        vm.prank(WRITER);
+        registry.commitStateRoot(appId, PUB, subspaceId, bytes32(0), ROOT_A);
     }
 
     /// A missing head can be restored once; a live one can never be rewritten.
@@ -129,22 +129,26 @@ contract DataRegistryTest is Test {
         vm.stopPrank();
     }
 
-    function test_subspaces_have_isolated_timelines() public {
-        vm.startPrank(PUB);
-        registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
+    /// Each publisher and each subspace has its own timeline.
+    function test_timelines_are_isolated() public {
+        commit(SUB_A, bytes32(0), ROOT_A);
         // SUB_B is untouched and still starts from zero
         assertEq(registry.getNamespaceHead(APP, PUB, SUB_B), bytes32(0));
-
-        registry.commitStateRoot(APP, SUB_B, bytes32(0), ROOT_B);
-        vm.stopPrank();
+        commit(SUB_B, bytes32(0), ROOT_B);
         assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), ROOT_A);
         assertEq(registry.getNamespaceHead(APP, PUB, SUB_B), ROOT_B);
+
+        // The same app and subspace under another publisher is another timeline.
+        assertEq(registry.getNamespaceHead(APP, ADMIN, SUB_A), bytes32(0));
+        vm.prank(WRITER);
+        registry.commitStateRoot(APP, ADMIN, SUB_A, bytes32(0), ROOT_B);
+        assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), ROOT_A);
     }
 
     function test_stale_state_root_is_rejected() public {
-        vm.prank(PUB);
+        vm.prank(WRITER);
         vm.expectRevert(DataRegistry.StaleStateRoot.selector);
-        registry.commitStateRoot(APP, SUB_A, ROOT_A, ROOT_B);
+        registry.commitStateRoot(APP, PUB, SUB_A, ROOT_A, ROOT_B);
     }
 
     // ── upgrades ──────────────────────────────────────────────────────────────
@@ -152,8 +156,7 @@ contract DataRegistryTest is Test {
     /// A new implementation takes over the same address and the same state — every
     /// namespace head — and only the admin can install one.
     function test_an_upgrade_keeps_state_and_only_the_admin_can_do_it() public {
-        vm.prank(PUB);
-        registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
+        commit(SUB_A, bytes32(0), ROOT_A);
         address v2 = address(new DataRegistryUpgradeMock());
 
         vm.prank(PUB);
@@ -165,12 +168,11 @@ contract DataRegistryTest is Test {
 
         assertEq(DataRegistryUpgradeMock(address(registry)).version(), 2);
         assertEq(registry.admin(), ADMIN);
-        assertEq(registry.appRegistry(), address(apps));
+        assertEq(registry.appRegistry(), WRITER);
         assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), ROOT_A);
 
         // The timeline continues from where it was.
-        vm.prank(PUB);
-        registry.commitStateRoot(APP, SUB_A, ROOT_A, ROOT_B);
+        commit(SUB_A, ROOT_A, ROOT_B);
         assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), ROOT_B);
     }
 
@@ -178,11 +180,11 @@ contract DataRegistryTest is Test {
     /// on the bare implementation, which nobody should be able to take over.
     function test_initialize_runs_once_and_never_on_the_implementation() public {
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        registry.initialize(PUB, address(apps));
+        registry.initialize(PUB, WRITER);
 
         DataRegistry implementation = new DataRegistry();
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        implementation.initialize(PUB, address(apps));
+        implementation.initialize(PUB, WRITER);
     }
 
     /// The admin role moves, and the right to upgrade moves with it.
