@@ -97,18 +97,6 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
     /// Only the admin may point the proxy at a new implementation.
     function _authorizeUpgrade(address) internal override onlyAdmin {}
 
-    /// Restore one namespace head after a redeploy. Fill-only: it refuses a slot that
-    /// already holds a root, so it cannot rewrite a live timeline.
-    function seedNamespaceHead(bytes32 app_id, address publisher, bytes32 subspace_id, bytes32 root)
-        external
-        onlyAdmin
-    {
-        bytes32 key = _namespaceKey(app_id, publisher, subspace_id);
-        if (namespaceHeads[key] != bytes32(0)) revert StaleStateRoot();
-        namespaceHeads[key] = root;
-        emit StateCommitted(key, app_id, publisher, subspace_id, bytes32(0), root);
-    }
-
     modifier onlyAdmin() {
         if (msg.sender != admin) revert Unauthorized();
         _;

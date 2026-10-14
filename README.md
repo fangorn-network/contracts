@@ -15,7 +15,7 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
      │ addPublisher(pub)           │  │  app → owner, terms, join fee
      │ renewApp()                  │  │  app → subscribedAt (the subscription)
      ▼                             │  │  (app, publisher) → status
-  Admin ── suspendPublisher() ─────┘  │  wallet → suspended (network-wide ban)
+  Admin ── suspendPublisher() ─────┘  │  wallet → globalSuspensions (network-wide ban)
   (network-wide ban)                  │
                                       │ commitStateRoot(app, publisher, subspace, old, new)
                                       │  forwarded once the publisher is checked
@@ -85,10 +85,10 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
 - `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`), stamps `subscribedAt(app_id)` as now, and makes the claimer the app's first publisher. `fee` is the app's own join fee, in wei. The claimer must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
 - `renewApp(app_id)` — owner-only. Pays the fee again and re-stamps `now`.
 - `addPublisher(app_id, publisher)` — owner-only. An **invitation**: status goes `0 → 3`. Nobody can join an app uninvited. The publisher must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
-- `registerForApp(app_id, terms_hash)` — payable, called by the invited publisher. Accepts the exact current terms hash and pays the join fee (forwarded to the app owner). Reverts `NotInvited` for a wallet the owner never added, `PublisherSuspendedApp` for one suspended from the app, and `PublisherSuspendedGlobal` for one banned network-wide. Re-accepting after a terms change is free.
+- `registerForApp(app_id, terms_hash)` — payable, called by the invited publisher. Accepts the exact current terms hash and pays exactly the join fee (forwarded to the app owner; any other amount reverts `JoinFeeMismatch`). Reverts `NotInvited` for a wallet the owner never added, `PublisherSuspendedApp` for one suspended from the app, and `PublisherSuspendedGlobal` for one banned network-wide. Re-accepting after a terms change is free, and must send nothing.
 - `setAppTerms`, `setAppFee`, `setAppAgentUri` — owner-only. Changing the terms unregisters every publisher until they re-accept; the agent card carries no hash, so moving it does not.
-- `suspendForApp` / `reinstateForApp` — owner-only, one publisher in one app. Suspending an invited publisher is how an invitation is taken back.
-- `suspendApp` / `reinstateApp` — admin-only takedown of a whole app.
+- `suspendForApp` / `reinstateForApp` — owner-only, one publisher in one app. Suspending an invited publisher is how an invitation is taken back; reinstating them makes them invited again, not a member. `suspendForApp` reverts `NotInvited` for a wallet the app does not know, and `reinstateForApp` reverts `PublisherNotSuspended` for one who is not suspended.
+- `setAppSuspended(app_id, bool)` — admin-only takedown of a whole app, and its undoing. Memberships are left intact.
 - `suspendPublisher(wallet)` / `reinstateGlobal(wallet)` — admin-only network-wide ban of any address, including one that has never published. They emit `PublisherSuspended` and `PublisherReinstated`, and touch nothing else, so lifting a ban restores everything as it was, namespace heads in the DataRegistry included.
 - `commitStateRoot(app_id, subspace_id, old_root, new_root)` — the only way to publish. Unless the sender `isRegisteredForApp`, it reverts with the first reason that applies:
 
@@ -96,7 +96,7 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
   |---|---|
   | `AppNotFound` | names an app nobody has claimed |
   | `PublisherSuspendedGlobal` | is banned network-wide by the protocol admin |
-  | `AppSuspendedErr` | names an app the protocol admin has taken down |
+  | `AppSuspended` | names an app the protocol admin has taken down |
   | `PublisherSuspendedApp` | is suspended from this app by its owner |
   | `NotInvited` | was never added to the app |
   | `NotRegisteredForApp` | was added but has not joined (`registerForApp`) |
@@ -105,13 +105,12 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
 
   Otherwise it forwards the commit to the DataRegistry, which compare-and-swaps the head of `app_id:sender:subspace_id` (`StaleStateRoot` if `old_root` is not it) and emits `StateCommitted`. A lapsed subscription does not stop it: the Worker enforces that.
 - `access(app_id, publisher) → (bool registered, address owner, uint64 paidAt)` — the upload gate's single read. `registered` is `isRegisteredForApp`.
-- Views: `isRegisteredForApp`, `statusForApp`, `joinInfo`, `getAppOwner`, `subscribedAt`, `subscriptionFee`, `usdc`, `dataRegistry`, `suspended`, `appTerms`, `appTermsUri`, `appAgentUri`, `appFee`, `acceptedTerms`, `isAppSuspended`, `admin`.
-- Admin: `setSubscriptionFee`, `setUsdc`, `setDataRegistry`, `withdrawUsdc`, `withdrawEth`.
-- Admin, used once to carry state over from the previous contracts: `seedApp(app_id, owner, terms_hash, terms_uri, fee, agent_uri)` recreates an app for its owner, pulls **no** subscription fee and stamps it as paid now (a testnet shortcut); `seedPublisherForApp(app_id, publisher, status, accepted_terms)` restores one membership verbatim. Both are fill-only: they refuse an app that is already claimed, or a publisher the app already knows.
+- Views: `isRegisteredForApp`, `statusForApp`, `joinInfo`, `getAppOwner`, `subscribedAt`, `subscriptionFee`, `usdc`, `dataRegistry`, `globalSuspensions`, `appTerms`, `appTermsUri`, `appAgentUri`, `appFee`, `acceptedTerms`, `isAppSuspended`, `admin`.
+- Admin: `setSubscriptionFee`, `setDataRegistry`, `withdrawUsdc`. The fee token is fixed at `initialize`; the contract never holds ETH, since join fees go straight to the app owner.
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
 - `initialize(admin, usdc, subscription_fee)`.
 
-**Global bans.** A wallet the protocol admin has banned can neither claim an app, be added to one, nor accept an invitation. There is nothing else to pass: no wallet registers anywhere first. A wallet banned later reads as not registered in every app (`isRegisteredForApp`), so it cannot commit (`PublisherSuspendedGlobal`) or upload (the Worker refuses). An *owner* banned later keeps the app, and its other publishers keep publishing. The app can be taken down with `suspendApp`.
+**Global bans.** A wallet the protocol admin has banned can neither claim an app, be added to one, nor accept an invitation. There is nothing else to pass: no wallet registers anywhere first. A wallet banned later reads as not registered in every app (`isRegisteredForApp`), so it cannot commit (`PublisherSuspendedGlobal`) or upload (the Worker refuses). An *owner* banned later keeps the app, and its other publishers keep publishing. The app can be taken down with `setAppSuspended`.
 
 Per-app status codes: `0` unregistered, `1` active, `2` suspended, `3` invited. `isRegisteredForApp` is true only for an active publisher on the app's current terms hash, in an app that is not suspended, and who is not banned network-wide.
 
@@ -125,7 +124,7 @@ State: `admin`, `appRegistry`, `namespaceHeads` (`keccak256(app_id ‖ publisher
 
 - `commitStateRoot(app_id, publisher, subspace_id, old_root, new_root)` — the only graph-mutating route, callable by the AppRegistry only (`Unauthorized` otherwise), which has checked that `publisher` may publish under `app_id`. Publishers call `AppRegistry.commitStateRoot`. It compare-and-swaps (CAS) the head which enforces a linear timeline. Emits `StateCommitted` the SDK's light-client watches.
 - Views: `getNamespaceHead`, `appRegistry`, `admin`.
-- Admin: `setAppRegistry` (the one address that may commit; until it is set, nobody can), `seedNamespaceHead` (fill-only; replays heads after a redeploy).
+- Admin: `setAppRegistry` (the one address that may commit; until it is set, nobody can).
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
 - `initialize(admin, app_registry)`.
 

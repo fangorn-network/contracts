@@ -111,24 +111,6 @@ contract DataRegistryTest is Test {
         registry.commitStateRoot(appId, PUB, subspaceId, bytes32(0), ROOT_A);
     }
 
-    /// A missing head can be restored once; a live one can never be rewritten.
-    function test_seed_namespace_head_is_fill_only() public {
-        bytes32 root = bytes32(uint256(9));
-
-        vm.prank(PUB);
-        vm.expectRevert(DataRegistry.Unauthorized.selector);
-        registry.seedNamespaceHead(APP, PUB, SUB_A, root);
-
-        vm.startPrank(ADMIN);
-        registry.seedNamespaceHead(APP, PUB, SUB_A, root);
-        assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), root);
-
-        // Overwriting a live timeline would be a backdoor, not a migration.
-        vm.expectRevert(DataRegistry.StaleStateRoot.selector);
-        registry.seedNamespaceHead(APP, PUB, SUB_A, bytes32(uint256(8)));
-        vm.stopPrank();
-    }
-
     /// Each publisher and each subspace has its own timeline.
     function test_timelines_are_isolated() public {
         commit(SUB_A, bytes32(0), ROOT_A);

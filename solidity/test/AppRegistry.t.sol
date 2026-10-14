@@ -160,15 +160,15 @@ contract AppRegistryTest is Test {
         // The app owner has no say over their own takedown, and a stranger even less.
         vm.prank(APP_OWNER);
         vm.expectRevert(AppRegistry.Unauthorized.selector);
-        apps.suspendApp(APP);
+        apps.setAppSuspended(APP, true);
         vm.prank(STRANGER);
         vm.expectRevert(AppRegistry.Unauthorized.selector);
-        apps.suspendApp(APP);
+        apps.setAppSuspended(APP, true);
 
         vm.startPrank(ADMIN);
         vm.expectRevert(AppRegistry.AppNotFound.selector);
-        apps.suspendApp(GHOST_APP);
-        apps.suspendApp(APP);
+        apps.setAppSuspended(GHOST_APP, true);
+        apps.setAppSuspended(APP, true);
         vm.stopPrank();
         assertTrue(apps.isAppSuspended(APP));
 
@@ -181,13 +181,13 @@ contract AppRegistryTest is Test {
         vm.prank(APP_OWNER);
         apps.addPublisher(APP, STRANGER);
         vm.prank(STRANGER);
-        vm.expectRevert(AppRegistry.AppSuspendedErr.selector);
+        vm.expectRevert(AppRegistry.AppSuspended.selector);
         apps.registerForApp{value: FEE}(APP, TERMS_V1);
         assertEq(apps.statusForApp(APP, PUBLISHER), STATUS_ACTIVE);
 
         // Reinstating restores the memberships exactly as they were.
         vm.prank(ADMIN);
-        apps.reinstateApp(APP);
+        apps.setAppSuspended(APP, false);
         assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
         assertTrue(apps.isRegisteredForApp(APP, APP_OWNER));
     }
@@ -253,15 +253,28 @@ contract AppRegistryTest is Test {
     function test_the_fee_is_required_and_goes_to_the_app_owner() public {
         openApp();
 
-        vm.prank(PUBLISHER);
-        vm.expectRevert(AppRegistry.JoinFeeRequired.selector);
-        apps.registerForApp{value: FEE - 1}(APP, TERMS_V1);
+        // Exactly the fee: less is refused, and so is more, which would otherwise reach
+        // the owner unrecorded.
+        uint256[2] memory wrong = [FEE - 1, FEE + 1];
+        for (uint256 i = 0; i < wrong.length; i++) {
+            vm.prank(PUBLISHER);
+            vm.expectRevert(AppRegistry.JoinFeeMismatch.selector);
+            apps.registerForApp{value: wrong[i]}(APP, TERMS_V1);
+        }
 
         uint256 ownerBefore = APP_OWNER.balance;
         join(PUBLISHER, APP, TERMS_V1, FEE);
         assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
         assertEq(APP_OWNER.balance, ownerBefore + FEE, "the join fee did not reach the app owner");
         assertEq(address(apps).balance, 0, "the registry kept the join fee");
+
+        // Accepting new terms is free, and only free.
+        vm.prank(APP_OWNER);
+        apps.setAppTerms(APP, TERMS_V2, "");
+        vm.prank(PUBLISHER);
+        vm.expectRevert(AppRegistry.JoinFeeMismatch.selector);
+        apps.registerForApp{value: FEE}(APP, TERMS_V2);
+        join(PUBLISHER, APP, TERMS_V2, 0);
     }
 
     function test_an_undeliverable_join_fee_aborts_the_registration() public {
@@ -331,10 +344,33 @@ contract AppRegistryTest is Test {
         apps.registerForApp{value: FEE}(APP, TERMS_V1);
 
         vm.startPrank(APP_OWNER);
-        vm.expectRevert(AppRegistry.NotRegistered.selector);
+        // Only someone in the app can be suspended, and only someone suspended reinstated.
+        vm.expectRevert(AppRegistry.NotInvited.selector);
+        apps.suspendForApp(APP, STRANGER);
+        vm.expectRevert(AppRegistry.PublisherNotSuspended.selector);
         apps.reinstateForApp(APP, STRANGER);
+        vm.expectRevert(AppRegistry.PublisherNotSuspended.selector);
+        apps.reinstateForApp(OTHER_APP, PUBLISHER);
         apps.reinstateForApp(APP, PUBLISHER);
         vm.stopPrank();
+        assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
+    }
+
+    /// An invitation taken back before it was accepted comes back as an invitation:
+    /// reinstating does not make a member of someone who never joined or paid.
+    function test_a_reinstated_invitation_is_still_only_an_invitation() public {
+        openApp();
+        vm.startPrank(APP_OWNER);
+        apps.suspendForApp(APP, PUBLISHER);
+        apps.reinstateForApp(APP, PUBLISHER);
+        vm.stopPrank();
+        assertEq(apps.statusForApp(APP, PUBLISHER), STATUS_INVITED);
+        assertRefused(PUBLISHER, APP, AppRegistry.NotRegisteredForApp.selector);
+
+        vm.prank(PUBLISHER);
+        vm.expectRevert(AppRegistry.JoinFeeMismatch.selector);
+        apps.registerForApp(APP, TERMS_V1);
+        join(PUBLISHER, APP, TERMS_V1, FEE);
         assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
     }
 
@@ -455,14 +491,14 @@ contract AppRegistryTest is Test {
         vm.prank(STRANGER);
         vm.expectRevert(AppRegistry.Unauthorized.selector);
         apps.suspendPublisher(STRANGER);
-        assertFalse(apps.suspended(STRANGER));
+        assertFalse(apps.globalSuspensions(STRANGER));
 
         vm.expectEmit(true, true, true, true, address(apps));
         emit AppRegistry.PublisherSuspended(STRANGER);
         vm.prank(ADMIN);
         apps.suspendPublisher(STRANGER);
-        assertTrue(apps.suspended(STRANGER));
-        assertFalse(apps.suspended(PUBLISHER), "one wallet's ban leaked into another");
+        assertTrue(apps.globalSuspensions(STRANGER));
+        assertFalse(apps.globalSuspensions(PUBLISHER), "one wallet's ban leaked into another");
 
         // A banned wallet cannot lift its own ban.
         vm.prank(STRANGER);
@@ -473,7 +509,7 @@ contract AppRegistryTest is Test {
         emit AppRegistry.PublisherReinstated(STRANGER);
         vm.prank(ADMIN);
         apps.reinstateGlobal(STRANGER);
-        assertFalse(apps.suspended(STRANGER));
+        assertFalse(apps.globalSuspensions(STRANGER));
     }
 
     /// The reason the check exists: a wallet the protocol admin banned network-wide
@@ -628,22 +664,17 @@ contract AppRegistryTest is Test {
         assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
 
         vm.prank(ADMIN);
-        apps.suspendApp(APP);
-        assertRefused(PUBLISHER, APP, AppRegistry.AppSuspendedErr.selector);
-        assertRefused(APP_OWNER, APP, AppRegistry.AppSuspendedErr.selector);
+        apps.setAppSuspended(APP, true);
+        assertRefused(PUBLISHER, APP, AppRegistry.AppSuspended.selector);
+        assertRefused(APP_OWNER, APP, AppRegistry.AppSuspended.selector);
         vm.prank(ADMIN);
-        apps.reinstateApp(APP);
+        apps.setAppSuspended(APP, false);
         assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
 
         // An app claimed with no terms: even its owner cannot publish until it has some.
         vm.prank(STRANGER);
         apps.registerApp(OTHER_APP, bytes32(0), "", 0);
         assertRefused(STRANGER, OTHER_APP, AppRegistry.TermsNotSet.selector);
-
-        // A status no function sets reads as not joined.
-        vm.prank(ADMIN);
-        apps.seedPublisherForApp(APP, STRANGER, 7, TERMS_V2);
-        assertRefused(STRANGER, APP, AppRegistry.NotRegisteredForApp.selector);
     }
 
     /// The DataRegistry takes commits from the AppRegistry only, so its checks cannot be
@@ -679,82 +710,6 @@ contract AppRegistryTest is Test {
         vm.prank(APP_OWNER);
         vm.expectRevert();
         apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
-    }
-
-    // ── migration ─────────────────────────────────────────────────────────────
-
-    /// The admin recreates an app for its owner: no fee is pulled, and it is stamped
-    /// as paid now.
-    function test_a_seeded_app_is_paid_up_without_paying() public {
-        vm.prank(ADMIN);
-        apps.setSubscriptionFee(SUB_FEE);
-        // The token would refuse: seeding must not call it.
-        usdc.setMode(MockUSDC.Mode.Revert);
-
-        vm.prank(APP_OWNER);
-        vm.expectRevert(AppRegistry.Unauthorized.selector);
-        apps.seedApp(APP, APP_OWNER, TERMS_V1, "https://tabs.example/terms", FEE, "ipfs://card");
-
-        vm.warp(1_700_000_000);
-        vm.startPrank(ADMIN);
-        vm.expectRevert(AppRegistry.AppNotFound.selector);
-        apps.seedApp(APP, address(0), TERMS_V1, "", 0, "");
-        apps.seedApp(APP, APP_OWNER, TERMS_V1, "https://tabs.example/terms", FEE, "ipfs://card");
-        assertEq(usdc.calls(), 0);
-
-        (bool registered, address owner, uint64 paidAt) = apps.access(APP, APP_OWNER);
-        assertTrue(registered);
-        assertEq(owner, APP_OWNER);
-        assertEq(paidAt, 1_700_000_000);
-        assertEq(apps.appTermsUri(APP), "https://tabs.example/terms");
-        assertEq(apps.appFee(APP), FEE);
-        assertEq(apps.appAgentUri(APP), "ipfs://card");
-
-        // A claimed app is never rewritten, whoever claimed it.
-        vm.expectRevert(AppRegistry.AppAlreadyRegistered.selector);
-        apps.seedApp(APP, STRANGER, TERMS_V2, "", 0, "");
-        vm.stopPrank();
-        assertEq(apps.getAppOwner(APP), APP_OWNER);
-
-        // The owner really owns it.
-        vm.prank(APP_OWNER);
-        apps.setAppFee(APP, 0);
-    }
-
-    /// A membership is restored verbatim, once, and only into an app that exists.
-    function test_a_seeded_membership_is_restored_verbatim() public {
-        bytes32 sub = keccak256("docs");
-        bytes32 root = bytes32(uint256(7));
-
-        vm.startPrank(ADMIN);
-        vm.expectRevert(AppRegistry.AppNotFound.selector);
-        apps.seedPublisherForApp(GHOST_APP, PUBLISHER, STATUS_ACTIVE, TERMS_V1);
-        apps.seedApp(APP, APP_OWNER, TERMS_V2, "", FEE, "");
-        vm.stopPrank();
-
-        vm.prank(APP_OWNER);
-        vm.expectRevert(AppRegistry.Unauthorized.selector);
-        apps.seedPublisherForApp(APP, PUBLISHER, STATUS_ACTIVE, TERMS_V2);
-
-        vm.startPrank(ADMIN);
-        apps.seedPublisherForApp(APP, PUBLISHER, STATUS_ACTIVE, TERMS_V2);
-        // Someone who accepted older terms stays on them, and so stays unregistered.
-        apps.seedPublisherForApp(APP, STRANGER, STATUS_ACTIVE, TERMS_V1);
-        vm.expectRevert(AppRegistry.AlreadyRegistered.selector);
-        apps.seedPublisherForApp(APP, PUBLISHER, STATUS_INVITED, TERMS_V2);
-        // The owner is already a member of their own app.
-        vm.expectRevert(AppRegistry.AlreadyRegistered.selector);
-        apps.seedPublisherForApp(APP, APP_OWNER, STATUS_INVITED, bytes32(0));
-        vm.stopPrank();
-
-        assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
-        assertFalse(apps.isRegisteredForApp(APP, STRANGER));
-        assertEq(apps.acceptedTerms(APP, STRANGER), TERMS_V1);
-
-        // Restored without paying the join fee, and able to publish.
-        vm.prank(PUBLISHER);
-        apps.commitStateRoot(APP, sub, bytes32(0), root);
-        assertEq(data.getNamespaceHead(APP, PUBLISHER, sub), root);
     }
 
     // ── upgrades ──────────────────────────────────────────────────────────────
