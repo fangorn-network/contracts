@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {MockUSDC, Proxied} from "./Mocks.sol";
 
 /// An app owner that cannot receive ETH, so a join fee paid to it is undeliverable.
@@ -12,6 +13,30 @@ contract PennilessOwner {
     function claim(AppRegistry apps, bytes32 app, bytes32 terms, uint256 fee, address invitee) external {
         apps.registerApp(app, terms, "", fee);
         apps.addPublisher(app, invitee);
+    }
+}
+
+/// An app owner that, when a join fee reaches it, tries to commit to its own app in the
+/// middle of the join. As the owner it passes every membership check, so only the
+/// reentrancy guard can refuse the commit. It keeps the refusal and accepts the fee, so
+/// the join itself goes through.
+contract ReentrantOwner {
+    AppRegistry apps;
+    bytes32 app;
+    bytes public refusal;
+
+    function claim(AppRegistry apps_, bytes32 app_, bytes32 terms, uint256 fee, address invitee) external {
+        apps = apps_;
+        app = app_;
+        apps_.registerApp(app_, terms, "", fee);
+        apps_.addPublisher(app_, invitee);
+    }
+
+    receive() external payable {
+        try apps.commitStateRoot(app, keccak256("docs"), bytes32(0), bytes32(uint256(7))) {}
+        catch (bytes memory reason) {
+            refusal = reason;
+        }
     }
 }
 
@@ -289,6 +314,28 @@ contract AppRegistryTest is Test {
         // The payout failure unwound the membership: nobody was admitted for free.
         assertEq(uint8(apps.statusForApp(OTHER_APP, PUBLISHER)), STATUS_INVITED);
         assertFalse(apps.isRegisteredForApp(OTHER_APP, PUBLISHER));
+    }
+
+    /// Paying the join fee hands control to the app owner. A guarded function called
+    /// from there is refused, even one the owner could otherwise call: committing to
+    /// their own app.
+    function test_a_join_fee_payout_cannot_reenter() public {
+        ReentrantOwner owner = new ReentrantOwner();
+        owner.claim(apps, OTHER_APP, TERMS_V1, FEE, PUBLISHER);
+        assertTrue(apps.isRegisteredForApp(OTHER_APP, address(owner)));
+
+        join(PUBLISHER, OTHER_APP, TERMS_V1, FEE);
+        assertEq(
+            owner.refusal(), abi.encodeWithSelector(ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector)
+        );
+        assertEq(data.getNamespaceHead(OTHER_APP, address(owner), keccak256("docs")), bytes32(0));
+        assertEq(address(owner).balance, FEE);
+        assertTrue(apps.isRegisteredForApp(OTHER_APP, PUBLISHER));
+
+        // Outside the payout, the same commit goes through.
+        vm.prank(address(owner));
+        apps.commitStateRoot(OTHER_APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+        assertEq(data.getNamespaceHead(OTHER_APP, address(owner), keccak256("docs")), bytes32(uint256(7)));
     }
 
     function test_moving_the_terms_drops_everyone_back_to_unaccepted() public {
