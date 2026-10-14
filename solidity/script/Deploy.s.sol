@@ -169,7 +169,8 @@ contract Deploy is Builds {
             appId,
             termsHash,
             vm.envOr("DEFAULT_APP_TERMS_URI", string("https://fangorn.network/terms.html")),
-            vm.envOr("DEFAULT_APP_JOIN_FEE", uint256(0))
+            vm.envOr("DEFAULT_APP_JOIN_FEE", uint256(0)),
+            fee
         );
         require(apps.getAppOwner(appId) == deployer, "default app owner");
     }

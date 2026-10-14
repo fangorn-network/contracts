@@ -10,9 +10,9 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
 ## Architecture
 
 ```
-  App owner ── registerApp() ──▶  AppRegistry  ◀── registerForApp() ── Publisher
+  App owner ── registerApp() ──▶  AppRegistry  ◀── joinApp() ── Publisher
   (wallet, USDC)                   ▲  │          ◀── commitStateRoot(app, subspace, old, new)
-     │ addPublisher(pub)           │  │  app → owner, terms, join fee
+     │ invitePublisher(pub)        │  │  app → owner, terms, join fee
      │ renewSubscription()         │  │  app → expiry (the subscription), ERC-721 token
      ▼                             │  │  (app, publisher) → status
   Admin ── setGlobalSuspension() ──┘  │  wallet → globalSuspensions (network-wide ban)
@@ -28,8 +28,8 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
                                                    (watches logs, no indexer)
 
   Upload gate (Cloudflare Worker) reads:
-    AppRegistry.access(app, addr)                → (registered, owner, expiresAt)
-                                                   registered is false for a banned wallet
+    AppRegistry.access(app, addr)                → (canPublish, owner, expiresAt)
+                                                   canPublish is false for a banned wallet
 
 
   Reader ── join() / claim() ──▶ MembershipRegistry ──▶ Semaphore
@@ -46,7 +46,7 @@ Publishers commit through the AppRegistry. It decides who may publish (apps, mem
 |----------------------------|--------------------------------------|--------------------------------------------------------|
 | AppRegistry → DataRegistry | every commit                         | Move this publisher's head; the AppRegistry has checked they may |
 
-**Why commits go through the AppRegistry.** The DataRegistry is where the head moves, so it has to refuse a commit nobody checked. `AppRegistry.commitStateRoot(app_id, …)` requires the sender to be an active publisher of that app (`isRegisteredForApp`: invited, joined on the current terms, not suspended from the app or banned network-wide, in an app that is not suspended), else it reverts with the reason (see `commitStateRoot` under AppRegistry). It then calls `DataRegistry.commitStateRoot` with the sender's address as the publisher. The DataRegistry trusts that address because only the AppRegistry may call it (`Unauthorized` otherwise), so all of the checks live in one contract and the DataRegistry needs no view of apps at all.
+**Why commits go through the AppRegistry.** The DataRegistry is where the head moves, so it has to refuse a commit nobody checked. `AppRegistry.commitStateRoot(app_id, …)` requires the sender to be an active publisher of that app (`canPublish`: invited, joined on the current terms, not suspended from the app or banned network-wide, in an app that is not suspended), else it reverts with the reason (see `commitStateRoot` under AppRegistry). It then calls `DataRegistry.commitStateRoot` with the sender's address as the publisher. The DataRegistry trusts that address because only the AppRegistry may call it (`Unauthorized` otherwise), so all of the checks live in one contract and the DataRegistry needs no view of apps at all.
 
 Without that, any wallet could commit under any app id. It could not overwrite another publisher's data, because the namespace key includes the publisher's address. But its commits would carry the app's id in `StateCommitted`, so they would appear in that app's commit stream for every reader and feed watching it.
 
@@ -84,18 +84,20 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
 
 **Each app is an ERC-721 token** (`FAPP`), id `uint256(app_id)`, minted to its owner at claim, and **its subscription follows [ERC-5643](https://eips.ethereum.org/EIPS/eip-5643)**. One payment of `subscriptionFee` (USDC) buys `subscriptionPeriod` seconds. The token cannot be transferred or burned (`NotTransferable`), so its owner is always `getAppOwner`.
 
-- `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`), mints the app's token to the claimer, sets its expiry one period from now, and makes the claimer the app's first publisher. `fee` is the app's own join fee, in wei. `terms_hash` must not be zero (`TermsNotSet`), here or in `setAppTerms`, so an app always has terms to accept. The claimer must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
-- `renewSubscription(token_id, duration)` — ERC-5643. The owner, or an address they approved for the token, pays the fee for one more period (USDC; approve this contract first). `duration` must be `subscriptionPeriod` (`DurationMismatch`), and the app must be renewable (`SubscriptionNotRenewable`): only once less than one period is left, so nobody pays more than a period ahead. The period is added to the expiry, or to now if it has passed. Sends no ETH (`EthNotAccepted`). Emits `SubscriptionUpdate(token_id, expiry)`.
-- `cancelSubscription(token_id)` — ERC-5643, the owner or their approved. Ends the subscription now, as the standard does: the expiry becomes `0`, with no refund, and `SubscriptionUpdate(token_id, 0)` is emitted. The app stays claimed; a renewal starts a new period from now.
+- `registerApp(app_id, terms_hash, terms_uri, join_fee, max_subscription_fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`). If the fee is above `max_subscription_fee` when the claim lands, it reverts `SubscriptionFeeTooHigh` instead, so a fee raised in the meantime is never charged. Then it mints the app's token to the claimer, sets its expiry one period from now, and makes the claimer the app's first publisher. `join_fee` is the app's own join fee, in wei. `terms_hash` must not be zero (`TermsNotSet`), here or in `setAppTerms`, so an app always has terms to accept. The claimer must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
+- `renewSubscription(token_id, duration)` — ERC-5643. The owner, or an address they approved for the token, pays the fee for one more period (USDC; approve this contract first). `duration` must be `subscriptionPeriod` (`DurationMismatch`), and the app must be renewable (`SubscriptionNotRenewable`): only once less than one period is left, so nobody pays more than a period ahead. The period is added to the expiry, or to now if it has passed. Sends no ETH (`EthNotAccepted`). Emits `SubscriptionUpdate(token_id, expiry)`. The standard fixes the arguments, so there is no maximum fee: the payer's allowance is the cap. Approve exactly `subscriptionFee()`, and a fee raised in the meantime makes the renewal revert.
+- `cancelSubscription(token_id)` — ERC-5643, the owner only (`Unauthorized` otherwise, approved addresses included). Ends the subscription now, as the standard does: the expiry becomes `0`, with no refund, and `SubscriptionUpdate(token_id, 0)` is emitted. The app stays claimed; a renewal starts a new period from now.
 - `expiresAt(token_id)`, `isRenewable(token_id)` — ERC-5643. Both revert for a token that does not exist (`ERC721NonexistentToken`). `isRenewable` is true once less than one period is left.
 - ERC-721: `ownerOf`, `balanceOf`, `approve`, `getApproved`, `setApprovalForAll`, `isApprovedForAll`, `name`, `symbol`, `tokenURI` (empty), `supportsInterface` (ERC-165, ERC-721, its metadata, and ERC-5643's `0x8c65f84d`). The transfer functions revert.
-- `addPublisher(app_id, publisher)` — owner-only. An **invitation**: status goes `0 → 3`. Nobody can join an app uninvited. The publisher must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
-- `registerForApp(app_id, terms_hash)` — payable, called by the invited publisher. Accepts the exact current terms hash and pays exactly the join fee (forwarded to the app owner; any other amount reverts `JoinFeeMismatch`). Reverts `NotInvited` for a wallet the owner never added, `PublisherSuspendedApp` for one suspended from the app, and `PublisherSuspendedGlobal` for one banned network-wide. Re-accepting after a terms change is free, and must send nothing.
-- `setAppTerms`, `setAppFee`, `setAppAgentUri` — owner-only. Changing the terms unregisters every publisher until they re-accept; the agent card carries no hash, so moving it does not.
-- `suspendForApp` / `reinstateForApp` — owner-only, one publisher in one app. Suspending an invited publisher is how an invitation is taken back; reinstating them makes them invited again, not a member. `suspendForApp` reverts `NotInvited` for a wallet the app does not know, and `reinstateForApp` reverts `PublisherNotSuspended` for one who is not suspended.
+- `invitePublisher(app_id, publisher)` — owner-only. Reverts `AlreadyInApp` for a wallet the app already knows. An **invitation**: status goes `0 → 3`. Nobody can join an app uninvited. The publisher must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
+- `joinApp(app_id, terms_hash)` — payable, called once by the invited publisher. Accepts the exact current terms hash and pays exactly the join fee (any other amount reverts `JoinFeeMismatch`). The fee is credited to the app owner, not sent: nothing runs in the joiner's transaction but this contract. Reverts `NotInvited` for a wallet the owner never added, `PublisherSuspendedApp` for one suspended from the app, and `PublisherSuspendedGlobal` for one banned network-wide. Joining is once: a member reverts `AlreadyJoined`.
+- `acceptUpdatedTerms(app_id, terms_hash)` — a member whose accepted terms the owner has since replaced accepts the current ones, and can publish again. Free, and not `payable`, so an owner cannot bill every member by editing the terms. Emits `UpdatedTermsAccepted`. Reverts `NotJoined` for a publisher who has only been invited, `TermsMismatch` for anything but the current terms, and `TermsAlreadyAccepted` if they already accepted them.
+- `setAppTerms`, `setJoinFee`, `setAppAgentUri` — owner-only. Changing the terms stops every publisher publishing until they accept the new ones (`acceptUpdatedTerms`, free); the agent card carries no hash, so moving it does not.
+- `revokeInvitation(app_id, publisher)` — owner-only. Takes back an invitation the publisher has not accepted: they are as if never invited, cannot join, and can be invited again. Emits `InvitationRevoked`. Reverts `NotInvited` for a wallet the app does not know, and `AlreadyJoined` for a member (suspend them instead).
+- `setPublisherSuspended(app_id, publisher, bool)` — owner-only, one member in one app; emits `PublisherSuspensionChanged`. Only a publisher who has joined can be suspended (`NotJoined` for one only invited; revoke the invitation instead), so lifting a suspension always makes them a member again. Suspending a wallet the app does not know reverts `NotInvited`; lifting a suspension that is not there reverts `PublisherNotSuspended`. The owner cannot suspend themselves (`CannotSuspendOwner`).
 - `setAppSuspended(app_id, bool)` — admin-only takedown of a whole app, and its undoing. Memberships are left intact.
 - `setGlobalSuspension(wallet, bool)` — admin-only network-wide ban of any address, including one that has never published, and its lifting. It emits `GlobalSuspensionChanged` and touches nothing else, so lifting a ban restores everything as it was, namespace heads in the DataRegistry included.
-- `commitStateRoot(app_id, subspace_id, old_root, new_root)` — the only way to publish. Unless the sender `isRegisteredForApp`, it reverts with the first reason that applies:
+- `commitStateRoot(app_id, subspace_id, old_root, new_root)` — the only way to publish. Unless the sender `canPublish`, it reverts with the first reason that applies:
 
   | Error | The sender… |
   |---|---|
@@ -104,21 +106,22 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
   | `AppSuspended` | names an app the protocol admin has taken down |
   | `PublisherSuspendedApp` | is suspended from this app by its owner |
   | `NotInvited` | was never added to the app |
-  | `NotRegisteredForApp` | was added but has not joined (`registerForApp`) |
-  | `TermsMismatch` | accepted terms the app has since replaced; accept the new ones |
+  | `NotJoined` | was added but has not joined (`joinApp`) |
+  | `TermsMismatch` | accepted terms the app has since replaced; accept the new ones with `acceptUpdatedTerms` |
 
   Otherwise it forwards the commit to the DataRegistry, which compare-and-swaps the head of `app_id:sender:subspace_id` (`StaleStateRoot` if `old_root` is not it) and emits `StateCommitted`. A lapsed subscription does not stop it: the Worker enforces that.
-- `access(app_id, publisher) → (bool registered, address owner, uint64 expires_at)` — the upload gate's single read. `registered` is `isRegisteredForApp`; `expires_at` is the subscription's expiry, `0` for an unclaimed app or a cancelled subscription.
-- Views: `isRegisteredForApp`, `statusForApp`, `joinInfo`, `getAppOwner`, `subscriptionFee`, `subscriptionPeriod`, `usdc`, `dataRegistry`, `globalSuspensions`, `appTerms`, `appTermsUri`, `appAgentUri`, `appFee`, `acceptedTerms`, `isAppSuspended`, `admin`.
-- Admin: `setSubscriptionFee`, `setSubscriptionPeriod` (not zero, `ZeroPeriod`; applies from each app's next payment, emits `SubscriptionPeriodChanged`), `setDataRegistry`, `withdrawUsdc`. The fee token is fixed at `initialize`; the contract never holds ETH, since join fees go straight to the app owner.
+- `access(app_id, publisher) → (bool can_publish, address owner, uint64 expires_at)` — the upload gate's single read. `can_publish` is `canPublish`; `expires_at` is the subscription's expiry, `0` for an unclaimed app or a cancelled subscription.
+- Views: `canPublish`, `statusForApp`, `joinFeesOwed`, `joinInfo`, `getAppOwner`, `subscriptionFee`, `subscriptionPeriod`, `usdc`, `dataRegistry`, `globalSuspensions`, `appTerms`, `appTermsUri`, `appAgentUri`, `joinFee`, `acceptedTerms`, `isAppSuspended`, `admin`.
+- `withdrawJoinFees(to)` — an app owner takes out every join fee their apps have collected (`joinFeesOwed(owner)`, one balance across all their apps) and sends it to `to`, so an owner contract that cannot take ETH names an address that can. Reverts `NothingToWithdraw` if nothing is owed; emits `JoinFeesWithdrawn`.
+- Admin: `setSubscriptionFee`, `setSubscriptionPeriod` (not zero, `ZeroPeriod`; applies from each app's next payment, emits `SubscriptionPeriodChanged`), `setDataRegistry` (emits `DataRegistryChanged`), `withdrawToken(token, to, amount)` (the collected USDC, or any ERC-20 sent here by mistake; emits `TokenWithdrawn`). The fee token is fixed at `initialize`. The contract's ETH is the join fees owed to owners and nothing else: it has no `receive`, and no other function takes ETH.
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
 - `initialize(admin, usdc, subscription_fee, subscription_period)`.
 
-**Global bans.** A wallet the protocol admin has banned can neither claim an app, be added to one, nor accept an invitation. There is nothing else to pass: no wallet registers anywhere first. A wallet banned later reads as not registered in every app (`isRegisteredForApp`), so it cannot commit (`PublisherSuspendedGlobal`) or upload (the Worker refuses). An *owner* banned later keeps the app, and its other publishers keep publishing. The app can be taken down with `setAppSuspended`.
+**Global bans.** A wallet the protocol admin has banned can neither claim an app, be added to one, nor accept an invitation. There is nothing else to pass: no wallet registers anywhere first. A wallet banned later cannot publish in any app (`canPublish` is false), so it cannot commit (`PublisherSuspendedGlobal`) or upload (the Worker refuses). An *owner* banned later keeps the app, and its other publishers keep publishing. The app can be taken down with `setAppSuspended`.
 
-Per-app status (`statusForApp`, the `Status` enum, a `uint8` in the ABI): `0` unregistered, `1` active, `2` suspended, `3` invited. `isRegisteredForApp` is true only for an active publisher on the app's current terms hash, in an app that is not suspended, and who is not banned network-wide.
+Per-app status (`statusForApp`, the `Status` enum, a `uint8` in the ABI): `0` none (never added), `1` active, `2` suspended, `3` invited. `canPublish` is true only for an active publisher on the app's current terms hash, in an app that is not suspended, and who is not banned network-wide.
 
-The expiry is on-chain, but nothing on-chain enforces it: a lapsed app still passes `isRegisteredForApp`. The Worker compares `access`'s expiry with the time, so a lapse stops uploads, not commits.
+The expiry is on-chain, but nothing on-chain enforces it: a lapsed app still passes `canPublish`. The Worker compares `access`'s expiry with the time, so a lapse stops uploads, not commits.
 
 ## DataRegistry
 

@@ -27,7 +27,7 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
     error Unauthorized();
     error StaleStateRoot();
 
-    event AdminChanged(address previousAdmin, address newAdmin);
+    event AdminChanged(address previous_admin, address new_admin);
     event StateCommitted(
         bytes32 indexed namespace_key,
         bytes32 indexed app_id,

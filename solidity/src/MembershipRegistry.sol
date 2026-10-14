@@ -107,7 +107,7 @@ contract MembershipRegistry is
     event PlanSet(bytes32 indexed app_id, uint256 price, uint64 period);
     event Joined(bytes32 indexed app_id, uint256 indexed epoch, uint256 commitment);
     event Claimed(bytes32 indexed app_id, uint256 indexed epoch, uint256 indexed tokenId, address holder);
-    event AdminChanged(address previousAdmin, address newAdmin);
+    event AdminChanged(address previous_admin, address new_admin);
 
     struct Plan {
         uint256 price;
