@@ -24,8 +24,6 @@ contract DataRegistryTest is Test {
     bytes32 constant ROOT_A = bytes32(uint256(5));
     bytes32 constant ROOT_B = bytes32(uint256(6));
 
-    event PublisherSuspended(address indexed publisher);
-    event PublisherReactivated(address indexed publisher, bytes32 current_root);
     event StateCommitted(
         bytes32 indexed namespace_key,
         bytes32 indexed app_id,
@@ -48,7 +46,6 @@ contract DataRegistryTest is Test {
     function test_initialization() public view {
         assertEq(registry.admin(), ADMIN);
         assertEq(registry.appRegistry(), address(apps));
-        assertFalse(registry.suspended(PUB));
     }
 
     /// App membership is all it takes: there is nothing to register for first.
@@ -56,56 +53,6 @@ contract DataRegistryTest is Test {
         vm.prank(PUB);
         registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
         assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), ROOT_A);
-    }
-
-    function test_admin_suspension_flow() public {
-        vm.prank(PUB);
-        vm.expectRevert(DataRegistry.Unauthorized.selector);
-        registry.suspendPublisher(PUB);
-        assertFalse(registry.suspended(PUB));
-
-        vm.expectEmit(true, true, true, true, address(registry));
-        emit PublisherSuspended(PUB);
-        vm.prank(ADMIN);
-        registry.suspendPublisher(PUB);
-        assertTrue(registry.suspended(PUB));
-
-        // A suspended wallet cannot lift its own ban.
-        vm.prank(PUB);
-        vm.expectRevert(DataRegistry.Unauthorized.selector);
-        registry.reinstateGlobal(PUB);
-        assertTrue(registry.suspended(PUB));
-
-        vm.expectEmit(true, true, true, true, address(registry));
-        emit PublisherReactivated(PUB, bytes32(0));
-        vm.prank(ADMIN);
-        registry.reinstateGlobal(PUB);
-        assertFalse(registry.suspended(PUB));
-    }
-
-    /// The ban does not wait for a wallet to show up: one that has never published can
-    /// be suspended, and is refused when it later joins an app.
-    function test_a_wallet_can_be_suspended_before_it_ever_publishes() public {
-        address newcomer = makeAddr("newcomer");
-        vm.prank(ADMIN);
-        registry.suspendPublisher(newcomer);
-        assertTrue(registry.suspended(newcomer));
-        assertFalse(registry.suspended(PUB), "one wallet's ban leaked into another");
-
-        apps.setMember(APP, newcomer, true);
-        vm.prank(newcomer);
-        vm.expectRevert(DataRegistry.PublisherSuspendedErr.selector);
-        registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
-    }
-
-    function test_suspended_publisher_cannot_commit() public {
-        vm.prank(ADMIN);
-        registry.suspendPublisher(PUB);
-
-        vm.prank(PUB);
-        vm.expectRevert(DataRegistry.PublisherSuspendedErr.selector);
-        registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
-        assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), bytes32(0));
     }
 
     /// Golden fixture shared with the SDK (`namespace-key.test.ts`). The client derives
@@ -194,22 +141,6 @@ contract DataRegistryTest is Test {
         assertEq(registry.getNamespaceHead(APP, PUB, SUB_B), ROOT_B);
     }
 
-    function test_reactivation_retains_timeline_history() public {
-        vm.prank(PUB);
-        registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
-
-        vm.startPrank(ADMIN);
-        registry.suspendPublisher(PUB);
-        registry.reinstateGlobal(PUB);
-        vm.stopPrank();
-
-        // The head survived the suspension, and the CAS continues from it.
-        assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), ROOT_A);
-        vm.prank(PUB);
-        registry.commitStateRoot(APP, SUB_A, ROOT_A, ROOT_B);
-        assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), ROOT_B);
-    }
-
     function test_stale_state_root_is_rejected() public {
         vm.prank(PUB);
         vm.expectRevert(DataRegistry.StaleStateRoot.selector);
@@ -219,13 +150,10 @@ contract DataRegistryTest is Test {
     // ── upgrades ──────────────────────────────────────────────────────────────
 
     /// A new implementation takes over the same address and the same state — every
-    /// suspension and namespace head — and only the admin can install one.
+    /// namespace head — and only the admin can install one.
     function test_an_upgrade_keeps_state_and_only_the_admin_can_do_it() public {
-        address banned = makeAddr("banned");
         vm.prank(PUB);
         registry.commitStateRoot(APP, SUB_A, bytes32(0), ROOT_A);
-        vm.prank(ADMIN);
-        registry.suspendPublisher(banned);
         address v2 = address(new DataRegistryUpgradeMock());
 
         vm.prank(PUB);
@@ -238,8 +166,6 @@ contract DataRegistryTest is Test {
         assertEq(DataRegistryUpgradeMock(address(registry)).version(), 2);
         assertEq(registry.admin(), ADMIN);
         assertEq(registry.appRegistry(), address(apps));
-        assertTrue(registry.suspended(banned));
-        assertFalse(registry.suspended(PUB));
         assertEq(registry.getNamespaceHead(APP, PUB, SUB_A), ROOT_A);
 
         // The timeline continues from where it was.

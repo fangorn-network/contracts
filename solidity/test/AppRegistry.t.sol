@@ -5,7 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
-import {MockUSDC, Reverter, Proxied} from "./Mocks.sol";
+import {MockUSDC, Proxied} from "./Mocks.sol";
 
 /// An app owner that cannot receive ETH, so a join fee paid to it is undeliverable.
 contract PennilessOwner {
@@ -23,8 +23,7 @@ contract AppRegistryUpgradeMock is AppRegistry {
 }
 
 /// Against the real DataRegistry rather than a mock of it. The tests assert that ETH
-/// actually moves, that a revert unwinds state, and that an unwired DataRegistry fails
-/// closed.
+/// actually moves, and that a revert unwinds state.
 contract AppRegistryTest is Test {
     address constant ADMIN = 0x1111111111111111111111111111111111111111;
     address constant APP_OWNER = 0x2222222222222222222222222222222222222222;
@@ -51,10 +50,8 @@ contract AppRegistryTest is Test {
     /// Nobody registers anywhere: the three everyday wallets only hold ETH.
     function setUp() public {
         usdc = new MockUSDC();
-        data = Proxied.dataRegistry(ADMIN, address(0));
-        apps = Proxied.appRegistry(ADMIN, address(usdc), 0, address(data));
-        vm.prank(ADMIN);
-        data.setAppRegistry(address(apps));
+        apps = Proxied.appRegistry(ADMIN, address(usdc), 0);
+        data = Proxied.dataRegistry(ADMIN, address(apps));
 
         address[3] memory everyday = [APP_OWNER, PUBLISHER, STRANGER];
         for (uint256 i = 0; i < everyday.length; i++) {
@@ -433,12 +430,11 @@ contract AppRegistryTest is Test {
         apps.withdrawUsdc(STRANGER, SUB_FEE);
     }
 
-    // ── the DataRegistry's say ────────────────────────────────────────────────
+    // ── network-wide bans ─────────────────────────────────────────────────────
 
-    /// A wallet the DataRegistry has never heard of can claim an app and be added to
-    /// one: there is no registration step in front of either.
+    /// A wallet that has never been seen can claim an app and be added to one: there
+    /// is no registration step in front of either.
     function test_claiming_and_adding_need_no_registration() public {
-        assertEq(apps.dataRegistry(), address(data));
         address newcomer = makeAddr("newcomer");
 
         vm.prank(newcomer);
@@ -451,11 +447,38 @@ contract AppRegistryTest is Test {
         assertEq(apps.statusForApp(APP, newcomer), STATUS_INVITED);
     }
 
+    /// Only the admin bans and lifts a ban, any address can be banned, and one wallet's
+    /// ban does not touch another's.
+    function test_only_the_admin_bans_and_reinstates() public {
+        vm.prank(STRANGER);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.suspendPublisher(STRANGER);
+        assertFalse(apps.suspended(STRANGER));
+
+        vm.expectEmit(true, true, true, true, address(apps));
+        emit AppRegistry.PublisherSuspended(STRANGER);
+        vm.prank(ADMIN);
+        apps.suspendPublisher(STRANGER);
+        assertTrue(apps.suspended(STRANGER));
+        assertFalse(apps.suspended(PUBLISHER), "one wallet's ban leaked into another");
+
+        // A banned wallet cannot lift its own ban.
+        vm.prank(STRANGER);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.reinstateGlobal(STRANGER);
+
+        vm.expectEmit(true, true, true, true, address(apps));
+        emit AppRegistry.PublisherReinstated(STRANGER);
+        vm.prank(ADMIN);
+        apps.reinstateGlobal(STRANGER);
+        assertFalse(apps.suspended(STRANGER));
+    }
+
     /// The reason the check exists: a wallet the protocol admin banned network-wide
     /// cannot come back as an app owner, or be brought into an app by one.
     function test_a_globally_banned_wallet_can_neither_claim_nor_be_added() public {
         vm.prank(ADMIN);
-        data.suspendPublisher(STRANGER);
+        apps.suspendPublisher(STRANGER);
 
         vm.prank(STRANGER);
         vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
@@ -469,7 +492,7 @@ contract AppRegistryTest is Test {
         assertEq(apps.statusForApp(APP, STRANGER), STATUS_UNREGISTERED);
 
         vm.prank(ADMIN);
-        data.reinstateGlobal(STRANGER);
+        apps.reinstateGlobal(STRANGER);
         vm.prank(APP_OWNER);
         apps.addPublisher(APP, STRANGER);
         vm.prank(STRANGER);
@@ -481,7 +504,7 @@ contract AppRegistryTest is Test {
     function test_a_globally_banned_wallet_cannot_join() public {
         openApp();
         vm.prank(ADMIN);
-        data.suspendPublisher(PUBLISHER);
+        apps.suspendPublisher(PUBLISHER);
 
         vm.prank(PUBLISHER);
         vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
@@ -489,7 +512,7 @@ contract AppRegistryTest is Test {
         assertEq(apps.statusForApp(APP, PUBLISHER), STATUS_INVITED);
 
         vm.prank(ADMIN);
-        data.reinstateGlobal(PUBLISHER);
+        apps.reinstateGlobal(PUBLISHER);
         join(PUBLISHER, APP, TERMS_V1, FEE);
         assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
     }
@@ -501,30 +524,12 @@ contract AppRegistryTest is Test {
         vm.prank(APP_OWNER);
         apps.setAppTerms(APP, TERMS_V2, "");
         vm.prank(ADMIN);
-        data.suspendPublisher(PUBLISHER);
+        apps.suspendPublisher(PUBLISHER);
 
         vm.prank(PUBLISHER);
         vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
         apps.registerForApp(APP, TERMS_V2);
         assertEq(apps.acceptedTerms(APP, PUBLISHER), TERMS_V1);
-    }
-
-    /// With no usable DataRegistry, every wallet reads as suspended: unset, an address
-    /// with no code, and a registry that reverts all refuse the claim.
-    function test_an_unwired_data_registry_fails_closed() public {
-        vm.prank(STRANGER);
-        vm.expectRevert(AppRegistry.Unauthorized.selector);
-        apps.setDataRegistry(STRANGER);
-
-        address[3] memory broken = [address(0), makeAddr("no-code"), address(new Reverter())];
-        for (uint256 i = 0; i < broken.length; i++) {
-            vm.prank(ADMIN);
-            apps.setDataRegistry(broken[i]);
-            assertEq(apps.dataRegistry(), broken[i]);
-            vm.prank(APP_OWNER);
-            vm.expectRevert(AppRegistry.PublisherSuspendedErr.selector);
-            apps.registerApp(APP, TERMS_V1, "", 0);
-        }
     }
 
     /// The two registries together: a publisher can commit only once they are added
@@ -550,13 +555,23 @@ contract AppRegistryTest is Test {
         vm.expectRevert(DataRegistry.NotRegisteredForApp.selector);
         data.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
 
-        // A network-wide ban is checked on every commit, so it stops an owner who
-        // claimed the app before being banned.
-        vm.prank(ADMIN);
-        data.suspendPublisher(APP_OWNER);
+        // A network-wide ban is part of the membership answer, so it stops an owner who
+        // claimed the app before being banned, on every commit.
         vm.prank(APP_OWNER);
-        vm.expectRevert(DataRegistry.PublisherSuspendedErr.selector);
         data.commitStateRoot(APP, sub, bytes32(0), root);
+        vm.prank(ADMIN);
+        apps.suspendPublisher(APP_OWNER);
+        assertFalse(apps.isRegisteredForApp(APP, APP_OWNER));
+        vm.prank(APP_OWNER);
+        vm.expectRevert(DataRegistry.NotRegisteredForApp.selector);
+        data.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
+
+        // Lifting the ban touches nothing else: the timeline resumes from its head.
+        vm.prank(ADMIN);
+        apps.reinstateGlobal(APP_OWNER);
+        vm.prank(APP_OWNER);
+        data.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
+        assertEq(data.getNamespaceHead(APP, APP_OWNER, sub), bytes32(uint256(8)));
     }
 
     // ── migration ─────────────────────────────────────────────────────────────
@@ -654,7 +669,6 @@ contract AppRegistryTest is Test {
 
         assertEq(AppRegistryUpgradeMock(address(apps)).version(), 2);
         assertEq(apps.admin(), ADMIN);
-        assertEq(apps.dataRegistry(), address(data));
         assertEq(apps.getAppOwner(APP), APP_OWNER);
         assertEq(apps.appTerms(APP), TERMS_V1);
         assertEq(apps.appTermsUri(APP), "https://tabs.example/terms");
@@ -673,11 +687,11 @@ contract AppRegistryTest is Test {
     /// on the bare implementation, which nobody should be able to take over.
     function test_initialize_runs_once_and_never_on_the_implementation() public {
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        apps.initialize(STRANGER, address(usdc), 0, address(data));
+        apps.initialize(STRANGER, address(usdc), 0);
 
         AppRegistry implementation = new AppRegistry();
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        implementation.initialize(STRANGER, address(usdc), 0, address(data));
+        implementation.initialize(STRANGER, address(usdc), 0);
     }
 
     /// The admin role moves, and the right to upgrade moves with it.

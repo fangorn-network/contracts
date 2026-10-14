@@ -16,12 +16,9 @@ import {NonReentrant} from "./NonReentrant.sol";
 /// publishers. Membership is by invitation — the owner adds a publisher, who then
 /// accepts the terms.
 ///
-/// The DataRegistry is where the protocol admin bans a publisher network-wide, so this
-/// contract asks it before letting a wallet claim an app or be added to one. The two
-/// contracts therefore point at each other:
-///
-///   AppRegistry ── suspended(wallet) ─────────────────▶ DataRegistry
-///   AppRegistry ◀── isRegisteredForApp(app_id, sender) ── DataRegistry
+/// The protocol admin's network-wide ban is kept here too, so this contract calls no
+/// other registry. The DataRegistry asks it on every commit whether the sender may
+/// publish under the app (`isRegisteredForApp`), and a banned wallet may not.
 ///
 /// Deployed behind an ERC-1967 proxy (UUPS): the proxy holds the state and the address,
 /// and the admin can point it at a new implementation. Storage is therefore
@@ -44,7 +41,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     error AlreadyRegistered();
     error NotRegistered();
     /// The publisher is suspended: from this app by its owner, or network-wide by the
-    /// protocol admin in the DataRegistry.
+    /// protocol admin.
     error PublisherSuspendedErr();
     error AppSuspendedErr();
     error JoinFeeRequired();
@@ -65,6 +62,9 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// An app owner suspended a publisher from their app
     event PublisherSuspendedForApp(bytes32 indexed app_id, address indexed publisher);
     event PublisherReinstatedForApp(bytes32 indexed app_id, address indexed publisher);
+    /// The protocol admin banned a wallet network-wide, or lifted the ban
+    event PublisherSuspended(address indexed publisher);
+    event PublisherReinstated(address indexed publisher);
     /// The protocol admin suspended (or reinstated) an entire app
     event AppSuspensionChanged(bytes32 indexed app_id, bool suspended);
     /// An app owner added a publisher, who may now accept the terms and join
@@ -81,8 +81,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     address public usdc;
     /// Subscription fee, denominated in USDC base units (6 decimals).
     uint256 public subscriptionFee;
-    /// The DataRegistry queried for the network-wide ban.
-    address public dataRegistry;
 
     struct App {
         // The first three fields share one storage slot (20 + 1 + 8 bytes): keep them
@@ -109,6 +107,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     mapping(bytes32 => mapping(address => uint8)) internal statuses;
     /// app_id => publisher => the terms hash they actually accepted
     mapping(bytes32 => mapping(address => bytes32)) internal accepted;
+    /// wallet => banned network-wide by the protocol admin
+    mapping(address => bool) public suspended;
 
     /// The implementation is only ever used through a proxy. Lock it, so nobody can
     /// initialize it directly.
@@ -119,14 +119,10 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
 
     /// Takes the place of a constructor: runs once, in the proxy's storage, as part of
     /// the proxy's deployment.
-    function initialize(address admin_, address usdc_, uint256 subscriptionFee_, address dataRegistry_)
-        external
-        initializer
-    {
+    function initialize(address admin_, address usdc_, uint256 subscriptionFee_) external initializer {
         admin = admin_;
         usdc = usdc_;
         subscriptionFee = subscriptionFee_;
-        dataRegistry = dataRegistry_;
     }
 
     // ── Apps ──────────────────────────────────────────────────────────────────
@@ -144,15 +140,15 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// Claiming pays the subscription fee (USDC), so an app cannot exist unpaid. The
     /// caller must `approve` this contract for `subscriptionFee()` first.
     ///
-    /// The caller must not be suspended in the DataRegistry, so a wallet the protocol
-    /// admin has banned cannot come back as an app owner.
+    /// The caller must not be banned network-wide (`suspended`), so a wallet the
+    /// protocol admin has banned cannot come back as an app owner.
     function registerApp(bytes32 app_id, bytes32 terms_hash, string calldata terms_uri, uint256 fee)
         external
         nonReentrant
     {
         App storage app = apps[app_id];
         address owner = msg.sender;
-        if (_isSuspendedGlobally(owner)) revert PublisherSuspendedErr();
+        if (suspended[owner]) revert PublisherSuspendedErr();
         if (app.owner != address(0)) revert AppAlreadyRegistered();
         _paySubscription(app_id, owner);
 
@@ -181,10 +177,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     ///
     /// Danger: every publisher who accepted the previous terms becomes unregistered
     /// until they accept the new ones.
-    function setAppTerms(bytes32 app_id, bytes32 terms_hash, string calldata terms_uri)
-        external
-        onlyAppOwner(app_id)
-    {
+    function setAppTerms(bytes32 app_id, bytes32 terms_hash, string calldata terms_uri) external onlyAppOwner(app_id) {
         App storage app = apps[app_id];
         app.appTerms = terms_hash;
         app.appTermsUri = terms_uri;
@@ -225,20 +218,21 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     /// terms (and pay the join fee) with `registerForApp`. Nobody can join uninvited.
     /// Take an invitation back with `suspendForApp`.
     ///
-    /// The publisher must not be suspended in the DataRegistry: an owner cannot bring
-    /// in a wallet the protocol admin has banned.
+    /// The publisher must not be banned network-wide: an owner cannot bring in a wallet
+    /// the protocol admin has banned.
     function addPublisher(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
-        if (_isSuspendedGlobally(publisher)) revert PublisherSuspendedErr();
+        if (suspended[publisher]) revert PublisherSuspendedErr();
         if (statuses[app_id][publisher] != STATUS_UNREGISTERED) revert AlreadyRegistered();
         statuses[app_id][publisher] = STATUS_INVITED;
         emit PublisherInvited(app_id, publisher);
     }
 
     /// Register to publish to an app. By registering, you are agreeing to the app's
-    /// terms and conditions. The app owner must have added you first (`addPublisher`).
+    /// terms and conditions. The app owner must have added you first (`addPublisher`),
+    /// and a wallet banned network-wide cannot accept.
     function registerForApp(bytes32 app_id, bytes32 terms_hash) external payable nonReentrant {
         App storage app = apps[app_id];
-        if (_isSuspendedGlobally(msg.sender)) revert PublisherSuspendedErr();
+        if (suspended[msg.sender]) revert PublisherSuspendedErr();
         address owner = app.owner;
         if (owner == address(0)) revert AppNotFound();
         if (app.isAppSuspended) revert AppSuspendedErr();
@@ -308,13 +302,14 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
         return apps[app_id].subscribedAt;
     }
 
-    /// Is a publisher actively registered in an app? False if the publisher is
-    /// suspended, merely invited, on stale terms, or the app is suspended.
+    /// Is a publisher actively registered in an app? False if the publisher is banned
+    /// network-wide or suspended from the app, merely invited, on stale terms, or the
+    /// app is suspended. This is what the DataRegistry asks on every commit.
     function isRegisteredForApp(bytes32 app_id, address publisher) public view returns (bool) {
         App storage app = apps[app_id];
         bytes32 current = app.appTerms;
-        return !app.isAppSuspended && current != bytes32(0) && statuses[app_id][publisher] == STATUS_ACTIVE
-            && accepted[app_id][publisher] == current;
+        return !app.isAppSuspended && !suspended[publisher] && current != bytes32(0)
+            && statuses[app_id][publisher] == STATUS_ACTIVE && accepted[app_id][publisher] == current;
     }
 
     /// The single oracle the upload gate reads: `(registered, owner, paid_at)`.
@@ -373,17 +368,27 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
         usdc = token;
     }
 
-    /// Update the DataRegistry used for the ban check. Until one is set, every wallet
-    /// reads as suspended, so no app can be claimed and nobody added.
-    function setDataRegistry(address registry) external onlyAdmin {
-        dataRegistry = registry;
+    /// Ban a wallet network-wide: it can no longer claim an app, be added to one, join
+    /// one, or publish in any (`isRegisteredForApp` turns false). Any address can be
+    /// banned, including one that has never published. Nothing else is touched, so
+    /// lifting the ban restores everything, and the wallet's timelines in the
+    /// DataRegistry resume where they stopped.
+    function suspendPublisher(address publisher) external onlyAdmin {
+        suspended[publisher] = true;
+        emit PublisherSuspended(publisher);
+    }
+
+    /// Lift a network-wide ban.
+    function reinstateGlobal(address publisher) external onlyAdmin {
+        suspended[publisher] = false;
+        emit PublisherReinstated(publisher);
     }
 
     /// Recreate an app for its original owner after a redeploy. Fill-only: it refuses
     /// an app id that is already claimed.
     ///
     /// Testnet migration aid: it pulls no subscription fee and stamps the app as paid
-    /// now. It does not ask the DataRegistry about `owner` either — the admin is the
+    /// now. It does not check `owner` against the ban either — the admin is the
     /// ban authority, and an owner banned after claiming keeps their app anyway.
     function seedApp(
         bytes32 app_id,
@@ -457,11 +462,11 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
         _;
     }
 
-    function _setAppSuspended(bytes32 app_id, bool suspended) private onlyAdmin {
+    function _setAppSuspended(bytes32 app_id, bool isSuspended) private onlyAdmin {
         App storage app = apps[app_id];
         if (app.owner == address(0)) revert AppNotFound();
-        app.isAppSuspended = suspended;
-        emit AppSuspensionChanged(app_id, suspended);
+        app.isAppSuspended = isSuspended;
+        emit AppSuspensionChanged(app_id, isSuspended);
     }
 
     /// Mark an app owner as an active publisher of their own app
@@ -475,7 +480,9 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
         uint256 fee = subscriptionFee;
         if (
             fee != 0
-                && !_tokenCall(abi.encodeWithSignature("transferFrom(address,address,uint256)", payer, address(this), fee))
+                && !_tokenCall(
+                    abi.encodeWithSignature("transferFrom(address,address,uint256)", payer, address(this), fee)
+                )
         ) revert SubscriptionFeeRequired();
         _stampPaid(app_id, payer);
     }
@@ -497,14 +504,5 @@ contract AppRegistry is Initializable, UUPSUpgradeable, NonReentrant {
     function _sendEth(address to, uint256 amount) private {
         (bool ok,) = to.call{value: amount}("");
         if (!ok) revert TransferFailed();
-    }
-
-    /// Cross-contract check: has the protocol admin suspended `who` in the
-    /// DataRegistry? Anything but a clean `false` — a revert, no contract at the
-    /// address, a malformed return — counts as suspended, so an unwired registry
-    /// fails closed. A plain interface call would revert on the last two instead.
-    function _isSuspendedGlobally(address who) private view returns (bool) {
-        (bool ok, bytes memory ret) = dataRegistry.staticcall(abi.encodeWithSignature("suspended(address)", who));
-        return !(ok && ret.length == 32 && abi.decode(ret, (uint256)) == 0);
     }
 }

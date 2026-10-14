@@ -194,11 +194,8 @@ contract Reverter {
 /// proxy that initializes it. What comes back is the proxy, so every test runs against
 /// proxy storage — including the reentrancy guard, which starts at zero there.
 library Proxied {
-    function appRegistry(address admin, address usdc, uint256 subscriptionFee, address dataRegistry_)
-        internal
-        returns (AppRegistry)
-    {
-        bytes memory init = abi.encodeCall(AppRegistry.initialize, (admin, usdc, subscriptionFee, dataRegistry_));
+    function appRegistry(address admin, address usdc, uint256 subscriptionFee) internal returns (AppRegistry) {
+        bytes memory init = abi.encodeCall(AppRegistry.initialize, (admin, usdc, subscriptionFee));
         return AppRegistry(address(new ERC1967Proxy(address(new AppRegistry()), init)));
     }
 

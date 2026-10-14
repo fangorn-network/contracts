@@ -44,15 +44,23 @@ library Deployments {
     }
 
     /// The proxy of `name` on `chainId`: the contract's address, which never changes.
-    function proxy(string memory name, uint256 chainId) internal pure returns (address) {
-        bytes32 n = keccak256(bytes(name));
-        if (chainId == ARBITRUM_SEPOLIA) {
-            if (n == keccak256("AppRegistry")) return 0x57b41E334864B430db44F7FbCD8d165C56e41402;
-            if (n == keccak256("DataRegistry")) return 0x0312503913656f25c2bfDf229425aA6926ccF1Cd;
-            if (n == keccak256("MembershipRegistry")) return 0x57B95b9B20C31E146aDF619Dafc4539e056360a5;
-        }
+    function proxy(string memory name, uint256 chainId) internal pure returns (address p) {
+        p = recorded(name, chainId);
+        if (p == address(0)) revert NoProxyRecorded(name, chainId);
+    }
+
+    /// The proxy of `name` on `chainId`, or zero while it is not deployed there.
+    function recorded(string memory name, uint256 chainId) internal pure returns (address) {
         current(name); // an unknown name is a different mistake from a missing address
-        revert NoProxyRecorded(name, chainId);
+        if (chainId == ARBITRUM_SEPOLIA) {
+            // None yet: the registries are being deployed afresh. The proxies before
+            // them, now retired, were AppRegistry 0x57b41E334864B430db44F7FbCD8d165C56e41402,
+            // DataRegistry 0x0312503913656f25c2bfDf229425aA6926ccF1Cd and
+            // MembershipRegistry 0x57B95b9B20C31E146aDF619Dafc4539e056360a5. Add each new
+            // one as
+            //   if (keccak256(bytes(name)) == keccak256("AppRegistry")) return 0x…;
+        }
+        return address(0);
     }
 
     /// The validation options `name` is deployed and upgraded with.
