@@ -177,8 +177,11 @@ contract MockHook {
 /// proxy that initializes it. What comes back is the proxy, so every test runs against
 /// proxy storage.
 library Proxied {
-    function appRegistry(address admin, address usdc, uint256 subscriptionFee) internal returns (AppRegistry) {
-        bytes memory init = abi.encodeCall(AppRegistry.initialize, (admin, usdc, subscriptionFee));
+    function appRegistry(address admin, address usdc, uint256 subscriptionFee, uint64 subscriptionPeriod)
+        internal
+        returns (AppRegistry)
+    {
+        bytes memory init = abi.encodeCall(AppRegistry.initialize, (admin, usdc, subscriptionFee, subscriptionPeriod));
         return AppRegistry(address(new ERC1967Proxy(address(new AppRegistry()), init)));
     }
 

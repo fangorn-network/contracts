@@ -13,7 +13,7 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
   App owner ── registerApp() ──▶  AppRegistry  ◀── registerForApp() ── Publisher
   (wallet, USDC)                   ▲  │          ◀── commitStateRoot(app, subspace, old, new)
      │ addPublisher(pub)           │  │  app → owner, terms, join fee
-     │ renewApp()                  │  │  app → subscribedAt (the subscription)
+     │ renewSubscription()         │  │  app → expiry (the subscription), ERC-721 token
      ▼                             │  │  (app, publisher) → status
   Admin ── setGlobalSuspension() ──┘  │  wallet → globalSuspensions (network-wide ban)
   (network-wide ban)                  │
@@ -28,7 +28,7 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
                                                    (watches logs, no indexer)
 
   Upload gate (Cloudflare Worker) reads:
-    AppRegistry.access(app, addr)                → (registered, owner, paidAt)
+    AppRegistry.access(app, addr)                → (registered, owner, expiresAt)
                                                    registered is false for a banned wallet
 
 
@@ -59,6 +59,7 @@ The Worker cannot cover this on its own. It only gates uploads through Fangorn's
 | `solidity/src/AppRegistry.sol`          | AppRegistry                                             |
 | `solidity/src/DataRegistry.sol`         | DataRegistry                                            |
 | `solidity/src/MembershipRegistry.sol`   | MembershipRegistry                                      |
+| `solidity/src/IERC5643.sol`             | The ERC-5643 subscription interface both registries implement |
 | `solidity/test/`                        | Foundry tests and mocks                                 |
 | `solidity/script/Deploy.s.sol`          | Deploys the contracts behind their own UUPS proxy              |
 | `solidity/script/Upgrade.s.sol`         | Admin: upgrade a deployed contract in place             |
@@ -81,8 +82,13 @@ The Worker cannot cover this on its own. It only gates uploads through Fangorn's
 
 Apps, who may publish under them, and who pays for their storage. **An app is synonymous to a storage subscription** so data availability has stronger guarantees.
 
-- `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`), stamps `subscribedAt(app_id)` as now, and makes the claimer the app's first publisher. `fee` is the app's own join fee, in wei. `terms_hash` must not be zero (`TermsNotSet`), here or in `setAppTerms`, so an app always has terms to accept. The claimer must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
-- `renewApp(app_id)` — owner-only. Pays the fee again and re-stamps `now`.
+**Each app is an ERC-721 token** (`FAPP`), id `uint256(app_id)`, minted to its owner at claim, and **its subscription follows [ERC-5643](https://eips.ethereum.org/EIPS/eip-5643)**. One payment of `subscriptionFee` (USDC) buys `subscriptionPeriod` seconds. The token cannot be transferred or burned (`NotTransferable`), so its owner is always `getAppOwner`.
+
+- `registerApp(app_id, terms_hash, terms_uri, fee)` — claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`), mints the app's token to the claimer, sets its expiry one period from now, and makes the claimer the app's first publisher. `fee` is the app's own join fee, in wei. `terms_hash` must not be zero (`TermsNotSet`), here or in `setAppTerms`, so an app always has terms to accept. The claimer must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
+- `renewSubscription(token_id, duration)` — ERC-5643. The owner, or an address they approved for the token, pays the fee for one more period (USDC; approve this contract first). `duration` must be `subscriptionPeriod` (`DurationMismatch`), and the app must be renewable (`SubscriptionNotRenewable`): only once less than one period is left, so nobody pays more than a period ahead. The period is added to the expiry, or to now if it has passed. Sends no ETH (`EthNotAccepted`). Emits `SubscriptionUpdate(token_id, expiry)`.
+- `cancelSubscription(token_id)` — ERC-5643, the owner or their approved. Ends the subscription now, as the standard does: the expiry becomes `0`, with no refund, and `SubscriptionUpdate(token_id, 0)` is emitted. The app stays claimed; a renewal starts a new period from now.
+- `expiresAt(token_id)`, `isRenewable(token_id)` — ERC-5643. Both revert for a token that does not exist (`ERC721NonexistentToken`). `isRenewable` is true once less than one period is left.
+- ERC-721: `ownerOf`, `balanceOf`, `approve`, `getApproved`, `setApprovalForAll`, `isApprovedForAll`, `name`, `symbol`, `tokenURI` (empty), `supportsInterface` (ERC-165, ERC-721, its metadata, and ERC-5643's `0x8c65f84d`). The transfer functions revert.
 - `addPublisher(app_id, publisher)` — owner-only. An **invitation**: status goes `0 → 3`. Nobody can join an app uninvited. The publisher must not be banned network-wide (`PublisherSuspendedGlobal` otherwise).
 - `registerForApp(app_id, terms_hash)` — payable, called by the invited publisher. Accepts the exact current terms hash and pays exactly the join fee (forwarded to the app owner; any other amount reverts `JoinFeeMismatch`). Reverts `NotInvited` for a wallet the owner never added, `PublisherSuspendedApp` for one suspended from the app, and `PublisherSuspendedGlobal` for one banned network-wide. Re-accepting after a terms change is free, and must send nothing.
 - `setAppTerms`, `setAppFee`, `setAppAgentUri` — owner-only. Changing the terms unregisters every publisher until they re-accept; the agent card carries no hash, so moving it does not.
@@ -102,17 +108,17 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
   | `TermsMismatch` | accepted terms the app has since replaced; accept the new ones |
 
   Otherwise it forwards the commit to the DataRegistry, which compare-and-swaps the head of `app_id:sender:subspace_id` (`StaleStateRoot` if `old_root` is not it) and emits `StateCommitted`. A lapsed subscription does not stop it: the Worker enforces that.
-- `access(app_id, publisher) → (bool registered, address owner, uint64 paidAt)` — the upload gate's single read. `registered` is `isRegisteredForApp`.
-- Views: `isRegisteredForApp`, `statusForApp`, `joinInfo`, `getAppOwner`, `subscribedAt`, `subscriptionFee`, `usdc`, `dataRegistry`, `globalSuspensions`, `appTerms`, `appTermsUri`, `appAgentUri`, `appFee`, `acceptedTerms`, `isAppSuspended`, `admin`.
-- Admin: `setSubscriptionFee`, `setDataRegistry`, `withdrawUsdc`. The fee token is fixed at `initialize`; the contract never holds ETH, since join fees go straight to the app owner.
+- `access(app_id, publisher) → (bool registered, address owner, uint64 expires_at)` — the upload gate's single read. `registered` is `isRegisteredForApp`; `expires_at` is the subscription's expiry, `0` for an unclaimed app or a cancelled subscription.
+- Views: `isRegisteredForApp`, `statusForApp`, `joinInfo`, `getAppOwner`, `subscriptionFee`, `subscriptionPeriod`, `usdc`, `dataRegistry`, `globalSuspensions`, `appTerms`, `appTermsUri`, `appAgentUri`, `appFee`, `acceptedTerms`, `isAppSuspended`, `admin`.
+- Admin: `setSubscriptionFee`, `setSubscriptionPeriod` (not zero, `ZeroPeriod`; applies from each app's next payment, emits `SubscriptionPeriodChanged`), `setDataRegistry`, `withdrawUsdc`. The fee token is fixed at `initialize`; the contract never holds ETH, since join fees go straight to the app owner.
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
-- `initialize(admin, usdc, subscription_fee)`.
+- `initialize(admin, usdc, subscription_fee, subscription_period)`.
 
 **Global bans.** A wallet the protocol admin has banned can neither claim an app, be added to one, nor accept an invitation. There is nothing else to pass: no wallet registers anywhere first. A wallet banned later reads as not registered in every app (`isRegisteredForApp`), so it cannot commit (`PublisherSuspendedGlobal`) or upload (the Worker refuses). An *owner* banned later keeps the app, and its other publishers keep publishing. The app can be taken down with `setAppSuspended`.
 
 Per-app status (`statusForApp`, the `Status` enum, a `uint8` in the ABI): `0` unregistered, `1` active, `2` suspended, `3` invited. `isRegisteredForApp` is true only for an active publisher on the app's current terms hash, in an app that is not suspended, and who is not banned network-wide.
 
-The active window is not on-chain — the contract only stores a timestamp. The Worker decides what counts as active (`SUBSCRIPTION_WINDOW_DAYS`, 30 days), so that policy is tunable without a redeploy. A lapsed app therefore still passes `isRegisteredForApp`: the lapse stops uploads at the Worker, not commits on-chain.
+The expiry is on-chain, but nothing on-chain enforces it: a lapsed app still passes `isRegisteredForApp`. The Worker compares `access`'s expiry with the time, so a lapse stops uploads, not commits.
 
 ## DataRegistry
 
@@ -254,7 +260,8 @@ contract has builds exactly when `Deployments.sol` records its proxy.
 
 `all()` deploys the AppRegistry, then the DataRegistry, points each at the other, then
 deploys the MembershipRegistry and claims the default app (`fangorn`) for the deployer. With a non-zero
-`SUBSCRIPTION_FEE` the deployer needs that much USDC.
+`SUBSCRIPTION_FEE` the deployer needs that much USDC. `SUBSCRIPTION_PERIOD` (seconds,
+default 30 days) is how long one payment lasts.
 
 Deploying mints new addresses. They reach every consumer through one place:
 `fangorn/src/config.ts`. Publish the SDK, then bump it in the workers and the website.
@@ -342,9 +349,9 @@ existing slot the way the old code wrote it:
 The plugin enforces the first two, and also refuses constructors, `selfdestruct` and
 `delegatecall` in a new version. A change that cannot keep the layout is a redeploy.
 
-`MembershipRegistry` inherits OpenZeppelin's non-upgradeable `ERC721` and `EIP712`,
-whose constructors the plugin would refuse. `Deployments.options` allows them for that
-contract only; the comment there says why it is safe.
+The contracts inherit OpenZeppelin's upgradeable variants (`ERC721Upgradeable`,
+`EIP712Upgradeable`), which keep their state in namespaced storage and set it in
+`initialize`, so the plugin needs no exemption for any of them.
 
 **Rehearse first.** Fork the chain locally and run the same command against the fork,
 signing as the admin's address without its key:

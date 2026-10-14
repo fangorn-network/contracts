@@ -63,16 +63,9 @@ library Deployments {
         return address(0);
     }
 
-    /// The validation options `name` is deployed and upgraded with.
-    function options(string memory name) internal pure returns (Options memory opts) {
-        // MembershipRegistry inherits OpenZeppelin's ERC721 and EIP712, which have
-        // constructors, and the validator has no annotation for inherited code. They
-        // are safe here: `name` and `symbol` are overridden, so what ERC721's
-        // constructor stores is never read, and EIP712 keeps its values in immutables,
-        // which a proxy reads from the implementation's code. The contract is live
-        // with this storage, so its bases cannot be swapped for the upgradeable ones.
-        if (keccak256(bytes(name)) == keccak256("MembershipRegistry")) opts.unsafeAllow = "constructor";
-    }
+    /// The validation options `name` is deployed and upgraded with. None so far: every
+    /// contract passes the validator as it is.
+    function options(string memory) internal pure returns (Options memory opts) {}
 
     /// The options `name` is upgraded with: the ones above, plus what the new code is
     /// checked against. That is a build of a deployed version, committed under

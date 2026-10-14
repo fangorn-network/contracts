@@ -46,6 +46,7 @@ import {Deployments} from "./Deployments.sol";
 ///   USDC_ADDR, SEMAPHORE_ADDR
 ///                           default to Arbitrum Sepolia's; required on any other chain
 ///   SUBSCRIPTION_FEE        claiming an app, in USDC base units. Default 0
+///   SUBSCRIPTION_PERIOD     how long one payment lasts, in seconds. Default 30 days
 ///   DEFAULT_APP_NAME, DEFAULT_APP_TERMS_HASH, DEFAULT_APP_TERMS_URI,
 ///   DEFAULT_APP_JOIN_FEE    the app claimed for the deployer. Defaults below
 contract Deploy is Builds {
@@ -119,7 +120,15 @@ contract Deploy is Builds {
         return AppRegistry(
             Upgrades.deployUUPSProxy(
                 Deployments.APP_REGISTRY,
-                abi.encodeCall(AppRegistry.initialize, (admin, _usdc(), vm.envOr("SUBSCRIPTION_FEE", uint256(0)))),
+                abi.encodeCall(
+                    AppRegistry.initialize,
+                    (
+                        admin,
+                        _usdc(),
+                        vm.envOr("SUBSCRIPTION_FEE", uint256(0)),
+                        uint64(vm.envOr("SUBSCRIPTION_PERIOD", uint256(30 days)))
+                    )
+                ),
                 Deployments.options("AppRegistry")
             )
         );

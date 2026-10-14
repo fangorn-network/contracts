@@ -4,6 +4,8 @@ pragma solidity ^0.8.24;
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {ERC721Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import {IERC5643} from "./IERC5643.sol";
 
 /// The DataRegistry's one write, which accepts calls from this contract only.
 interface IDataRegistry {
@@ -17,10 +19,14 @@ interface IDataRegistry {
 /// it. Publishers must be registered with an app to write to its namespace in the
 /// DataRegistry.
 ///
-/// An app IS a storage subscription: claiming one pulls the subscription fee (USDC),
-/// and the off-chain upload gate reads `access` to decide whether to serve its
-/// publishers. Membership is by invitation — the owner adds a publisher, who then
-/// accepts the terms.
+/// An app IS a storage subscription: claiming one pulls the subscription fee (USDC)
+/// for one period, and the off-chain upload gate reads `access` to decide whether to
+/// serve its publishers. Membership is by invitation — the owner adds a publisher, who
+/// then accepts the terms.
+///
+/// Each app is also an ERC-721 token, id `uint256(app_id)`, minted to its owner at
+/// claim, and its subscription follows ERC-5643: `expiresAt`, `isRenewable`,
+/// `renewSubscription` and `cancelSubscription`. The token cannot be transferred.
 ///
 /// Every commit goes through this contract (`commitStateRoot`). It checks that the
 /// sender may publish under the app — the protocol admin's network-wide ban is kept
@@ -33,7 +39,7 @@ interface IDataRegistry {
 /// `App`, and never reorder, retype or remove what is there. A new version is an edit
 /// to this file; the upgrade tooling checks its storage against the build of the live
 /// version, committed under `deployed/`.
-contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient {
+contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, ReentrancyGuardTransient, IERC5643 {
     /// A publisher's standing in one app. In the ABI it is a uint8, in this order.
     enum Status {
         Unregistered,
@@ -67,6 +73,16 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
     error TransferFailed();
     error NotInvited();
     error SubscriptionFeeRequired();
+    /// An app's token cannot be transferred or burned
+    error NotTransferable();
+    /// The subscription has a period or more left; renew it once less than that remains
+    error SubscriptionNotRenewable();
+    /// `renewSubscription`: `duration` is not the subscription period
+    error DurationMismatch();
+    /// The subscription is paid in USDC; renewing or cancelling takes no ETH
+    error EthNotAccepted();
+    /// The subscription period cannot be zero
+    error ZeroPeriod();
     /// Committing: invited, but has not joined (`registerForApp`)
     error NotRegisteredForApp();
     /// Raised by the DataRegistry and passed through by `commitStateRoot`: `old_root` is
@@ -92,14 +108,15 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
     event AppSuspensionChanged(bytes32 indexed app_id, bool suspended);
     /// An app owner added a publisher, who may now accept the terms and join
     event PublisherInvited(bytes32 indexed app_id, address indexed publisher);
-    /// The app's subscription was paid (at claim, or a renewal). `paid_at` is the block
-    /// timestamp (Unix seconds); the off-chain gate enforces the active window.
-    event AppSubscribed(bytes32 indexed app_id, address indexed payer, uint64 paid_at);
     event SubscriptionFeeChanged(uint256 fee);
+    /// The admin changed the period: it applies from each app's next payment
+    event SubscriptionPeriodChanged(uint64 period);
     event AdminChanged(address previousAdmin, address newAdmin);
 
     /// The app registry admin
     address public admin;
+    /// How long one subscription payment lasts, in seconds. Shares a slot with `admin`.
+    uint64 public subscriptionPeriod;
     /// ERC-20 token the subscription fee is paid in (USDC). Amounts are in its base units.
     address public usdc;
     /// Subscription fee, denominated in USDC base units (6 decimals).
@@ -114,8 +131,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
         address owner;
         /// Admin takedown flag. A suspended app is dead for every publisher at once.
         bool isAppSuspended;
-        /// Block timestamp (Unix seconds) of the app's last subscription payment.
-        uint64 subscribedAt;
+        /// When the subscription expires (Unix seconds). Zero once cancelled.
+        uint64 expiry;
         /// Hash of the app's current publisher terms. Zero means none are set.
         bytes32 appTerms;
         /// URI to read the terms
@@ -144,10 +161,15 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
 
     /// Takes the place of a constructor: runs once, in the proxy's storage, as part of
     /// the proxy's deployment.
-    function initialize(address admin_, address usdc_, uint256 subscriptionFee_) external initializer {
+    function initialize(address admin_, address usdc_, uint256 subscriptionFee_, uint64 subscriptionPeriod_)
+        external
+        initializer
+    {
+        __ERC721_init("FAPP", "FAPP");
         admin = admin_;
         usdc = usdc_;
         subscriptionFee = subscriptionFee_;
+        _setSubscriptionPeriod(subscriptionPeriod_);
     }
 
     // ── Apps ──────────────────────────────────────────────────────────────────
@@ -162,8 +184,9 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
     ///
     /// The claimer becomes the app's first registered publisher.
     ///
-    /// Claiming pays the subscription fee (USDC), so an app cannot exist unpaid. The
-    /// caller must `approve` this contract for `subscriptionFee()` first.
+    /// Claiming pays the subscription fee (USDC) for one period, so an app cannot exist
+    /// unpaid. The caller must `approve` this contract for `subscriptionFee()` first.
+    /// It mints the app's token to the claimer.
     ///
     /// The caller must not be banned network-wide (`globalSuspensions`), so a wallet the
     /// protocol admin has banned cannot come back as an app owner.
@@ -183,6 +206,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
         app.appTermsUri = terms_uri;
         app.joinFee = fee;
         _joinOwner(app_id, owner, terms_hash);
+        _mint(owner, uint256(app_id));
 
         emit AppRegistered(app_id, owner);
         emit AppTermsChanged(app_id, terms_hash, terms_uri);
@@ -191,12 +215,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
 
     function getAppOwner(bytes32 app_id) external view returns (address) {
         return apps[app_id].owner;
-    }
-
-    /// Renew an app's subscription: pays the fee again and re-stamps `now`.
-    /// Only callable by the app owner. Renewing while still active is allowed.
-    function renewApp(bytes32 app_id) external nonReentrant onlyAppOwner(app_id) {
-        _paySubscription(app_id, msg.sender);
     }
 
     /// Publish (or update) an app's publisher agreement. Only callable by the app owner.
@@ -335,10 +353,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
         return apps[app_id].isAppSuspended;
     }
 
-    function subscribedAt(bytes32 app_id) external view returns (uint64) {
-        return apps[app_id].subscribedAt;
-    }
-
     /// Is a publisher actively registered in an app? False if the publisher is banned
     /// network-wide or suspended from the app, merely invited, on stale terms, or the
     /// app is suspended. `commitStateRoot` requires it.
@@ -351,13 +365,13 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
             && acceptedTerms[app_id][publisher] == app.appTerms;
     }
 
-    /// The single oracle the upload gate reads: `(registered, owner, paid_at)`.
+    /// The single oracle the upload gate reads: `(registered, owner, expires_at)`.
     /// `registered` is `isRegisteredForApp`; `owner` is zero for an unclaimed app;
-    /// `paid_at` is the app's last subscription timestamp. The gate applies its own
-    /// active-window policy off-chain.
+    /// `expires_at` is when the app's subscription expires, which the gate compares
+    /// with the time.
     function access(bytes32 app_id, address publisher) external view returns (bool, address, uint64) {
         App storage app = apps[app_id];
-        return (isRegisteredForApp(app_id, publisher), app.owner, app.subscribedAt);
+        return (isRegisteredForApp(app_id, publisher), app.owner, app.expiry);
     }
 
     /// `(terms_hash, terms_uri, join_fee, status, registered)` — a join screen in one call
@@ -376,6 +390,55 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
         );
     }
 
+    // ── Subscription (ERC-5643) ───────────────────────────────────────────────
+
+    /// Pay for one more period. Callable by the app's owner, or an address they have
+    /// approved for its token, who pays the subscription fee (USDC; `approve` this
+    /// contract first).
+    ///
+    /// `duration` must be the subscription period, and the app must be renewable: a
+    /// subscription with a period or more left cannot be paid further ahead. The
+    /// period is added to the current expiry, or to now if it has passed.
+    function renewSubscription(uint256 tokenId, uint64 duration) external payable nonReentrant {
+        _checkAuthorized(_ownerOf(tokenId), msg.sender, tokenId);
+        if (msg.value != 0) revert EthNotAccepted();
+        if (duration != subscriptionPeriod) revert DurationMismatch();
+        if (!isRenewable(tokenId)) revert SubscriptionNotRenewable();
+        _paySubscription(bytes32(tokenId), msg.sender);
+    }
+
+    /// End the subscription now, as the standard does: the expiry becomes zero. Nothing
+    /// is refunded. The app stays claimed, and renewing starts a new period from now.
+    /// Callable by the app's owner, or an address they have approved for its token.
+    function cancelSubscription(uint256 tokenId) external payable {
+        _checkAuthorized(_ownerOf(tokenId), msg.sender, tokenId);
+        if (msg.value != 0) revert EthNotAccepted();
+        apps[bytes32(tokenId)].expiry = 0;
+        emit SubscriptionUpdate(tokenId, 0);
+    }
+
+    function expiresAt(uint256 tokenId) external view returns (uint64) {
+        _requireOwned(tokenId);
+        return apps[bytes32(tokenId)].expiry;
+    }
+
+    /// True while less than one period is left, or the subscription has expired.
+    function isRenewable(uint256 tokenId) public view returns (bool) {
+        _requireOwned(tokenId);
+        return apps[bytes32(tokenId)].expiry < block.timestamp + subscriptionPeriod;
+    }
+
+    function supportsInterface(bytes4 interface_id) public view override returns (bool) {
+        return interface_id == type(IERC5643).interfaceId || super.supportsInterface(interface_id);
+    }
+
+    /// Mint only: an app's token is never transferred or burned, so its owner is
+    /// always `App.owner`.
+    function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
+        if (_ownerOf(tokenId) != address(0)) revert NotTransferable();
+        return super._update(to, tokenId, auth);
+    }
+
     // ── Protocol admin ────────────────────────────────────────────────────────
 
     /// Hand the admin role to another address. The admin is also who may upgrade this
@@ -391,6 +454,12 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
     function setSubscriptionFee(uint256 fee) external onlyAdmin {
         subscriptionFee = fee;
         emit SubscriptionFeeChanged(fee);
+    }
+
+    /// Change how long one payment lasts. Expiries already set stay as they are; the
+    /// new period applies from each app's next payment.
+    function setSubscriptionPeriod(uint64 period) external onlyAdmin {
+        _setSubscriptionPeriod(period);
     }
 
     /// Point commits at a DataRegistry. Until one is set, every commit reverts.
@@ -434,7 +503,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
         acceptedTerms[app_id][owner] = terms_hash;
     }
 
-    /// Pull the subscription fee from `payer` and stamp the app as paid now.
+    /// Pull the subscription fee from `payer` and add one period to the app's expiry,
+    /// counted from now if it has passed.
     function _paySubscription(bytes32 app_id, address payer) private {
         uint256 fee = subscriptionFee;
         if (
@@ -443,9 +513,17 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ReentrancyGuardTransient
                     abi.encodeWithSignature("transferFrom(address,address,uint256)", payer, address(this), fee)
                 )
         ) revert SubscriptionFeeRequired();
-        uint64 paidAt = uint64(block.timestamp);
-        apps[app_id].subscribedAt = paidAt;
-        emit AppSubscribed(app_id, payer, paidAt);
+        App storage app = apps[app_id];
+        uint64 from = app.expiry > block.timestamp ? app.expiry : uint64(block.timestamp);
+        uint64 expiry = from + subscriptionPeriod;
+        app.expiry = expiry;
+        emit SubscriptionUpdate(uint256(app_id), expiry);
+    }
+
+    function _setSubscriptionPeriod(uint64 period) private {
+        if (period == 0) revert ZeroPeriod();
+        subscriptionPeriod = period;
+        emit SubscriptionPeriodChanged(period);
     }
 
     /// Call the fee token and require a clean `true` back. A revert, no contract at

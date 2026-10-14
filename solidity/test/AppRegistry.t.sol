@@ -6,6 +6,10 @@ import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {IERC5643} from "../src/IERC5643.sol";
 import {MockUSDC, Proxied} from "./Mocks.sol";
 
 /// An app owner that cannot receive ETH, so a join fee paid to it is undeliverable.
@@ -62,6 +66,8 @@ contract AppRegistryTest is Test {
     bytes32 constant TERMS_V2 = bytes32(uint256(0x22));
     uint256 constant FEE = 0.001 ether;
     uint256 constant SUB_FEE = 2_000_000; // 2 USDC (6 decimals)
+    uint64 constant PERIOD = 30 days;
+    uint64 constant T0 = 1_700_000_000;
 
     uint8 constant STATUS_UNREGISTERED = 0;
     uint8 constant STATUS_ACTIVE = 1;
@@ -75,7 +81,7 @@ contract AppRegistryTest is Test {
     /// Nobody registers anywhere: the three everyday wallets only hold ETH.
     function setUp() public {
         usdc = new MockUSDC();
-        apps = Proxied.appRegistry(ADMIN, address(usdc), 0);
+        apps = Proxied.appRegistry(ADMIN, address(usdc), 0, PERIOD);
         data = Proxied.dataRegistry(ADMIN, address(apps));
         vm.prank(ADMIN);
         apps.setDataRegistry(address(data));
@@ -455,41 +461,33 @@ contract AppRegistryTest is Test {
             vm.expectRevert(AppRegistry.SubscriptionFeeRequired.selector);
             apps.registerApp(OTHER_APP, TERMS_V1, "", 0);
             assertEq(apps.getAppOwner(OTHER_APP), address(0), "an unpaid claim left an app behind");
-            assertEq(apps.subscribedAt(OTHER_APP), 0);
+            assertEq(apps.balanceOf(STRANGER), 0, "an unpaid claim minted a token");
         }
         usdc.setMode(MockUSDC.Mode.Ok);
 
-        vm.warp(1_700_000_000);
+        vm.warp(T0);
+        vm.expectEmit(true, true, true, true, address(apps));
+        emit IERC5643.SubscriptionUpdate(uint256(APP), T0 + PERIOD);
         vm.prank(APP_OWNER);
         apps.registerApp(APP, TERMS_V1, "", 0);
-        assertEq(apps.subscribedAt(APP), 1_700_000_000);
+        assertEq(apps.expiresAt(uint256(APP)), T0 + PERIOD);
         // The fee was pulled from the claimer into the registry.
         assertEq(usdc.lastFrom(), APP_OWNER);
         assertEq(usdc.lastTo(), address(apps));
         assertEq(usdc.lastAmount(), SUB_FEE);
 
-        // The gate's one read: membership, who owns the app, and when it last paid.
-        (bool registered, address owner, uint64 paidAt) = apps.access(APP, APP_OWNER);
+        // The gate's one read: membership, who owns the app, and when it expires.
+        (bool registered, address owner, uint64 expiry) = apps.access(APP, APP_OWNER);
         assertTrue(registered);
         assertEq(owner, APP_OWNER);
-        assertEq(paidAt, 1_700_000_000);
-        (registered, owner, paidAt) = apps.access(APP, STRANGER);
+        assertEq(expiry, T0 + PERIOD);
+        (registered, owner, expiry) = apps.access(APP, STRANGER);
         assertFalse(registered);
         assertEq(owner, APP_OWNER);
-        (registered, owner, paidAt) = apps.access(OTHER_APP, STRANGER);
+        (registered, owner, expiry) = apps.access(OTHER_APP, STRANGER);
         assertFalse(registered);
         assertEq(owner, address(0));
-        assertEq(paidAt, 0);
-
-        // Renewing is the owner's to do, and re-stamps to the new now.
-        vm.warp(1_700_100_000);
-        vm.prank(STRANGER);
-        vm.expectRevert(AppRegistry.Unauthorized.selector);
-        apps.renewApp(APP);
-        vm.prank(APP_OWNER);
-        apps.renewApp(APP);
-        assertEq(apps.subscribedAt(APP), 1_700_100_000);
-        assertEq(usdc.calls(), 2);
+        assertEq(expiry, 0);
     }
 
     function test_a_free_subscription_never_touches_the_token() public {
@@ -499,6 +497,205 @@ contract AppRegistryTest is Test {
         apps.registerApp(APP, TERMS_V1, "", 0);
         assertEq(apps.getAppOwner(APP), APP_OWNER);
         assertEq(usdc.calls(), 0);
+    }
+
+    // ── the app's token (ERC-721, ERC-5643) ───────────────────────────────────
+
+    function test_claiming_mints_the_apps_token() public {
+        vm.expectEmit(true, true, true, true, address(apps));
+        emit IERC721.Transfer(address(0), APP_OWNER, uint256(APP));
+        openApp();
+        assertEq(apps.ownerOf(uint256(APP)), APP_OWNER);
+        assertEq(apps.balanceOf(APP_OWNER), 1);
+        assertEq(apps.name(), "FAPP");
+        assertEq(apps.symbol(), "FAPP");
+
+        assertTrue(apps.supportsInterface(0x01ffc9a7), "ERC-165");
+        assertTrue(apps.supportsInterface(0x80ac58cd), "ERC-721");
+        assertTrue(apps.supportsInterface(0x5b5e139f), "ERC-721 metadata");
+        assertTrue(apps.supportsInterface(0x8c65f84d), "ERC-5643");
+        assertEq(type(IERC5643).interfaceId, bytes4(0x8c65f84d));
+        assertFalse(apps.supportsInterface(0xffffffff));
+
+        // No token, no answer: the standard's reads revert for an unknown token.
+        bytes memory unknown = abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, uint256(GHOST_APP));
+        vm.expectRevert(unknown);
+        apps.expiresAt(uint256(GHOST_APP));
+        vm.expectRevert(unknown);
+        apps.isRenewable(uint256(GHOST_APP));
+    }
+
+    /// The token stays with the app's owner: no transfer, by its owner or anyone they
+    /// approve, so it can never disagree with `getAppOwner`.
+    function test_an_apps_token_cannot_be_transferred() public {
+        openApp();
+        vm.startPrank(APP_OWNER);
+        vm.expectRevert(AppRegistry.NotTransferable.selector);
+        apps.transferFrom(APP_OWNER, STRANGER, uint256(APP));
+        vm.expectRevert(AppRegistry.NotTransferable.selector);
+        apps.safeTransferFrom(APP_OWNER, STRANGER, uint256(APP));
+        apps.approve(STRANGER, uint256(APP));
+        vm.stopPrank();
+        vm.prank(STRANGER);
+        vm.expectRevert(AppRegistry.NotTransferable.selector);
+        apps.transferFrom(APP_OWNER, STRANGER, uint256(APP));
+
+        assertEq(apps.ownerOf(uint256(APP)), APP_OWNER);
+        assertEq(apps.getAppOwner(APP), APP_OWNER);
+    }
+
+    /// A renewal adds one period to the expiry, and only once less than a period is
+    /// left: an owner cannot pay several periods ahead.
+    function test_a_renewal_extends_the_expiry_by_one_period() public {
+        vm.warp(T0);
+        openApp();
+        vm.prank(ADMIN);
+        apps.setSubscriptionFee(SUB_FEE);
+
+        // A full period is left at claim: not yet.
+        assertFalse(apps.isRenewable(uint256(APP)));
+        vm.prank(APP_OWNER);
+        vm.expectRevert(AppRegistry.SubscriptionNotRenewable.selector);
+        apps.renewSubscription(uint256(APP), PERIOD);
+
+        vm.warp(T0 + 1);
+        assertTrue(apps.isRenewable(uint256(APP)));
+        vm.expectEmit(true, true, true, true, address(apps));
+        emit IERC5643.SubscriptionUpdate(uint256(APP), T0 + 2 * PERIOD);
+        vm.prank(APP_OWNER);
+        apps.renewSubscription(uint256(APP), PERIOD);
+        assertEq(apps.expiresAt(uint256(APP)), T0 + 2 * PERIOD, "extended from the expiry, not from now");
+        assertEq(usdc.lastFrom(), APP_OWNER);
+        assertEq(usdc.lastAmount(), SUB_FEE);
+
+        // Paid a period ahead: no more until less than a period is left again.
+        vm.prank(APP_OWNER);
+        vm.expectRevert(AppRegistry.SubscriptionNotRenewable.selector);
+        apps.renewSubscription(uint256(APP), PERIOD);
+        vm.warp(T0 + PERIOD + 1);
+        assertTrue(apps.isRenewable(uint256(APP)));
+    }
+
+    /// After the expiry has passed, a renewal starts a full period from now: the time
+    /// spent lapsed is not paid for.
+    function test_a_lapsed_subscription_renews_from_now() public {
+        vm.warp(T0);
+        openApp();
+        vm.warp(T0 + PERIOD + 1000);
+        vm.prank(APP_OWNER);
+        apps.renewSubscription(uint256(APP), PERIOD);
+        assertEq(apps.expiresAt(uint256(APP)), T0 + 2 * PERIOD + 1000);
+    }
+
+    function test_a_renewal_is_one_period_by_the_owner_or_their_approved() public {
+        vm.warp(T0);
+        openApp();
+        vm.warp(T0 + 1);
+
+        vm.startPrank(APP_OWNER);
+        vm.expectRevert(AppRegistry.DurationMismatch.selector);
+        apps.renewSubscription(uint256(APP), PERIOD - 1);
+        vm.expectRevert(AppRegistry.DurationMismatch.selector);
+        apps.renewSubscription(uint256(APP), 2 * PERIOD);
+        // The fee is USDC: ETH sent with it would be stuck.
+        vm.expectRevert(AppRegistry.EthNotAccepted.selector);
+        apps.renewSubscription{value: 1}(uint256(APP), PERIOD);
+        vm.stopPrank();
+
+        vm.prank(STRANGER);
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC721Errors.ERC721InsufficientApproval.selector, STRANGER, uint256(APP))
+        );
+        apps.renewSubscription(uint256(APP), PERIOD);
+        vm.prank(STRANGER);
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, uint256(GHOST_APP)));
+        apps.renewSubscription(uint256(GHOST_APP), PERIOD);
+
+        // Someone the owner approves may renew, and pays.
+        vm.prank(ADMIN);
+        apps.setSubscriptionFee(SUB_FEE);
+        vm.prank(APP_OWNER);
+        apps.approve(STRANGER, uint256(APP));
+        vm.prank(STRANGER);
+        apps.renewSubscription(uint256(APP), PERIOD);
+        assertEq(apps.expiresAt(uint256(APP)), T0 + 2 * PERIOD);
+        assertEq(usdc.lastFrom(), STRANGER);
+    }
+
+    /// Cancelling ends the subscription now, as the standard does: the expiry becomes
+    /// zero. The app stays claimed, and a renewal starts over from now.
+    function test_cancelling_ends_the_subscription_now() public {
+        vm.warp(T0);
+        openApp();
+
+        vm.prank(STRANGER);
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC721Errors.ERC721InsufficientApproval.selector, STRANGER, uint256(APP))
+        );
+        apps.cancelSubscription(uint256(APP));
+        vm.prank(APP_OWNER);
+        vm.expectRevert(AppRegistry.EthNotAccepted.selector);
+        apps.cancelSubscription{value: 1}(uint256(APP));
+
+        vm.expectEmit(true, true, true, true, address(apps));
+        emit IERC5643.SubscriptionUpdate(uint256(APP), 0);
+        vm.prank(APP_OWNER);
+        apps.cancelSubscription(uint256(APP));
+        assertEq(apps.expiresAt(uint256(APP)), 0);
+        (,, uint64 expiry) = apps.access(APP, APP_OWNER);
+        assertEq(expiry, 0);
+        assertEq(apps.getAppOwner(APP), APP_OWNER);
+
+        assertTrue(apps.isRenewable(uint256(APP)));
+        vm.warp(T0 + 500);
+        vm.prank(APP_OWNER);
+        apps.renewSubscription(uint256(APP), PERIOD);
+        assertEq(apps.expiresAt(uint256(APP)), T0 + 500 + PERIOD);
+    }
+
+    /// The admin sets the period. A change applies from each app's next payment and
+    /// leaves expiries already set alone.
+    function test_a_new_period_applies_from_the_next_payment() public {
+        vm.warp(T0);
+        openApp();
+        uint64 week = 7 days;
+
+        vm.prank(APP_OWNER);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.setSubscriptionPeriod(week);
+        vm.prank(ADMIN);
+        vm.expectRevert(AppRegistry.ZeroPeriod.selector);
+        apps.setSubscriptionPeriod(0);
+
+        vm.expectEmit(true, true, true, true, address(apps));
+        emit AppRegistry.SubscriptionPeriodChanged(week);
+        vm.prank(ADMIN);
+        apps.setSubscriptionPeriod(week);
+        assertEq(apps.subscriptionPeriod(), week);
+        assertEq(apps.expiresAt(uint256(APP)), T0 + PERIOD, "an expiry already paid for moved");
+
+        // Renewable once less than the new period is left, and for the new period only.
+        vm.warp(T0 + PERIOD - week);
+        assertFalse(apps.isRenewable(uint256(APP)));
+        vm.warp(T0 + PERIOD - week + 1);
+        vm.startPrank(APP_OWNER);
+        vm.expectRevert(AppRegistry.DurationMismatch.selector);
+        apps.renewSubscription(uint256(APP), PERIOD);
+        apps.renewSubscription(uint256(APP), week);
+        vm.stopPrank();
+        assertEq(apps.expiresAt(uint256(APP)), T0 + PERIOD + week);
+
+        // A new app is claimed for the new period.
+        vm.prank(STRANGER);
+        apps.registerApp(OTHER_APP, TERMS_V1, "", 0);
+        assertEq(apps.expiresAt(uint256(OTHER_APP)), block.timestamp + week);
+    }
+
+    function test_the_period_cannot_start_at_zero() public {
+        address implementation = address(new AppRegistry());
+        bytes memory init = abi.encodeCall(AppRegistry.initialize, (ADMIN, address(usdc), 0, 0));
+        vm.expectRevert(AppRegistry.ZeroPeriod.selector);
+        new ERC1967Proxy(implementation, init);
     }
 
     function test_only_the_admin_sweeps_the_subscription_fees() public {
@@ -763,7 +960,7 @@ contract AppRegistryTest is Test {
     function test_an_upgrade_keeps_state_and_only_the_admin_can_do_it() public {
         openApp();
         join(PUBLISHER, APP, TERMS_V1, FEE);
-        uint64 paidAt = apps.subscribedAt(APP);
+        uint64 expiry = apps.expiresAt(uint256(APP));
         address v2 = address(new AppRegistryUpgradeMock());
 
         vm.prank(APP_OWNER);
@@ -780,25 +977,25 @@ contract AppRegistryTest is Test {
         assertEq(apps.appTerms(APP), TERMS_V1);
         assertEq(apps.appTermsUri(APP), "https://tabs.example/terms");
         assertEq(apps.appFee(APP), FEE);
-        assertEq(apps.subscribedAt(APP), paidAt);
+        assertEq(apps.expiresAt(uint256(APP)), expiry);
+        assertEq(apps.ownerOf(uint256(APP)), APP_OWNER);
+        assertEq(apps.name(), "FAPP");
         assertTrue(apps.isRegisteredForApp(APP, PUBLISHER));
 
         // Still the contract the DataRegistry takes commits from.
         vm.prank(PUBLISHER);
         apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
-        vm.prank(APP_OWNER);
-        apps.renewApp(APP);
     }
 
     /// `initialize` stands in for the constructor, so it runs exactly once — and never
     /// on the bare implementation, which nobody should be able to take over.
     function test_initialize_runs_once_and_never_on_the_implementation() public {
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        apps.initialize(STRANGER, address(usdc), 0);
+        apps.initialize(STRANGER, address(usdc), 0, PERIOD);
 
         AppRegistry implementation = new AppRegistry();
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        implementation.initialize(STRANGER, address(usdc), 0);
+        implementation.initialize(STRANGER, address(usdc), 0, PERIOD);
     }
 
     /// The admin role moves, and the right to upgrade moves with it.
