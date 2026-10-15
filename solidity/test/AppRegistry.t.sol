@@ -248,7 +248,7 @@ contract AppRegistryTest is Test {
         vm.stopPrank();
 
         vm.startPrank(APP_OWNER);
-        vm.expectRevert(AppRegistry.AlreadyInApp.selector);
+        vm.expectRevert(AppRegistry.AlreadyInvited.selector);
         apps.invitePublisher(APP, PUBLISHER);
 
         // The owner can take an invitation back before it is used.
@@ -638,8 +638,8 @@ contract AppRegistryTest is Test {
         openApp();
         assertEq(apps.ownerOf(uint256(APP)), APP_OWNER);
         assertEq(apps.balanceOf(APP_OWNER), 1);
-        assertEq(apps.name(), "FAPP");
-        assertEq(apps.symbol(), "FAPP");
+        assertEq(apps.name(), "FANGAPP");
+        assertEq(apps.symbol(), "FANGAPP");
 
         assertTrue(apps.supportsInterface(0x01ffc9a7), "ERC-165");
         assertTrue(apps.supportsInterface(0x80ac58cd), "ERC-721");
@@ -1189,7 +1189,7 @@ contract AppRegistryTest is Test {
         assertEq(apps.joinFee(APP), FEE);
         assertEq(apps.expiresAt(uint256(APP)), expiry);
         assertEq(apps.ownerOf(uint256(APP)), APP_OWNER);
-        assertEq(apps.name(), "FAPP");
+        assertEq(apps.name(), "FANGAPP");
         assertTrue(apps.canPublish(APP, PUBLISHER));
 
         // Still the contract the DataRegistry takes commits from.

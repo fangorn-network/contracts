@@ -94,7 +94,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     error NotInvited();
     /// `invitePublisher`: the wallet is already invited to, a member of, or suspended from
     /// this app
-    error AlreadyInApp();
+    error AlreadyInvited();
     /// Committing, accepting updated terms or being suspended: invited, but has not
     /// joined (`joinApp`). An invitation is taken back with `revokeInvitation`.
     error NotJoined();
@@ -356,7 +356,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// the protocol admin has banned.
     function invitePublisher(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
         if (globalSuspensions[publisher]) revert PublisherSuspendedGlobal();
-        if (statusForApp[app_id][publisher] != Status.None) revert AlreadyInApp();
+        if (statusForApp[app_id][publisher] != Status.None) revert AlreadyInvited();
         statusForApp[app_id][publisher] = Status.Invited;
         emit PublisherInvited(app_id, publisher);
     }
