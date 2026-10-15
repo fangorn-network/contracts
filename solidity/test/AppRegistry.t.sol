@@ -910,6 +910,40 @@ contract AppRegistryTest is Test {
         assertFalse(apps.globalSuspensions(STRANGER));
     }
 
+    /// A banned owner's app keeps running, but the owner cannot bring anyone in (which
+    /// would let them keep publishing through new wallets) or change what the app
+    /// points to. Lifting the ban gives all of it back.
+    function test_a_banned_owner_cannot_invite_or_repoint_their_app() public {
+        openApp();
+        join(PUBLISHER, APP, TERMS_V1, FEE);
+        vm.prank(ADMIN);
+        apps.setGlobalSuspension(APP_OWNER, true);
+
+        vm.startPrank(APP_OWNER);
+        vm.expectRevert(AppRegistry.PublisherSuspendedGlobal.selector);
+        apps.invitePublisher(APP, makeAddr("sock-puppet"));
+        vm.expectRevert(AppRegistry.PublisherSuspendedGlobal.selector);
+        apps.setAppTerms(APP, TERMS_V2, "https://elsewhere.example/terms");
+        vm.expectRevert(AppRegistry.PublisherSuspendedGlobal.selector);
+        apps.setAppAgentUri(APP, "https://elsewhere.example/card");
+        vm.stopPrank();
+        assertEq(uint8(apps.statusForApp(APP, makeAddr("sock-puppet"))), STATUS_NONE);
+        assertEq(apps.appTerms(APP), TERMS_V1);
+        assertEq(apps.appAgentUri(APP), "");
+
+        // The app itself keeps running for its other publishers.
+        vm.prank(PUBLISHER);
+        apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+
+        vm.prank(ADMIN);
+        apps.setGlobalSuspension(APP_OWNER, false);
+        vm.startPrank(APP_OWNER);
+        apps.invitePublisher(APP, makeAddr("sock-puppet"));
+        apps.setAppTerms(APP, TERMS_V2, "");
+        apps.setAppAgentUri(APP, "ipfs://card");
+        vm.stopPrank();
+    }
+
     /// The reason the check exists: a wallet the protocol admin banned network-wide
     /// cannot come back as an app owner, or be brought into an app by one.
     function test_a_globally_banned_wallet_can_neither_claim_nor_be_added() public {

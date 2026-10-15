@@ -115,7 +115,9 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     error PublisherNotSuspended();
     /// `setPublisherSuspended`: an app's owner cannot suspend themselves from it
     error CannotSuspendOwner();
-    /// The protocol admin has suspended the publisher network-wide (`setGlobalSuspension`)
+    /// The protocol admin has suspended this wallet network-wide (`setGlobalSuspension`):
+    /// the caller, the publisher named, or (for inviting and changing what the app points
+    /// to) the app's owner
     error PublisherSuspendedGlobal();
 
     // Publishing
@@ -309,7 +311,11 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     ///
     /// Note: every publisher who accepted the previous terms can no longer publish
     /// until they accept the new ones (`acceptUpdatedTerms`, free).
+    ///
+    /// An owner banned network-wide cannot change the terms (`PublisherSuspendedGlobal`):
+    /// their app keeps running as it is, but they cannot change what it points to.
     function setAppTerms(bytes32 app_id, bytes32 terms_hash, string calldata terms_uri) external onlyAppOwner(app_id) {
+        if (globalSuspensions[msg.sender]) revert PublisherSuspendedGlobal();
         if (terms_hash == bytes32(0)) revert TermsNotSet();
         App storage app = apps[app_id];
         app.appTerms = terms_hash;
@@ -338,8 +344,10 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         emit JoinFeesWithdrawn(msg.sender, to, amount);
     }
 
-    /// Point at the app's ERC-8004 agent card. Only callable by the app owner.
+    /// Point at the app's ERC-8004 agent card. Only callable by the app owner, and not
+    /// by one banned network-wide (`PublisherSuspendedGlobal`).
     function setAppAgentUri(bytes32 app_id, string calldata agent_uri) external onlyAppOwner(app_id) {
+        if (globalSuspensions[msg.sender]) revert PublisherSuspendedGlobal();
         apps[app_id].appAgentUri = agent_uri;
         emit AppAgentChanged(app_id, agent_uri);
     }
@@ -352,9 +360,11 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// terms (and pay the join fee) with `joinApp`. Nobody can join uninvited.
     /// Take an invitation back with `revokeInvitation`.
     ///
-    /// The publisher must not be banned network-wide: an owner cannot bring in a wallet
-    /// the protocol admin has banned.
+    /// Neither side may be banned network-wide (`PublisherSuspendedGlobal`): an owner
+    /// cannot bring in a wallet the protocol admin has banned, and a banned owner cannot
+    /// bring in anyone, which would let them keep publishing through new wallets.
     function invitePublisher(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
+        if (globalSuspensions[msg.sender]) revert PublisherSuspendedGlobal();
         if (globalSuspensions[publisher]) revert PublisherSuspendedGlobal();
         if (statusForApp[app_id][publisher] != Status.None) revert AlreadyInvited();
         statusForApp[app_id][publisher] = Status.Invited;
