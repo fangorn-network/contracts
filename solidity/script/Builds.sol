@@ -54,7 +54,17 @@ abstract contract Builds is Script {
 
     /// Reverts unless the one build in `deployed/<name>/<implementation>/` is the
     /// runtime code at `implementation`, instruction for instruction.
+    ///
+    /// A build is several megabytes, and each JSON lookup below copies it into memory
+    /// again. Solidity never frees memory, and its gas cost grows with the square of its
+    /// size, so a script that checks two or three builds in a row ran out of gas
+    /// (MemoryOOG). Nothing allocated here is used after it returns, so it hands its
+    /// memory back at the end: the next check reuses the same space.
     function _requireReferenceIsLive(string memory name, address implementation) internal view {
+        uint256 freeMemory;
+        assembly {
+            freeMemory := mload(0x40)
+        }
         string memory dir = _dir(name, implementation);
         require(
             vm.isDir(dir),
@@ -103,5 +113,9 @@ abstract contract Builds is Script {
                 dir, " is not the code at that address. Rebuild it from the commit that was deployed (README, Upgrade)."
             )
         );
+
+        assembly {
+            mstore(0x40, freeMemory)
+        }
     }
 }
