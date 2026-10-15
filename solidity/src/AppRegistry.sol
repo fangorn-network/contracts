@@ -246,7 +246,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         external
         initializer
     {
-        __ERC721_init("FAPP", "FAPP");
+        __ERC721_init("FANGAPP", "FANGAPP");
         admin = admin_;
         usdc = usdc_;
         subscriptionFee = subscriptionFee_;
