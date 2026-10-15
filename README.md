@@ -6,6 +6,16 @@ The three core Fangorn contracts written in Solidity: the AppRegistry, the DataR
 
 Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak256(app_id || publisher || subspace_id)`, stored in the DataRegistry. The graph itself is content-addressed IPLD off-chain (IPFS/Pinata). The DataRegistry represents the onchain pointer to the latest head.
 
+## Deployed
+
+Arbitrum Sepolia (chain 421614). Use the proxy address since upgrades only change the implementation behind it. `solidity/script/Deployments.sol` is the source of truth, and `forge script script/Upgrade.s.sol --sig "check()" --rpc-url <rpc>` confirms the builds in `solidity/deployed/` are the live code.
+
+| Contract | Proxy |
+|---|---|
+| AppRegistry | `0x55e6209ea1833ceD900989a3b3b22466934E04A5` (created in block 319536642) |
+| DataRegistry | `0x72B5f83526F3893aF9f1eE0f32A27218EA09f8aE` |
+| MembershipRegistry | `0xDF17030Cd65435C86eb043F31DDACa99E819E347` |
+
 ## Architecture
 
 ```

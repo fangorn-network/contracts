@@ -52,13 +52,13 @@ library Deployments {
     /// The proxy of `name` on `chainId`, or zero while it is not deployed there.
     function recorded(string memory name, uint256 chainId) internal pure returns (address) {
         current(name); // an unknown name is a different mistake from a missing address
+        bytes32 n = keccak256(bytes(name));
         if (chainId == ARBITRUM_SEPOLIA) {
-            // None yet: the registries are being deployed afresh. The proxies before
-            // them, now retired, were AppRegistry 0x57b41E334864B430db44F7FbCD8d165C56e41402,
-            // DataRegistry 0x0312503913656f25c2bfDf229425aA6926ccF1Cd and
-            // MembershipRegistry 0x57B95b9B20C31E146aDF619Dafc4539e056360a5. Add each new
-            // one as
-            //   if (keccak256(bytes(name)) == keccak256("AppRegistry")) return 0x…;
+            // Deployed with Deploy.s.sol all(); the AppRegistry's proxy was created in
+            // block 319536642.
+            if (n == keccak256("AppRegistry")) return 0x55e6209ea1833ceD900989a3b3b22466934E04A5;
+            if (n == keccak256("DataRegistry")) return 0x72B5f83526F3893aF9f1eE0f32A27218EA09f8aE;
+            if (n == keccak256("MembershipRegistry")) return 0xDF17030Cd65435C86eb043F31DDACa99E819E347;
         }
         return address(0);
     }
