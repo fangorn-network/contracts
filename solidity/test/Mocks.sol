@@ -14,6 +14,9 @@ contract MockUSDC {
     }
 
     Mode public mode;
+    /// What each address has received and not sent on. A payer is never checked for
+    /// funds (these tests are about who gets paid), but what a registry holds can be.
+    mapping(address => uint256) public balanceOf;
     address public lastFrom;
     address public lastTo;
     uint256 public lastAmount;
@@ -29,7 +32,10 @@ contract MockUSDC {
         lastTo = to;
         lastAmount = amount;
         calls += 1;
-        return mode == Mode.Ok;
+        if (mode != Mode.Ok) return false;
+        balanceOf[to] += amount;
+        if (balanceOf[from] >= amount) balanceOf[from] -= amount;
+        return true;
     }
 
     function approve(address, uint256) external pure returns (bool) {
