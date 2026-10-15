@@ -37,7 +37,7 @@ Almost nothing lives on-chain. A publisher's namespace is one `bytes32`, `keccak
                                  plan, and who is paid
 ```
 
-Publishers commit through the AppRegistry which. It decides who may publish (apps, memberships and the protocol admin's network-wide ban all live in it) and forwards each commit it allows to the DataRegistry, which accepts commits from that AppRegistry and no one else. Each stores the other's address and the admin can repoint either (`setDataRegistry`, `setAppRegistry`), so replacing one contract is a deploy plus two calls.
+Publishers commit through the AppRegistry which proxies the call to the DataRegistry. It decides who may publish (apps, memberships and the protocol admin's network-wide ban all live in it) and forwards each commit it allows to the DataRegistry, which accepts commits from that AppRegistry and no one else. Each stores the other's address and the admin can repoint either (`setDataRegistry`, `setAppRegistry`), so replacing one contract is a deploy plus two calls.
 
 ### Contract Communication
 
