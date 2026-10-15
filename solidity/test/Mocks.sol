@@ -14,6 +14,9 @@ contract MockUSDC {
     }
 
     Mode public mode;
+    /// What each address has received and not sent on. A payer is never checked for
+    /// funds (these tests are about who gets paid), but what a registry holds can be.
+    mapping(address => uint256) public balanceOf;
     address public lastFrom;
     address public lastTo;
     uint256 public lastAmount;
@@ -29,7 +32,10 @@ contract MockUSDC {
         lastTo = to;
         lastAmount = amount;
         calls += 1;
-        return mode == Mode.Ok;
+        if (mode != Mode.Ok) return false;
+        balanceOf[to] += amount;
+        if (balanceOf[from] >= amount) balanceOf[from] -= amount;
+        return true;
     }
 
     function approve(address, uint256) external pure returns (bool) {
@@ -173,32 +179,15 @@ contract MockHook {
     }
 }
 
-/// The AppRegistry, as far as the DataRegistry can see it: one settable answer per
-/// (app, publisher).
-contract MockAppRegistry {
-    mapping(bytes32 => mapping(address => bool)) public isRegisteredForApp;
-
-    function setMember(bytes32 appId, address publisher, bool joined) external {
-        isRegisteredForApp[appId][publisher] = joined;
-    }
-}
-
-/// Reverts on every call, including the views the registries cross-call.
-contract Reverter {
-    fallback() external payable {
-        revert("no");
-    }
-}
-
 /// Deploys each registry the way `deploy.sh` does: an implementation, and the ERC-1967
 /// proxy that initializes it. What comes back is the proxy, so every test runs against
-/// proxy storage — including the reentrancy guard, which starts at zero there.
+/// proxy storage.
 library Proxied {
-    function appRegistry(address admin, address usdc, uint256 subscriptionFee, address dataRegistry_)
+    function appRegistry(address admin, address usdc, uint256 subscriptionFee, uint64 subscriptionPeriod)
         internal
         returns (AppRegistry)
     {
-        bytes memory init = abi.encodeCall(AppRegistry.initialize, (admin, usdc, subscriptionFee, dataRegistry_));
+        bytes memory init = abi.encodeCall(AppRegistry.initialize, (admin, usdc, subscriptionFee, subscriptionPeriod));
         return AppRegistry(address(new ERC1967Proxy(address(new AppRegistry()), init)));
     }
 

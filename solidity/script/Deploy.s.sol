@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Script, console} from "forge-std/Script.sol";
+import {console} from "forge-std/Script.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
 import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
 import {MembershipRegistry} from "../src/MembershipRegistry.sol";
+import {Builds} from "./Builds.sol";
 import {Deployments} from "./Deployments.sol";
 
 /// Deploys the Fangorn contracts, each behind its own ERC-1967 proxy (UUPS).
@@ -16,13 +18,19 @@ import {Deployments} from "./Deployments.sol";
 ///
 /// `--force` is not optional: the upgrade-safety check needs a full build.
 ///
-///   all()                               AppRegistry and DataRegistry, wired to each
-///                                       other, and the default app claimed
+///   all()                               all three registries, the AppRegistry and the
+///                                       DataRegistry wired to each other, and the
+///                                       default app claimed
 ///   appRegistry(address dataRegistry)   a new AppRegistry in front of an existing
 ///                                       DataRegistry, which is repointed at it
 ///   dataRegistry(address appRegistry)   a new DataRegistry behind an existing
 ///                                       AppRegistry, which is repointed at it
 ///   membershipRegistry(address appRegistry)
+///
+/// With --broadcast, each new contract's build is written under
+/// `deployed/<Contract>/<implementation address>/`, replacing any older build of it: the
+/// first upgrade is checked against it. Commit it with the broadcast log and the new
+/// addresses in Deployments.sol.
 ///
 /// This is for a FIRST deployment. To change a contract that is already deployed, use
 /// Upgrade.s.sol: it keeps the address and the state. A redeploy starts empty at a new
@@ -32,15 +40,16 @@ import {Deployments} from "./Deployments.sol";
 /// signer who is not the admin, stops it with nothing deployed.
 ///
 /// Parameters are environment variables (Forge also reads a `.env` in this directory):
-///   ADMIN_ADDR              required. Fees, takedowns and upgrades. For all(),
+///   ADMIN_ADDR              required. Fees, bans, takedowns and upgrades. For all(),
 ///                           appRegistry() and dataRegistry() it must be the signer,
 ///                           because the wiring calls are admin-only.
 ///   USDC_ADDR, SEMAPHORE_ADDR
 ///                           default to Arbitrum Sepolia's; required on any other chain
 ///   SUBSCRIPTION_FEE        claiming an app, in USDC base units. Default 0
+///   SUBSCRIPTION_PERIOD     how long one payment lasts, in seconds. Default 30 days
 ///   DEFAULT_APP_NAME, DEFAULT_APP_TERMS_HASH, DEFAULT_APP_TERMS_URI,
 ///   DEFAULT_APP_JOIN_FEE    the app claimed for the deployer. Defaults below
-contract Deploy is Script {
+contract Deploy is Builds {
     address internal constant SEPOLIA_USDC = 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d;
     address internal constant SEPOLIA_SEMAPHORE = 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D;
     // sha256("test"): a placeholder for testing, with no real significance. An app with
@@ -50,38 +59,46 @@ contract Deploy is Script {
     function all() external {
         address admin = _admin();
         vm.startBroadcast();
-        AppRegistry apps = _deployAppRegistry(admin, address(0));
+        AppRegistry apps = _deployAppRegistry(admin);
         DataRegistry data = _deployDataRegistry(admin, address(apps));
-        // Each registry consults the other. Until this is set the AppRegistry treats
-        // every wallet as suspended, and no app can be claimed.
+        // Commits go through the AppRegistry, which forwards them here; the DataRegistry
+        // takes them from that AppRegistry only. Until this is set, nobody can commit.
         apps.setDataRegistry(address(data));
+        address membership = _deployMembershipRegistry(admin, address(apps));
         _claimDefaultApp(apps);
         vm.stopBroadcast();
         _report(apps, data);
+        _reportMembership(membership, admin, address(apps));
+        _recordBuild("AppRegistry", address(apps));
+        _recordBuild("DataRegistry", address(data));
+        _recordBuild("MembershipRegistry", membership);
     }
 
     function appRegistry(address dataRegistry_) external {
         address admin = _admin();
         DataRegistry data = DataRegistry(dataRegistry_);
         vm.startBroadcast();
-        AppRegistry apps = _deployAppRegistry(admin, dataRegistry_);
-        // The existing DataRegistry still checks membership against the old AppRegistry.
-        // Namespace heads stay; apps and memberships do not carry over.
+        AppRegistry apps = _deployAppRegistry(admin);
+        // The existing DataRegistry still takes commits from the old AppRegistry only.
+        // Namespace heads stay; apps, memberships and bans do not carry over.
+        apps.setDataRegistry(dataRegistry_);
         data.setAppRegistry(address(apps));
         _claimDefaultApp(apps);
         vm.stopBroadcast();
         _report(apps, data);
+        _recordBuild("AppRegistry", address(apps));
     }
 
     function dataRegistry(address appRegistry_) external {
         address admin = _admin();
         AppRegistry apps = AppRegistry(appRegistry_);
         vm.startBroadcast();
+        // Namespace heads do not carry over.
         DataRegistry data = _deployDataRegistry(admin, appRegistry_);
-        // Suspensions and namespace heads do not carry over.
         apps.setDataRegistry(address(data));
         vm.stopBroadcast();
         _report(apps, data);
+        _recordBuild("DataRegistry", address(data));
     }
 
     /// The AppRegistry is an argument, not a default: the MembershipRegistry has no
@@ -90,28 +107,27 @@ contract Deploy is Script {
         address admin = _admin();
         require(appRegistry_.code.length != 0, "appRegistry has no code on this chain");
         vm.startBroadcast();
-        address proxy = Upgrades.deployUUPSProxy(
-            Deployments.MEMBERSHIP_REGISTRY,
-            abi.encodeCall(MembershipRegistry.initialize, (admin, _usdc(), _semaphore(), appRegistry_)),
-            Deployments.options("MembershipRegistry")
-        );
+        address proxy = _deployMembershipRegistry(admin, appRegistry_);
         vm.stopBroadcast();
-
-        MembershipRegistry membership = MembershipRegistry(proxy);
-        require(membership.admin() == admin, "MembershipRegistry admin");
-        require(membership.appRegistry() == appRegistry_, "MembershipRegistry appRegistry");
-        console.log("MembershipRegistry: %s", proxy);
+        _reportMembership(proxy, admin, appRegistry_);
         console.log("Record it in script/Deployments.sol.");
+        _recordBuild("MembershipRegistry", proxy);
     }
 
     // ── Steps ─────────────────────────────────────────────────────────────────
 
-    function _deployAppRegistry(address admin, address dataRegistry_) internal returns (AppRegistry) {
+    function _deployAppRegistry(address admin) internal returns (AppRegistry) {
         return AppRegistry(
             Upgrades.deployUUPSProxy(
                 Deployments.APP_REGISTRY,
                 abi.encodeCall(
-                    AppRegistry.initialize, (admin, _usdc(), vm.envOr("SUBSCRIPTION_FEE", uint256(0)), dataRegistry_)
+                    AppRegistry.initialize,
+                    (
+                        admin,
+                        _usdc(),
+                        vm.envOr("SUBSCRIPTION_FEE", uint256(0)),
+                        uint64(vm.envOr("SUBSCRIPTION_PERIOD", uint256(30 days)))
+                    )
                 ),
                 Deployments.options("AppRegistry")
             )
@@ -128,8 +144,15 @@ contract Deploy is Script {
         );
     }
 
-    /// Claims the default app for the deployer. After the wiring: a claim asks the
-    /// DataRegistry whether the claimer is suspended, and pays the subscription fee.
+    function _deployMembershipRegistry(address admin, address appRegistry_) internal returns (address) {
+        return Upgrades.deployUUPSProxy(
+            Deployments.MEMBERSHIP_REGISTRY,
+            abi.encodeCall(MembershipRegistry.initialize, (admin, _usdc(), _semaphore(), appRegistry_)),
+            Deployments.options("MembershipRegistry")
+        );
+    }
+
+    /// Claims the default app for the deployer, which pays the subscription fee.
     function _claimDefaultApp(AppRegistry apps) internal {
         bytes32 termsHash = vm.envOr("DEFAULT_APP_TERMS_HASH", DEFAULT_TERMS_HASH);
         // A zero terms hash leaves the app unjoinable, which reads on the website as
@@ -146,7 +169,8 @@ contract Deploy is Script {
             appId,
             termsHash,
             vm.envOr("DEFAULT_APP_TERMS_URI", string("https://fangorn.network/terms.html")),
-            vm.envOr("DEFAULT_APP_JOIN_FEE", uint256(0))
+            vm.envOr("DEFAULT_APP_JOIN_FEE", uint256(0)),
+            fee
         );
         require(apps.getAppOwner(appId) == deployer, "default app owner");
     }
@@ -160,6 +184,22 @@ contract Deploy is Script {
         console.log("AppRegistry:  %s", address(apps));
         console.log("DataRegistry: %s", address(data));
         console.log("Record the new address(es) in script/Deployments.sol.");
+    }
+
+    function _reportMembership(address proxy, address admin, address appRegistry_) internal view {
+        MembershipRegistry membership = MembershipRegistry(proxy);
+        require(membership.admin() == admin, "MembershipRegistry admin");
+        require(membership.appRegistry() == appRegistry_, "MembershipRegistry appRegistry");
+        console.log("MembershipRegistry: %s", proxy);
+    }
+
+    /// With --broadcast, writes the build of `proxy`'s implementation under `deployed/`
+    /// (see the top of this file). A dry run writes nothing.
+    function _recordBuild(string memory name, address proxy) internal {
+        if (!vm.isContext(VmSafe.ForgeContext.ScriptBroadcast)) return;
+        address implementation = Upgrades.getImplementationAddress(proxy);
+        _record(name, address(0), implementation);
+        console.log("Build of %s: %s", name, _dir(name, implementation));
     }
 
     // ── Parameters ────────────────────────────────────────────────────────────

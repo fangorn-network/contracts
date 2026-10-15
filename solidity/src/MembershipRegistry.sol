@@ -3,12 +3,13 @@ pragma solidity ^0.8.24;
 
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
-import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import {ERC721Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import {EIP712Upgradeable} from "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {NonReentrant} from "./NonReentrant.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {IERC5643} from "./IERC5643.sol";
 
 interface ISemaphore {
     struct SemaphoreProof {
@@ -61,16 +62,6 @@ interface IERC5192 {
     function locked(uint256 tokenId) external view returns (bool);
 }
 
-/// ERC-5643: an expirable token
-interface IERC5643 {
-    event SubscriptionUpdate(uint256 indexed tokenId, uint64 expiration);
-
-    function renewSubscription(uint256 tokenId, uint64 duration) external payable;
-    function cancelSubscription(uint256 tokenId) external payable;
-    function expiresAt(uint256 tokenId) external view returns (uint64);
-    function isRenewable(uint256 tokenId) external view returns (bool);
-}
-
 /// MembershipRegistry
 ///
 /// Time-limited access to an app's paid records, held by an address nobody can tie to
@@ -91,7 +82,16 @@ interface IERC5643 {
 /// `setUserBySig` lets a holder with no gas name it; anyone may submit the signature.
 ///
 /// Deployed behind an ERC-1967 proxy (UUPS). Storage is append-only.
-contract MembershipRegistry is Initializable, UUPSUpgradeable, ERC721, EIP712, NonReentrant, IERC4907, IERC5192, IERC5643 {
+contract MembershipRegistry is
+    Initializable,
+    UUPSUpgradeable,
+    ERC721Upgradeable,
+    EIP712Upgradeable,
+    ReentrancyGuardTransient,
+    IERC4907,
+    IERC5192,
+    IERC5643
+{
     using SafeERC20 for IERC20;
 
     error Unauthorized();
@@ -107,7 +107,7 @@ contract MembershipRegistry is Initializable, UUPSUpgradeable, ERC721, EIP712, N
     event PlanSet(bytes32 indexed app_id, uint256 price, uint64 period);
     event Joined(bytes32 indexed app_id, uint256 indexed epoch, uint256 commitment);
     event Claimed(bytes32 indexed app_id, uint256 indexed epoch, uint256 indexed tokenId, address holder);
-    event AdminChanged(address previousAdmin, address newAdmin);
+    event AdminChanged(address previous_admin, address new_admin);
 
     struct Plan {
         uint256 price;
@@ -150,27 +150,20 @@ contract MembershipRegistry is Initializable, UUPSUpgradeable, ERC721, EIP712, N
     /// per token, for setUserBySig replay protection
     mapping(uint256 => uint256) public userNonces;
 
-    /// ERC721's and EIP712's constructors only write the implementation's own storage and
-    /// immutables: `name`/`symbol` are overridden below, and EIP712's values are immutables,
-    /// which the proxy reads from this code.
+    /// The implementation is only ever used through a proxy. Lock it, so nobody can
+    /// initialize it directly.
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() ERC721("", "") EIP712("Fangorn Membership", "1") {
+    constructor() {
         _disableInitializers();
     }
 
     function initialize(address admin_, address usdc_, address semaphore_, address appRegistry_) external initializer {
+        __ERC721_init("Fangorn Membership", "FMEMBER");
+        __EIP712_init("Fangorn Membership", "1");
         admin = admin_;
         usdc = usdc_;
         semaphore = semaphore_;
         appRegistry = appRegistry_;
-    }
-
-    function name() public pure override returns (string memory) {
-        return "Fangorn Membership";
-    }
-
-    function symbol() public pure override returns (string memory) {
-        return "FMEMBER";
     }
 
     // ── Plans ─────────────────────────────────────────────────────────────────
@@ -226,9 +219,10 @@ contract MembershipRegistry is Initializable, UUPSUpgradeable, ERC721, EIP712, N
         uint256 epoch = block.timestamp / p.period;
         if (pay.nonce != joinNonce(app_id, epoch, commitment, salt)) revert NonceNotBound();
 
-        IERC3009(usdc).receiveWithAuthorization(
-            pay.from, address(this), pay.value, pay.validAfter, pay.validBefore, pay.nonce, pay.v, pay.r, pay.s
-        );
+        IERC3009(usdc)
+            .receiveWithAuthorization(
+                pay.from, address(this), pay.value, pay.validAfter, pay.validBefore, pay.nonce, pay.v, pay.r, pay.s
+            );
         IERC20(usdc).safeTransfer(IAppRegistry(appRegistry).getAppOwner(app_id), pay.value);
 
         bytes32 key = keccak256(abi.encode(app_id, epoch));
@@ -256,17 +250,18 @@ contract MembershipRegistry is Initializable, UUPSUpgradeable, ERC721, EIP712, N
         // The scope is fixed here, not taken from the caller: a proof under any other scope
         // would carry another nullifier and claim the same payment twice. The message is
         // the holder, so whoever submits the proof cannot redirect the membership.
-        ISemaphore(semaphore).validateProof(
-            groupOf(app_id, epoch),
-            ISemaphore.SemaphoreProof({
-                merkleTreeDepth: merkleTreeDepth,
-                merkleTreeRoot: merkleTreeRoot,
-                nullifier: nullifier,
-                message: uint256(uint160(holder)),
-                scope: scopeOf(app_id, epoch),
-                points: points
-            })
-        );
+        ISemaphore(semaphore)
+            .validateProof(
+                groupOf(app_id, epoch),
+                ISemaphore.SemaphoreProof({
+                    merkleTreeDepth: merkleTreeDepth,
+                    merkleTreeRoot: merkleTreeRoot,
+                    nullifier: nullifier,
+                    message: uint256(uint160(holder)),
+                    scope: scopeOf(app_id, epoch),
+                    points: points
+                })
+            );
         claimed[nullifier] = true;
 
         tokenId = tokenIdOf(app_id, holder);
@@ -371,8 +366,8 @@ contract MembershipRegistry is Initializable, UUPSUpgradeable, ERC721, EIP712, N
     }
 
     function supportsInterface(bytes4 id) public view override returns (bool) {
-        return id == type(IERC4907).interfaceId || id == type(IERC5192).interfaceId
-            || id == type(IERC5643).interfaceId || super.supportsInterface(id);
+        return id == type(IERC4907).interfaceId || id == type(IERC5192).interfaceId || id == type(IERC5643).interfaceId
+            || super.supportsInterface(id);
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────

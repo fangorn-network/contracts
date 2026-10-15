@@ -44,27 +44,28 @@ library Deployments {
     }
 
     /// The proxy of `name` on `chainId`: the contract's address, which never changes.
-    function proxy(string memory name, uint256 chainId) internal pure returns (address) {
-        bytes32 n = keccak256(bytes(name));
-        if (chainId == ARBITRUM_SEPOLIA) {
-            if (n == keccak256("AppRegistry")) return 0x57b41E334864B430db44F7FbCD8d165C56e41402;
-            if (n == keccak256("DataRegistry")) return 0x0312503913656f25c2bfDf229425aA6926ccF1Cd;
-            if (n == keccak256("MembershipRegistry")) return 0x57B95b9B20C31E146aDF619Dafc4539e056360a5;
-        }
-        current(name); // an unknown name is a different mistake from a missing address
-        revert NoProxyRecorded(name, chainId);
+    function proxy(string memory name, uint256 chainId) internal pure returns (address p) {
+        p = recorded(name, chainId);
+        if (p == address(0)) revert NoProxyRecorded(name, chainId);
     }
 
-    /// The validation options `name` is deployed and upgraded with.
-    function options(string memory name) internal pure returns (Options memory opts) {
-        // MembershipRegistry inherits OpenZeppelin's ERC721 and EIP712, which have
-        // constructors, and the validator has no annotation for inherited code. They
-        // are safe here: `name` and `symbol` are overridden, so what ERC721's
-        // constructor stores is never read, and EIP712 keeps its values in immutables,
-        // which a proxy reads from the implementation's code. The contract is live
-        // with this storage, so its bases cannot be swapped for the upgradeable ones.
-        if (keccak256(bytes(name)) == keccak256("MembershipRegistry")) opts.unsafeAllow = "constructor";
+    /// The proxy of `name` on `chainId`, or zero while it is not deployed there.
+    function recorded(string memory name, uint256 chainId) internal pure returns (address) {
+        current(name); // an unknown name is a different mistake from a missing address
+        bytes32 n = keccak256(bytes(name));
+        if (chainId == ARBITRUM_SEPOLIA) {
+            // Deployed with Deploy.s.sol all(); the AppRegistry's proxy was created in
+            // block 319536642.
+            if (n == keccak256("AppRegistry")) return 0x55e6209ea1833ceD900989a3b3b22466934E04A5;
+            if (n == keccak256("DataRegistry")) return 0x72B5f83526F3893aF9f1eE0f32A27218EA09f8aE;
+            if (n == keccak256("MembershipRegistry")) return 0xDF17030Cd65435C86eb043F31DDACa99E819E347;
+        }
+        return address(0);
     }
+
+    /// The validation options `name` is deployed and upgraded with. None so far: every
+    /// contract passes the validator as it is.
+    function options(string memory) internal pure returns (Options memory opts) {}
 
     /// The options `name` is upgraded with: the ones above, plus what the new code is
     /// checked against. That is a build of a deployed version, committed under
