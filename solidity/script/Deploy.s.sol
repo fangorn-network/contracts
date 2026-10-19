@@ -26,7 +26,7 @@ import {Deployments} from "./Deployments.sol";
 ///   membershipRegistry(address appRegistry)
 ///
 /// With --broadcast, each new contract's build is written under
-/// `deployed/<Contract>/<implementation address>/`, replacing any older build of it: the
+/// `deployed/<chain id>/<Contract>/<implementation address>/`, replacing any older build of it: the
 /// first upgrade is checked against it. Commit it with the broadcast log and the new
 /// addresses in Deployments.sol.
 ///
@@ -42,12 +42,15 @@ import {Deployments} from "./Deployments.sol";
 ///                           appRegistry() and dataRegistry() it must be the signer,
 ///                           because the wiring calls are admin-only.
 ///   USDC_ADDR, SEMAPHORE_ADDR
-///                           default to Arbitrum Sepolia's; required on any other chain
+///                           default to Arbitrum Sepolia's or Base Sepolia's; required on any
+///                           other chain
 ///   SUBSCRIPTION_FEE        claiming an app, in USDC base units. Default 0
 ///   SUBSCRIPTION_PERIOD     how long one payment lasts, in seconds. Default 30 days
 contract Deploy is Builds {
-    address internal constant SEPOLIA_USDC = 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d;
-    address internal constant SEPOLIA_SEMAPHORE = 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D;
+    address internal constant ARBITRUM_SEPOLIA_USDC = 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d;
+    address internal constant BASE_SEPOLIA_USDC = 0x036CbD53842c5426634e7929541eC2318f3dCF7e;
+    /// Semaphore v4: the same contract at the same address on both chains.
+    address internal constant SEMAPHORE = 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D;
 
     function all() external {
         address admin = _admin();
@@ -177,16 +180,22 @@ contract Deploy is Builds {
     }
 
     function _usdc() internal view returns (address) {
-        return _external("USDC_ADDR", SEPOLIA_USDC);
+        return _external("USDC_ADDR", ARBITRUM_SEPOLIA_USDC, BASE_SEPOLIA_USDC);
     }
 
     function _semaphore() internal view returns (address) {
-        return _external("SEMAPHORE_ADDR", SEPOLIA_SEMAPHORE);
+        return _external("SEMAPHORE_ADDR", SEMAPHORE, SEMAPHORE);
     }
 
-    /// An address this deployment depends on. The known one is only a default on the
-    /// chain it belongs to; anywhere else it has to be given.
-    function _external(string memory name, address onSepolia) private view returns (address) {
-        return block.chainid == Deployments.ARBITRUM_SEPOLIA ? vm.envOr(name, onSepolia) : vm.envAddress(name);
+    /// An address this deployment depends on. The known ones are only defaults on the
+    /// chains they belong to; anywhere else it has to be given.
+    function _external(string memory name, address onArbitrumSepolia, address onBaseSepolia)
+        private
+        view
+        returns (address)
+    {
+        if (block.chainid == Deployments.ARBITRUM_SEPOLIA) return vm.envOr(name, onArbitrumSepolia);
+        if (block.chainid == Deployments.BASE_SEPOLIA) return vm.envOr(name, onBaseSepolia);
+        return vm.envAddress(name);
     }
 }
