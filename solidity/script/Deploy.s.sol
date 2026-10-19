@@ -47,14 +47,10 @@ import {Deployments} from "./Deployments.sol";
 ///                           default to Arbitrum Sepolia's; required on any other chain
 ///   SUBSCRIPTION_FEE        claiming an app, in USDC base units. Default 0
 ///   SUBSCRIPTION_PERIOD     how long one payment lasts, in seconds. Default 30 days
-///   DEFAULT_APP_NAME, DEFAULT_APP_TERMS_HASH, DEFAULT_APP_TERMS_URI,
-///   DEFAULT_APP_JOIN_FEE    the app claimed for the deployer. Defaults below
+///   DEFAULT_APP_NAME        the app claimed for the deployer. Default "fangorn"
 contract Deploy is Builds {
     address internal constant SEPOLIA_USDC = 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d;
     address internal constant SEPOLIA_SEMAPHORE = 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D;
-    // sha256("test"): a placeholder for testing, with no real significance. An app with
-    // a zero terms hash cannot be joined, so the default app needs some value.
-    bytes32 internal constant DEFAULT_TERMS_HASH = 0x9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08;
 
     function all() external {
         address admin = _admin();
@@ -154,24 +150,13 @@ contract Deploy is Builds {
 
     /// Claims the default app for the deployer, which pays the subscription fee.
     function _claimDefaultApp(AppRegistry apps) internal {
-        bytes32 termsHash = vm.envOr("DEFAULT_APP_TERMS_HASH", DEFAULT_TERMS_HASH);
-        // A zero terms hash leaves the app unjoinable, which reads on the website as
-        // "registration is broken". Fail here instead, where the cause is obvious.
-        require(termsHash != bytes32(0), "DEFAULT_APP_TERMS_HASH is zero: an app with no terms cannot be joined");
-
         (, address deployer,) = vm.readCallers();
 
         uint256 fee = apps.subscriptionFee();
         if (fee != 0) IERC20(apps.usdc()).approve(address(apps), fee);
 
         bytes32 appId = keccak256(bytes(vm.envOr("DEFAULT_APP_NAME", string("fangorn"))));
-        apps.registerApp(
-            appId,
-            termsHash,
-            vm.envOr("DEFAULT_APP_TERMS_URI", string("https://fangorn.network/terms.html")),
-            vm.envOr("DEFAULT_APP_JOIN_FEE", uint256(0)),
-            fee
-        );
+        apps.registerApp(appId, fee);
         require(apps.getAppOwner(appId) == deployer, "default app owner");
     }
 

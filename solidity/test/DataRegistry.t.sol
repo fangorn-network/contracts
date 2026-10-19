@@ -13,8 +13,7 @@ contract DataRegistryUpgradeMock is DataRegistry {
     }
 }
 
-/// The DataRegistry on its own. Carried acceptances are the AppRegistry's, tested with
-/// it; here every update carries none.
+/// The DataRegistry on its own: it calls nothing.
 contract DataRegistryTest is Test {
     address constant ADMIN = 0x1111111111111111111111111111111111111111;
     address constant PUB = 0x2222222222222222222222222222222222222222;
@@ -27,7 +26,6 @@ contract DataRegistryTest is Test {
     );
 
     DataRegistry registry;
-    bytes32[] none;
 
     function setUp() public {
         registry = Proxied.dataRegistry(ADMIN, APPS);
@@ -35,7 +33,7 @@ contract DataRegistryTest is Test {
 
     function update(address who, string memory repo, bytes32 parent, bytes32 head) internal {
         vm.prank(who);
-        registry.update(repo, parent, head, none);
+        registry.update(repo, parent, head);
     }
 
     function headOf(address who, string memory repo) internal view returns (uint64 pos, bytes32 head) {
@@ -87,14 +85,14 @@ contract DataRegistryTest is Test {
     function test_a_stale_parent_or_a_zero_head_is_rejected() public {
         vm.prank(PUB);
         vm.expectRevert(DataRegistry.StaleStateRoot.selector);
-        registry.update("a", ROOT_A, ROOT_B, none);
+        registry.update("a", ROOT_A, ROOT_B);
 
         vm.prank(PUB);
         vm.expectRevert(DataRegistry.ZeroHead.selector);
-        registry.update("a", bytes32(0), bytes32(0), none);
+        registry.update("a", bytes32(0), bytes32(0));
     }
 
-    /// Only the admin repoints where carried acceptances go.
+    /// Only the admin repoints the AppRegistry it names.
     function test_only_the_admin_repoints_the_app_registry() public {
         vm.prank(PUB);
         vm.expectRevert(DataRegistry.Unauthorized.selector);
