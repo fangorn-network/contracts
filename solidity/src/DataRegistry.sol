@@ -6,16 +6,15 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeab
 
 /// DataRegistry
 ///
-/// The heads of every repo, and their update log (WHITEPAPER_1 §3.2, H and U).
+/// The heads of every repo, and their update log.
 ///
 /// A repo is `(publisher, repo)`: one publisher's data under a name it chooses. It
 /// belongs to no app: any address may update its own repos, with a compare-and-swap on
 /// the head, and an update names no app. Which apps present a repo is the AppRegistry's
 /// (an app presents the publishers whose storage it provides, at their latest heads).
 ///
-/// What is not here yet (docs/REGISTRY_SPEC.md in the SDK): the head is passed in, not
-/// computed from the commit; the commit's epoch is not checked; the log is events, not
-/// an MMR.
+/// The head is passed in, not computed from the commit, and only the parent is checked.
+/// The update log is the `Updated` events.
 ///
 /// Deployed behind an ERC-1967 proxy (UUPS): the proxy holds the state and the address,
 /// and the admin can point it at a new implementation. Storage is therefore

@@ -196,7 +196,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         string appAgentUri;
     }
 
-    /// app_id => app. Internal: the getters below are the ABI the SDK reads.
+    /// app_id => app. Internal: the getters below are the ABI clients read.
     mapping(bytes32 => App) internal apps;
     /// app_id => publisher => standing in the app
     mapping(bytes32 => mapping(address => Status)) public statusForApp;

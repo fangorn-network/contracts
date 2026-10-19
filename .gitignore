@@ -17,6 +17,8 @@ bucket_factory/lib
 /solidity/broadcast/*/31337/
 /solidity/broadcast/**/dry-run/
 
+/solidity/lib/openzeppelin-contracts
+
 # Docs
 docs/
 

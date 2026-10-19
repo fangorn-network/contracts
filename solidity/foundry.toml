@@ -23,8 +23,8 @@ extra_output = ["storageLayout"]
 fs_permissions = [{ access = "read", path = "out" }, { access = "read-write", path = "deployed" }]
 
 [lint]
-# Argument and event-field names are snake_case on purpose: they mirror the Stylus
-# contracts' ABI, and the SDK reads event fields by those names.
+# Argument and event-field names are snake_case on purpose: clients read event fields
+# by those names.
 # block-timestamp: comparisons are membership expiries and permit deadlines (days),
 # so the few seconds of validator skew don't matter.
 exclude_lints = ["mixed-case-variable", "unwrapped-modifier-logic", "asm-keccak256", "block-timestamp"]

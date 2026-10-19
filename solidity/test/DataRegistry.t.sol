@@ -56,9 +56,9 @@ contract DataRegistryTest is Test {
         assertEq(head, ROOT_B);
     }
 
-    /// Golden fixture shared with the SDK. The client derives the repo id to filter
-    /// events and to address heads; if the derivations diverge, every read is zero.
-    function test_repo_id_matches_sdk_fixture() public {
+    /// Golden fixture: a client derives the repo id the same way, to filter events and
+    /// to address heads. If the derivations diverge, every read is zero.
+    function test_repo_id_matches_fixture() public {
         bytes32 repoId = keccak256("docs");
         assertEq(repoId, 0x6bf9054545420e9e9f4aa4f353a32c7d0d52c11dbcdda56c53be8375cafeebb1);
 
