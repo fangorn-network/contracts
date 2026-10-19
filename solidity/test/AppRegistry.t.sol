@@ -12,9 +12,12 @@ import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.s
 import {IERC5643} from "../src/IERC5643.sol";
 import {MockUSDC, Proxied} from "./Mocks.sol";
 
-/// A fee token that, whenever it is asked to move tokens, tries to commit to an app it
-/// owns. As that app's owner it passes every membership check, so only the reentrancy
-/// guard can refuse the commit. It keeps the refusal and lets the transfer succeed.
+// The app a reentering token tries to claim.
+bytes32 constant REENTERED = bytes32(uint256(0xEE));
+
+/// A fee token that, whenever it is asked to move tokens, tries to claim another app.
+/// Claiming is free here, so only the reentrancy guard can refuse it. It keeps the
+/// refusal and lets the transfer succeed.
 contract ReentrantToken {
     AppRegistry apps;
     bytes32 app;
@@ -39,7 +42,7 @@ contract ReentrantToken {
     }
 
     function _reenter() private returns (bool) {
-        try apps.commitStateRoot(app, keccak256("docs"), bytes32(0), bytes32(uint256(7))) {}
+        try apps.registerApp(REENTERED, bytes32(uint256(1)), "", 0, 0) {}
         catch (bytes memory reason) {
             refusal = reason;
         }
@@ -95,6 +98,8 @@ contract AppRegistryTest is Test {
     uint8 constant STATUS_ACTIVE = 1;
     uint8 constant STATUS_INVITED = 3;
 
+    bytes32 constant DOCS = keccak256("docs");
+
     AppRegistry apps;
     DataRegistry data;
     MockUSDC usdc;
@@ -127,6 +132,26 @@ contract AppRegistryTest is Test {
     function join(address who, bytes32 app, bytes32 terms, uint256 max_join_fee) internal {
         vm.prank(who);
         apps.joinApp(app, terms, max_join_fee);
+    }
+
+    /// `who` moves its repo "docs" to a new head, as any address may, and returns it.
+    function update(address who) internal returns (bytes32 head) {
+        (uint64 pos, bytes32 parent) = data.getHead(who, DOCS);
+        head = bytes32(uint256(pos) + 7);
+        vm.prank(who);
+        data.update("docs", parent, head, new bytes32[](0));
+    }
+
+    /// `who` publishes into `app`: an update, then its own acceptance of it.
+    function publish(address who, bytes32 app) internal returns (bytes32 head) {
+        head = update(who);
+        vm.prank(who);
+        apps.accept(app, who, "docs");
+    }
+
+    /// The head of `who`'s "docs" that `app` presents.
+    function presented(bytes32 app, address who) internal view returns (bytes32 head) {
+        (, head) = apps.getAccepted(app, who, DOCS);
     }
 
     // ── apps ──────────────────────────────────────────────────────────────────
@@ -420,12 +445,12 @@ contract AppRegistryTest is Test {
         vm.prank(APP_OWNER);
         registry.withdrawJoinFees(APP_OWNER);
         assertEq(token.refusal(), guarded);
-        assertEq(store.getNamespaceHead(OTHER_APP, address(token), keccak256("docs")), bytes32(0));
+        assertEq(registry.getAppOwner(REENTERED), address(0));
 
-        // Outside a transfer, the same commit goes through.
+        // Outside a transfer, the same claim goes through.
         vm.prank(address(token));
-        registry.commitStateRoot(OTHER_APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
-        assertEq(store.getNamespaceHead(OTHER_APP, address(token), keccak256("docs")), bytes32(uint256(7)));
+        registry.registerApp(REENTERED, TERMS_V1, "", 0, 0);
+        assertEq(registry.getAppOwner(REENTERED), address(token));
     }
 
     function test_moving_the_terms_drops_everyone_back_to_unaccepted() public {
@@ -1023,8 +1048,7 @@ contract AppRegistryTest is Test {
         assertEq(apps.appAgentUri(APP), "");
 
         // The app itself keeps running for its other publishers.
-        vm.prank(PUBLISHER);
-        apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+        publish(PUBLISHER, APP);
 
         vm.prank(ADMIN);
         apps.setGlobalSuspension(APP_OWNER, false);
@@ -1093,64 +1117,163 @@ contract AppRegistryTest is Test {
         assertEq(apps.acceptedTerms(APP, PUBLISHER), TERMS_V1);
     }
 
-    // ── publishing ────────────────────────────────────────────────────────────
+    // ── presenting ────────────────────────────────────────────────────────────
 
-    /// The two registries together: a publisher can commit only once they are added
-    /// and joined — and loses it when the owner ejects them, or the admin bans them.
-    function test_commits_follow_app_membership_end_to_end() public {
-        bytes32 sub = keccak256("docs");
-        bytes32 root = bytes32(uint256(7));
+    /// Anyone updates their own repo; what an app presents of it moves only by
+    /// acceptance. A publisher accepts its own heads once added and joined, and loses
+    /// that when the owner ejects them or the admin bans them. Its repo never stops.
+    function test_acceptances_follow_app_membership_end_to_end() public {
         openApp();
 
-        // Invited is not enough.
+        // Invited is not enough to be presented, and nothing is needed to update.
+        bytes32 head = update(PUBLISHER);
         vm.prank(PUBLISHER);
         vm.expectRevert(AppRegistry.NotJoined.selector);
-        apps.commitStateRoot(APP, sub, bytes32(0), root);
+        apps.accept(APP, PUBLISHER, "docs");
 
         join(PUBLISHER, APP, TERMS_V1, FEE);
         vm.prank(PUBLISHER);
-        apps.commitStateRoot(APP, sub, bytes32(0), root);
-        assertEq(data.getNamespaceHead(APP, PUBLISHER, sub), root);
-        // Written under the sender only.
-        assertEq(data.getNamespaceHead(APP, APP_OWNER, sub), bytes32(0));
+        apps.accept(APP, PUBLISHER, "docs");
+        assertEq(presented(APP, PUBLISHER), head);
+        assertEq(presented(APP, APP_OWNER), bytes32(0));
+        // Forward only: the same head again is stale.
+        vm.prank(PUBLISHER);
+        vm.expectRevert(AppRegistry.StaleAcceptance.selector);
+        apps.accept(APP, PUBLISHER, "docs");
 
         vm.prank(APP_OWNER);
         apps.setPublisherSuspended(APP, PUBLISHER, true);
+        update(PUBLISHER);
         vm.prank(PUBLISHER);
         vm.expectRevert(AppRegistry.PublisherSuspendedApp.selector);
-        apps.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
+        apps.accept(APP, PUBLISHER, "docs");
+        assertEq(presented(APP, PUBLISHER), head, "suspension stops new heads, and keeps the presented one");
 
         // A network-wide ban is part of the membership answer, so it stops an owner who
-        // claimed the app before being banned, on every commit.
-        vm.prank(APP_OWNER);
-        apps.commitStateRoot(APP, sub, bytes32(0), root);
+        // claimed the app before being banned.
+        publish(APP_OWNER, APP);
         vm.prank(ADMIN);
         apps.setGlobalSuspension(APP_OWNER, true);
         assertFalse(apps.canPublish(APP, APP_OWNER));
+        bytes32 next = update(APP_OWNER);
         vm.prank(APP_OWNER);
         vm.expectRevert(AppRegistry.PublisherSuspendedGlobal.selector);
-        apps.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
+        apps.accept(APP, APP_OWNER, "docs");
 
-        // Lifting the ban touches nothing else: the timeline resumes from its head.
+        // Lifting the ban touches nothing else: the latest head is accepted.
         vm.prank(ADMIN);
         apps.setGlobalSuspension(APP_OWNER, false);
         vm.prank(APP_OWNER);
-        apps.commitStateRoot(APP, sub, root, bytes32(uint256(8)));
-        assertEq(data.getNamespaceHead(APP, APP_OWNER, sub), bytes32(uint256(8)));
+        apps.accept(APP, APP_OWNER, "docs");
+        assertEq(presented(APP, APP_OWNER), next);
     }
 
-    /// `who` may not commit to `app`, for the reason `err` names, and
+    /// An update carries acceptances into apps in the same transaction. A refused one
+    /// never undoes the update, and only the DataRegistry may apply them.
+    function test_an_update_carries_acceptances_that_never_undo_it() public {
+        openApp();
+        bytes32[] memory both = new bytes32[](2);
+        both[0] = APP;
+        both[1] = GHOST_APP;
+
+        // Not joined yet: refused, and the update stands.
+        vm.prank(PUBLISHER);
+        data.update("docs", bytes32(0), bytes32(uint256(7)), both);
+        (, bytes32 head) = data.getHead(PUBLISHER, DOCS);
+        assertEq(head, bytes32(uint256(7)));
+        assertEq(presented(APP, PUBLISHER), bytes32(0));
+
+        join(PUBLISHER, APP, TERMS_V1, FEE);
+        vm.expectEmit(true, true, true, true, address(apps));
+        emit AppRegistry.Accepted(APP, PUBLISHER, DOCS, "docs", 2, bytes32(0), bytes32(uint256(8)));
+        vm.prank(PUBLISHER);
+        data.update("docs", bytes32(uint256(7)), bytes32(uint256(8)), both);
+        assertEq(presented(APP, PUBLISHER), bytes32(uint256(8)));
+        assertEq(presented(GHOST_APP, PUBLISHER), bytes32(0));
+
+        vm.prank(PUBLISHER);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.acceptFromUpdate(APP, PUBLISHER, DOCS, "docs", 3, bytes32(uint256(9)));
+    }
+
+    /// Too little gas for a carried acceptance reverts the update, rather than
+    /// landing it with the acceptance silently out of gas.
+    function test_an_update_never_starves_its_acceptances() public {
+        openApp();
+        join(PUBLISHER, APP, TERMS_V1, FEE);
+        bytes32[] memory one = new bytes32[](1);
+        one[0] = APP;
+
+        vm.prank(PUBLISHER);
+        vm.expectRevert(DataRegistry.InsufficientGas.selector);
+        data.update{gas: 90_000}("docs", bytes32(0), bytes32(uint256(7)), one);
+
+        vm.prank(PUBLISHER);
+        data.update("docs", bytes32(0), bytes32(uint256(7)), one);
+        assertEq(presented(APP, PUBLISHER), bytes32(uint256(7)));
+    }
+
+    /// The owner pulls any head, a member's or not; nobody else accepts for another.
+    function test_the_owner_pulls_any_head_and_nobody_else_does() public {
+        openApp();
+        bytes32 head = update(STRANGER);
+        vm.prank(PUBLISHER);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.accept(APP, STRANGER, "docs");
+
+        vm.prank(APP_OWNER);
+        apps.accept(APP, STRANGER, "docs");
+        assertEq(presented(APP, STRANGER), head);
+        assertEq(presented(OTHER_APP, STRANGER), bytes32(0), "another app presents nothing of it");
+
+        vm.startPrank(APP_OWNER);
+        vm.expectRevert(AppRegistry.StaleAcceptance.selector);
+        apps.accept(APP, STRANGER, "docs");
+        // A repo never written has no head to accept.
+        vm.expectRevert(AppRegistry.StaleAcceptance.selector);
+        apps.accept(APP, STRANGER, "never-written");
+        vm.stopPrank();
+    }
+
+    /// An exclusion alternates exclude and restore, counts every change, and is the
+    /// owner's alone. A publisher, a repo and a key are different exclusions.
+    function test_exclusions_alternate_and_count_each_change() public {
+        openApp();
+        bytes32 repo = apps.exclusionId(PUBLISHER, DOCS, bytes32(0));
+
+        vm.prank(STRANGER);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.exclude(APP, PUBLISHER, DOCS, bytes32(0));
+
+        vm.startPrank(APP_OWNER);
+        vm.expectRevert(AppRegistry.NotExcluded.selector);
+        apps.restore(APP, PUBLISHER, DOCS, bytes32(0));
+        vm.expectEmit(true, true, true, true, address(apps));
+        emit AppRegistry.ExclusionChanged(APP, PUBLISHER, repo, DOCS, bytes32(0), 1);
+        apps.exclude(APP, PUBLISHER, DOCS, bytes32(0));
+        vm.expectRevert(AppRegistry.AlreadyExcluded.selector);
+        apps.exclude(APP, PUBLISHER, DOCS, bytes32(0));
+        apps.restore(APP, PUBLISHER, DOCS, bytes32(0));
+        vm.stopPrank();
+
+        assertEq(apps.exclusionCount(APP, repo), 2);
+        assertEq(apps.exclusionCount(APP, apps.exclusionId(PUBLISHER, bytes32(0), bytes32(0))), 0);
+        assertEq(apps.exclusionCount(OTHER_APP, repo), 0);
+    }
+
+    /// `who` may not have heads accepted into `app`, for the reason `err` names, and
     /// `canPublish` agrees.
     function assertRefused(address who, bytes32 app, bytes4 err) internal {
         assertFalse(apps.canPublish(app, who));
+        update(who);
         vm.prank(who);
         vm.expectRevert(err);
-        apps.commitStateRoot(app, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+        apps.accept(app, who, "docs");
     }
 
-    /// A refused commit says why, so the publisher knows whom to ask: the app owner,
-    /// the protocol admin, or themselves.
-    function test_each_refused_commit_says_why() public {
+    /// A refused acceptance says why, so the publisher knows whom to ask: the app
+    /// owner, the protocol admin, or themselves.
+    function test_each_refused_acceptance_says_why() public {
         assertRefused(PUBLISHER, GHOST_APP, AppRegistry.AppNotFound.selector);
         openApp();
         assertRefused(STRANGER, APP, AppRegistry.NotInvited.selector);
@@ -1165,7 +1288,7 @@ contract AppRegistryTest is Test {
         apps.acceptUpdatedTerms(APP, TERMS_V2);
 
         // Each case below differs from a publisher who can publish in one way only, so each
-        // also checks `canPublish` against `commitStateRoot` on its own.
+        // also checks `canPublish` against `accept` on its own.
         vm.prank(APP_OWNER);
         apps.setPublisherSuspended(APP, PUBLISHER, true);
         assertRefused(PUBLISHER, APP, AppRegistry.PublisherSuspendedApp.selector);
@@ -1210,10 +1333,10 @@ contract AppRegistryTest is Test {
         assertTrue(apps.canPublish(APP, PUBLISHER));
     }
 
-    /// A lapsed app takes no commits and no join fees, so nothing is paid into an app
-    /// that cannot be used. Managing its members stays open, fees already earned can
-    /// still be withdrawn, and renewing restores everything.
-    function test_an_expired_app_takes_no_commits_and_no_join_fees() public {
+    /// A lapsed app accepts nothing and takes no join fees, so nothing is paid into an
+    /// app that cannot be used. Managing its members stays open, fees already earned
+    /// can still be withdrawn, and renewing restores everything.
+    function test_an_expired_app_takes_no_acceptances_and_no_join_fees() public {
         openApp();
         vm.prank(APP_OWNER);
         apps.invitePublisher(APP, STRANGER);
@@ -1228,9 +1351,13 @@ contract AppRegistryTest is Test {
         vm.prank(STRANGER);
         vm.expectRevert(AppRegistry.SubscriptionExpired.selector);
         apps.joinApp(APP, TERMS_V1, FEE);
+        update(PUBLISHER);
         vm.prank(PUBLISHER);
         vm.expectRevert(AppRegistry.SubscriptionExpired.selector);
-        apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+        apps.accept(APP, PUBLISHER, "docs");
+        vm.prank(APP_OWNER);
+        vm.expectRevert(AppRegistry.SubscriptionExpired.selector);
+        apps.accept(APP, PUBLISHER, "docs");
 
         // Still open: changing terms, accepting them, inviting, and collecting what was
         // earned while the app was live.
@@ -1247,37 +1374,20 @@ contract AppRegistryTest is Test {
         apps.renewSubscription(uint256(APP), PERIOD);
         join(STRANGER, APP, TERMS_V2, FEE);
         vm.prank(PUBLISHER);
-        apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
-        assertEq(data.getNamespaceHead(APP, PUBLISHER, keccak256("docs")), bytes32(uint256(7)));
+        apps.accept(APP, PUBLISHER, "docs");
+        (, bytes32 head) = data.getHead(PUBLISHER, DOCS);
+        assertEq(presented(APP, PUBLISHER), head);
     }
 
-    /// The DataRegistry takes commits from the AppRegistry only, so its checks cannot be
-    /// skipped, even by a publisher who would pass them.
-    function test_the_data_registry_cannot_be_called_directly() public {
-        openApp();
-        join(PUBLISHER, APP, TERMS_V1, FEE);
-        vm.prank(PUBLISHER);
-        vm.expectRevert(DataRegistry.Unauthorized.selector);
-        data.commitStateRoot(APP, PUBLISHER, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
-    }
-
-    /// The compare-and-swap is the DataRegistry's, and its refusal reaches the caller
-    /// as an error in the AppRegistry's ABI.
-    function test_a_stale_root_is_refused_through_the_app_registry() public {
-        openApp();
-        vm.prank(APP_OWNER);
-        vm.expectRevert(AppRegistry.StaleStateRoot.selector);
-        apps.commitStateRoot(APP, keccak256("docs"), bytes32(uint256(1)), bytes32(uint256(7)));
-    }
-
-    /// Only the admin points commits at a DataRegistry. Until one is set, nobody can
-    /// commit, member or not.
-    function test_commits_need_a_data_registry() public {
+    /// Only the admin points acceptances at a DataRegistry. Until one is set, nothing
+    /// can be accepted.
+    function test_acceptances_need_a_data_registry() public {
         vm.prank(STRANGER);
         vm.expectRevert(AppRegistry.Unauthorized.selector);
         apps.setDataRegistry(STRANGER);
 
         openApp();
+        update(APP_OWNER);
         vm.expectEmit(true, true, true, true, address(apps));
         emit AppRegistry.DataRegistryChanged(address(data), address(0));
         vm.prank(ADMIN);
@@ -1285,7 +1395,7 @@ contract AppRegistryTest is Test {
         assertEq(apps.dataRegistry(), address(0));
         vm.prank(APP_OWNER);
         vm.expectRevert();
-        apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+        apps.accept(APP, APP_OWNER, "docs");
     }
 
     // ── upgrades ──────────────────────────────────────────────────────────────
@@ -1317,9 +1427,9 @@ contract AppRegistryTest is Test {
         assertEq(apps.name(), "FANGAPP");
         assertTrue(apps.canPublish(APP, PUBLISHER));
 
-        // Still the contract the DataRegistry takes commits from.
-        vm.prank(PUBLISHER);
-        apps.commitStateRoot(APP, keccak256("docs"), bytes32(0), bytes32(uint256(7)));
+        // Still the contract acceptances go through.
+        bytes32 head = publish(PUBLISHER, APP);
+        assertEq(presented(APP, PUBLISHER), head);
     }
 
     /// `initialize` stands in for the constructor, so it runs exactly once — and never

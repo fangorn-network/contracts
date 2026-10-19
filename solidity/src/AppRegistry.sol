@@ -9,19 +9,23 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC5643} from "./IERC5643.sol";
 
-/// The DataRegistry's one write, which accepts calls from this contract only.
+/// The DataRegistry's heads, which acceptances read.
 interface IDataRegistry {
-    function commitStateRoot(bytes32 app_id, address publisher, bytes32 subspace_id, bytes32 old_root, bytes32 new_root)
-        external;
+    function getHead(address publisher, bytes32 repo_id) external view returns (uint64 pos, bytes32 head);
 }
 
 /// AppRegistry
 ///
 /// An application is a named domain and a set of agreements for associating data with
 /// it. A wallet claims an app (`registerApp`) and owns it; the owner invites publishers
-/// (`invitePublisher`), who join by accepting the app's terms (`joinApp`). Only a publisher
-/// who has joined may publish to the app's namespace in the DataRegistry
-/// (`canPublish`).
+/// (`invitePublisher`), who join by accepting the app's terms (`joinApp`).
+///
+/// What an app presents is what it has accepted (WHITEPAPER_1 §3.2, D, X and C). A repo
+/// lives in the DataRegistry and belongs to no app; the app presents one of its heads
+/// only once that head is accepted, and withdraws data by excluding it. The acceptance
+/// rule is admission: a joined publisher (`canPublish`) accepts its own heads, usually
+/// carried in its update, and the owner may pull any head. The exclusion rule is the
+/// owner's say.
 ///
 /// An app IS a storage subscription: claiming one pulls the subscription fee (USDC)
 /// for one period, and the off-chain upload gate reads `access` to decide whether to
@@ -41,16 +45,12 @@ interface IDataRegistry {
 /// the contract the app id. The token cannot be transferred.
 ///
 /// The expiry is enforced here. Once an app's subscription has lapsed or been
-/// cancelled, nobody can commit to it and nobody can join it, so no join fee is paid
+/// cancelled, nobody can have heads accepted into it and nobody can join it, so no join fee is paid
 /// into an app that cannot be used. Renewing lifts all of it at once, and nothing is
 /// lost meanwhile.
 /// Membership management (inviting, accepting updated terms, suspending) stays open,
 /// and fees already earned can still be withdrawn.
 ///
-/// Every commit goes through this contract (`commitStateRoot`). It checks that the
-/// sender may publish under the app — the protocol admin's network-wide ban is kept
-/// here too — and forwards the commit to the DataRegistry, which accepts commits from
-/// this contract alone.
 ///
 /// Deployed behind an ERC-1967 proxy (UUPS): the proxy holds the state and the address,
 /// and the admin can point it at a new implementation. Storage is therefore
@@ -104,13 +104,13 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// `invitePublisher`: the wallet is already invited to, a member of, or suspended from
     /// this app
     error AlreadyInvited();
-    /// Committing, accepting updated terms or being suspended: invited, but has not
+    /// Accepting heads, accepting updated terms or being suspended: invited, but has not
     /// joined (`joinApp`). An invitation is taken back with `revokeInvitation`.
     error NotJoined();
     /// `joinApp`: the publisher has already joined. After the terms change, a member
     /// accepts the new ones with `acceptUpdatedTerms`, not by joining again.
     error AlreadyJoined();
-    /// Joining or accepting updated terms: not the app's current terms. Committing: the
+    /// Joining or accepting updated terms: not the app's current terms. Accepting heads: the
     /// terms the publisher accepted are no longer the app's; accept the new ones with
     /// `acceptUpdatedTerms`.
     error TermsMismatch();
@@ -132,10 +132,14 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// to) the app's owner
     error PublisherSuspendedGlobal();
 
-    // Publishing
-    /// Raised by the DataRegistry and passed through by `commitStateRoot`: `old_root` is
-    /// not the current head. Declared here so it is in this contract's ABI.
-    error StaleStateRoot();
+    // Presenting
+    /// `accept`: the head is not beyond what the app already accepted of the repo, or
+    /// the repo was never written
+    error StaleAcceptance();
+    /// `exclude`: already excluded
+    error AlreadyExcluded();
+    /// `restore`: not excluded
+    error NotExcluded();
 
     // Subscription
     /// The subscription fee could not be collected: the token refused the transfer,
@@ -153,7 +157,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     error NotTransferable();
     /// The subscription period cannot be zero
     error ZeroPeriod();
-    /// Committing or joining: the app's subscription has expired or been cancelled.
+    /// Accepting heads or joining: the app's subscription has expired or been cancelled.
     /// Renew it (`renewSubscription`).
     error SubscriptionExpired();
 
@@ -189,13 +193,36 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// The protocol admin banned a wallet network-wide, or lifted the ban
     event GlobalSuspensionChanged(address indexed publisher, bool suspended);
 
+    // Presenting
+    /// The app now presents `head`, the `pos`-th head of the publisher's repo, in place
+    /// of `parent` (zero if it presented none)
+    event Accepted(
+        bytes32 indexed app_id,
+        address indexed publisher,
+        bytes32 indexed repo_id,
+        string repo,
+        uint64 pos,
+        bytes32 parent,
+        bytes32 head
+    );
+    /// An exclusion changed: odd `count` means in force. `repo_id` and `key_id` are zero
+    /// for the levels it does not name.
+    event ExclusionChanged(
+        bytes32 indexed app_id,
+        address indexed publisher,
+        bytes32 indexed exclusion_id,
+        bytes32 repo_id,
+        bytes32 key_id,
+        uint64 count
+    );
+
     // Protocol admin
     /// The admin changed the subscription fee, in USDC base units: it applies from the
     /// next claim or renewal
     event SubscriptionFeeChanged(uint256 fee);
     /// The admin changed the period: it applies from each app's next payment
     event SubscriptionPeriodChanged(uint64 period);
-    /// The admin pointed commits at another DataRegistry
+    /// The admin pointed acceptances at another DataRegistry
     event DataRegistryChanged(address previous_registry, address new_registry);
     /// The admin sent an ERC-20 the contract held: subscription fees, or a token sent
     /// here by mistake
@@ -211,14 +238,14 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     address public usdc;
     /// Subscription fee, denominated in USDC base units (6 decimals).
     uint256 public subscriptionFee;
-    /// The DataRegistry that commits are forwarded to
+    /// The DataRegistry whose heads are accepted
     address public dataRegistry;
 
     struct App {
         // The first three fields share one storage slot (20 + 1 + 8 bytes): keep them
         // adjacent.
         /// Zero means the app is unclaimed. Always the same as the token's owner
-        /// (`ownerOf`): the token cannot move. Kept here as well so that every commit
+        /// (`ownerOf`): the token cannot move. Kept here as well so that every acceptance
         /// reads the owner, the takedown flag and the expiry from one storage slot.
         address owner;
         /// Admin takedown flag. A suspended app is dead for every publisher at once.
@@ -249,6 +276,16 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// The sum of `joinFeesOwed`: the part of the contract's USDC that belongs to app
     /// owners, which `withdrawToken` cannot touch
     uint256 public totalJoinFeesOwed;
+
+    struct AcceptedHead {
+        uint64 pos;
+        bytes32 head;
+    }
+
+    /// app_id => publisher => keccak256(repo) => the head the app presents
+    mapping(bytes32 => mapping(address => mapping(bytes32 => AcceptedHead))) internal acceptedHeads;
+    /// app_id => exclusionId => changes so far; odd means excluded
+    mapping(bytes32 => mapping(bytes32 => uint64)) public exclusionCount;
 
     /// The implementation is only ever used through a proxy. Lock it, so nobody can
     /// initialize it directly.
@@ -471,23 +508,72 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         emit PublisherSuspensionChanged(app_id, publisher, is_suspended);
     }
 
-    // ── Publishing ────────────────────────────────────────────────────────────
+    // ── Presenting ────────────────────────────────────────────────────────────
 
-    /// Commit a new state root for one of your subspaces in an app. This is the only
-    /// way to publish: the DataRegistry accepts commits from this contract alone.
-    ///
-    /// The sender must be an active publisher of the app (`canPublish`), or the
-    /// commit reverts with the reason (see `_validatePublisher`). The DataRegistry then
-    /// compare-and-swaps the head of `app_id:sender:subspace_id`,
-    /// reverting `StaleStateRoot` if `old_root` is not the current head, and emits
-    /// `StateCommitted`. An app whose subscription has expired takes no commits
-    /// (`SubscriptionExpired`) until it is renewed.
-    function commitStateRoot(bytes32 app_id, bytes32 subspace_id, bytes32 old_root, bytes32 new_root)
+    /// Present the current head of `publisher`'s `repo` in the app. The publisher may
+    /// accept its own heads while it may publish (`canPublish`, else the reason); the
+    /// owner may pull anyone's. Moves forward only (`StaleAcceptance`).
+    function accept(bytes32 app_id, address publisher, string calldata repo) external {
+        if (msg.sender == publisher) {
+            _validatePublisher(app_id, publisher);
+        } else {
+            App storage app = apps[app_id];
+            if (app.owner == address(0)) revert AppNotFound();
+            if (msg.sender != app.owner) revert Unauthorized();
+            if (globalSuspensions[msg.sender]) revert PublisherSuspendedGlobal();
+            if (app.isAppSuspended) revert AppSuspended();
+            if (app.expiry <= block.timestamp) revert SubscriptionExpired();
+        }
+        bytes32 repo_id = keccak256(bytes(repo));
+        (uint64 pos, bytes32 head) = IDataRegistry(dataRegistry).getHead(publisher, repo_id);
+        _accept(app_id, publisher, repo_id, repo, pos, head);
+    }
+
+    /// An acceptance carried in `publisher`'s update, applied by the DataRegistry
+    /// alone. Held to the same rule as the publisher's own `accept`.
+    function acceptFromUpdate(
+        bytes32 app_id,
+        address publisher,
+        bytes32 repo_id,
+        string calldata repo,
+        uint64 pos,
+        bytes32 head
+    ) external {
+        if (msg.sender != dataRegistry) revert Unauthorized();
+        _validatePublisher(app_id, publisher);
+        _accept(app_id, publisher, repo_id, repo, pos, head);
+    }
+
+    /// The position and head the app presents of a repo; (0, 0) if none.
+    function getAccepted(bytes32 app_id, address publisher, bytes32 repo_id)
         external
-        nonReentrant
+        view
+        returns (uint64 pos, bytes32 head)
     {
-        _validatePublisher(app_id, msg.sender);
-        IDataRegistry(dataRegistry).commitStateRoot(app_id, msg.sender, subspace_id, old_root, new_root);
+        AcceptedHead storage a = acceptedHeads[app_id][publisher][repo_id];
+        return (a.pos, a.head);
+    }
+
+    /// Withdraw a publisher (`repo_id` and `key_id` zero), one of its repos (`key_id`
+    /// zero), or one record key of a repo from the app, for all of its past. Owner only.
+    function exclude(bytes32 app_id, address publisher, bytes32 repo_id, bytes32 key_id)
+        external
+        onlyAppOwner(app_id)
+    {
+        _flipExclusion(app_id, publisher, repo_id, key_id, 0);
+    }
+
+    /// Lift an exclusion. Owner only.
+    function restore(bytes32 app_id, address publisher, bytes32 repo_id, bytes32 key_id)
+        external
+        onlyAppOwner(app_id)
+    {
+        _flipExclusion(app_id, publisher, repo_id, key_id, 1);
+    }
+
+    /// The slot an exclusion is counted in. Names stay hashed.
+    function exclusionId(address publisher, bytes32 repo_id, bytes32 key_id) public pure returns (bytes32) {
+        return keccak256(abi.encode(publisher, repo_id, key_id));
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
@@ -514,10 +600,11 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     /// May `publisher` publish to the app now? False if the publisher is banned
     /// network-wide or suspended from the app, merely invited, on stale terms, or the
-    /// app is suspended or its subscription has expired. `commitStateRoot` requires it.
+    /// app is suspended or its subscription has expired. A publisher's own acceptance
+    /// requires it, and the upload gate bills its bytes to the app while it holds.
     ///
     /// The same rules as `_validatePublisher`, but as a yes or no. Change both together:
-    /// `test_each_refused_commit_says_why` checks that they agree.
+    /// `test_each_refused_acceptance_says_why` checks that they agree.
     function canPublish(bytes32 app_id, address publisher) public view returns (bool) {
         App storage app = apps[app_id];
         return !app.isAppSuspended && app.expiry > block.timestamp && !globalSuspensions[publisher]
@@ -632,7 +719,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         _setSubscriptionPeriod(period);
     }
 
-    /// Point commits at a DataRegistry. Until one is set, every commit reverts.
+    /// Point acceptances at a DataRegistry. Until one is set, every acceptance reverts.
     function setDataRegistry(address registry) external onlyAdmin {
         emit DataRegistryChanged(dataRegistry, registry);
         dataRegistry = registry;
@@ -705,6 +792,30 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         emit SubscriptionUpdate(uint256(app_id), expiry);
     }
 
+    function _accept(bytes32 app_id, address publisher, bytes32 repo_id, string calldata repo, uint64 pos, bytes32 head)
+        private
+    {
+        AcceptedHead storage a = acceptedHeads[app_id][publisher][repo_id];
+        if (pos <= a.pos) revert StaleAcceptance();
+        emit Accepted(app_id, publisher, repo_id, repo, pos, a.head, head);
+        a.pos = pos;
+        a.head = head;
+    }
+
+    /// exclude needs an even count, restore an odd one; both add one.
+    function _flipExclusion(bytes32 app_id, address publisher, bytes32 repo_id, bytes32 key_id, uint64 parity)
+        private
+    {
+        bytes32 xid = exclusionId(publisher, repo_id, key_id);
+        uint64 n = exclusionCount[app_id][xid];
+        if (n % 2 != parity) {
+            if (parity == 0) revert AlreadyExcluded();
+            revert NotExcluded();
+        }
+        exclusionCount[app_id][xid] = n + 1;
+        emit ExclusionChanged(app_id, publisher, xid, repo_id, key_id, n + 1);
+    }
+
     function _setSubscriptionPeriod(uint64 period) private {
         if (period == 0) revert ZeroPeriod();
         subscriptionPeriod = period;
@@ -722,7 +833,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         if (acceptedTerms[app_id][publisher] != app.appTerms) revert TermsMismatch();
     }
 
-    /// The checks joining, accepting updated terms and committing share, in the order
+    /// The checks joining, accepting updated terms and accepting heads share, in the order
     /// all three report them: the app exists, the publisher is not banned network-wide,
     /// the app is not taken down, and the publisher is in it and not suspended from it.
     /// Returns their status, which is then Invited or Active.
