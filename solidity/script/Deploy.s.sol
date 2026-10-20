@@ -3,7 +3,6 @@ pragma solidity ^0.8.24;
 
 import {console} from "forge-std/Script.sol";
 import {VmSafe} from "forge-std/Vm.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
 import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
@@ -19,8 +18,7 @@ import {Deployments} from "./Deployments.sol";
 /// `--force` is not optional: the upgrade-safety check needs a full build.
 ///
 ///   all()                               all three registries, the AppRegistry and the
-///                                       DataRegistry wired to each other, and the
-///                                       default app claimed
+///                                       DataRegistry naming each other
 ///   appRegistry(address dataRegistry)   a new AppRegistry in front of an existing
 ///                                       DataRegistry, which is repointed at it
 ///   dataRegistry(address appRegistry)   a new DataRegistry behind an existing
@@ -28,7 +26,7 @@ import {Deployments} from "./Deployments.sol";
 ///   membershipRegistry(address appRegistry)
 ///
 /// With --broadcast, each new contract's build is written under
-/// `deployed/<Contract>/<implementation address>/`, replacing any older build of it: the
+/// `deployed/<chain id>/<Contract>/<implementation address>/`, replacing any older build of it: the
 /// first upgrade is checked against it. Commit it with the broadcast log and the new
 /// addresses in Deployments.sol.
 ///
@@ -44,28 +42,23 @@ import {Deployments} from "./Deployments.sol";
 ///                           appRegistry() and dataRegistry() it must be the signer,
 ///                           because the wiring calls are admin-only.
 ///   USDC_ADDR, SEMAPHORE_ADDR
-///                           default to Arbitrum Sepolia's; required on any other chain
+///                           default to Arbitrum Sepolia's or Base Sepolia's; required on any
+///                           other chain
 ///   SUBSCRIPTION_FEE        claiming an app, in USDC base units. Default 0
 ///   SUBSCRIPTION_PERIOD     how long one payment lasts, in seconds. Default 30 days
-///   DEFAULT_APP_NAME, DEFAULT_APP_TERMS_HASH, DEFAULT_APP_TERMS_URI,
-///   DEFAULT_APP_JOIN_FEE    the app claimed for the deployer. Defaults below
 contract Deploy is Builds {
-    address internal constant SEPOLIA_USDC = 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d;
-    address internal constant SEPOLIA_SEMAPHORE = 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D;
-    // sha256("test"): a placeholder for testing, with no real significance. An app with
-    // a zero terms hash cannot be joined, so the default app needs some value.
-    bytes32 internal constant DEFAULT_TERMS_HASH = 0x9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08;
+    address internal constant ARBITRUM_SEPOLIA_USDC = 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d;
+    address internal constant BASE_SEPOLIA_USDC = 0x036CbD53842c5426634e7929541eC2318f3dCF7e;
+    /// Semaphore v4: the same contract at the same address on both chains.
+    address internal constant SEMAPHORE = 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D;
 
     function all() external {
         address admin = _admin();
         vm.startBroadcast();
         AppRegistry apps = _deployAppRegistry(admin);
         DataRegistry data = _deployDataRegistry(admin, address(apps));
-        // Commits go through the AppRegistry, which forwards them here; the DataRegistry
-        // takes them from that AppRegistry only. Until this is set, nobody can commit.
         apps.setDataRegistry(address(data));
         address membership = _deployMembershipRegistry(admin, address(apps));
-        _claimDefaultApp(apps);
         vm.stopBroadcast();
         _report(apps, data);
         _reportMembership(membership, admin, address(apps));
@@ -79,11 +72,9 @@ contract Deploy is Builds {
         DataRegistry data = DataRegistry(dataRegistry_);
         vm.startBroadcast();
         AppRegistry apps = _deployAppRegistry(admin);
-        // The existing DataRegistry still takes commits from the old AppRegistry only.
-        // Namespace heads stay; apps, memberships and bans do not carry over.
+        // Repo heads stay; apps, memberships and bans do not carry over.
         apps.setDataRegistry(dataRegistry_);
         data.setAppRegistry(address(apps));
-        _claimDefaultApp(apps);
         vm.stopBroadcast();
         _report(apps, data);
         _recordBuild("AppRegistry", address(apps));
@@ -93,7 +84,7 @@ contract Deploy is Builds {
         address admin = _admin();
         AppRegistry apps = AppRegistry(appRegistry_);
         vm.startBroadcast();
-        // Namespace heads do not carry over.
+        // Repo heads do not carry over.
         DataRegistry data = _deployDataRegistry(admin, appRegistry_);
         apps.setDataRegistry(address(data));
         vm.stopBroadcast();
@@ -152,29 +143,6 @@ contract Deploy is Builds {
         );
     }
 
-    /// Claims the default app for the deployer, which pays the subscription fee.
-    function _claimDefaultApp(AppRegistry apps) internal {
-        bytes32 termsHash = vm.envOr("DEFAULT_APP_TERMS_HASH", DEFAULT_TERMS_HASH);
-        // A zero terms hash leaves the app unjoinable, which reads on the website as
-        // "registration is broken". Fail here instead, where the cause is obvious.
-        require(termsHash != bytes32(0), "DEFAULT_APP_TERMS_HASH is zero: an app with no terms cannot be joined");
-
-        (, address deployer,) = vm.readCallers();
-
-        uint256 fee = apps.subscriptionFee();
-        if (fee != 0) IERC20(apps.usdc()).approve(address(apps), fee);
-
-        bytes32 appId = keccak256(bytes(vm.envOr("DEFAULT_APP_NAME", string("fangorn"))));
-        apps.registerApp(
-            appId,
-            termsHash,
-            vm.envOr("DEFAULT_APP_TERMS_URI", string("https://fangorn.network/terms.html")),
-            vm.envOr("DEFAULT_APP_JOIN_FEE", uint256(0)),
-            fee
-        );
-        require(apps.getAppOwner(appId) == deployer, "default app owner");
-    }
-
     function _report(AppRegistry apps, DataRegistry data) internal view {
         address admin = _admin();
         require(apps.admin() == admin, "AppRegistry admin");
@@ -212,16 +180,22 @@ contract Deploy is Builds {
     }
 
     function _usdc() internal view returns (address) {
-        return _external("USDC_ADDR", SEPOLIA_USDC);
+        return _external("USDC_ADDR", ARBITRUM_SEPOLIA_USDC, BASE_SEPOLIA_USDC);
     }
 
     function _semaphore() internal view returns (address) {
-        return _external("SEMAPHORE_ADDR", SEPOLIA_SEMAPHORE);
+        return _external("SEMAPHORE_ADDR", SEMAPHORE, SEMAPHORE);
     }
 
-    /// An address this deployment depends on. The known one is only a default on the
-    /// chain it belongs to; anywhere else it has to be given.
-    function _external(string memory name, address onSepolia) private view returns (address) {
-        return block.chainid == Deployments.ARBITRUM_SEPOLIA ? vm.envOr(name, onSepolia) : vm.envAddress(name);
+    /// An address this deployment depends on. The known ones are only defaults on the
+    /// chains they belong to; anywhere else it has to be given.
+    function _external(string memory name, address onArbitrumSepolia, address onBaseSepolia)
+        private
+        view
+        returns (address)
+    {
+        if (block.chainid == Deployments.ARBITRUM_SEPOLIA) return vm.envOr(name, onArbitrumSepolia);
+        if (block.chainid == Deployments.BASE_SEPOLIA) return vm.envOr(name, onBaseSepolia);
+        return vm.envAddress(name);
     }
 }

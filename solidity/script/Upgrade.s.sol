@@ -18,7 +18,7 @@ import {Deployments} from "./Deployments.sol";
 /// state stay; only the implementation behind it changes.
 ///
 /// Before anything is sent, the plugin checks the new code against the build of the
-/// live version, committed under `deployed/<name>/<implementation address>/`: a moved,
+/// live version, committed under `deployed/<chain id>/<name>/<implementation address>/`: a moved,
 /// retyped or removed storage slot stops the upgrade. The signer must be the contract's
 /// admin, or the simulation reverts and nothing is sent either.
 ///
@@ -33,7 +33,7 @@ import {Deployments} from "./Deployments.sol";
 /// rebuilding it. It is written next to the live build and not over it, because the
 /// script runs before the transactions are sent: if they fail, the live build is still
 /// there and the upgrade can be run again. The build of the version before the live one
-/// is removed at the same time, so `deployed/<name>/` never holds more than two.
+/// is removed at the same time, so `deployed/<chain id>/<name>/` never holds more than two.
 contract Upgrade is Builds {
     function run(string calldata name) external {
         run(name, "");
@@ -48,7 +48,9 @@ contract Upgrade is Builds {
         _requireReferenceIsLive(name, previous);
 
         vm.startBroadcast();
-        Upgrades.upgradeProxy(proxy, version, data, Deployments.upgradeOptions(name, vm.toString(previous)));
+        Upgrades.upgradeProxy(
+            proxy, version, data, Deployments.upgradeOptions(name, block.chainid, vm.toString(previous))
+        );
         vm.stopBroadcast();
 
         address next = Upgrades.getImplementationAddress(proxy);
@@ -69,7 +71,7 @@ contract Upgrade is Builds {
         for (uint256 i = 0; i < names.length; i++) {
             address implementation = Upgrades.getImplementationAddress(Deployments.proxy(names[i], block.chainid));
             _requireReferenceIsLive(names[i], implementation);
-            console.log("deployed/%s is the code at %s", names[i], implementation);
+            console.log("%s is the code at %s", _builds(names[i]), implementation);
         }
     }
 }

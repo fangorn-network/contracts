@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {Options} from "openzeppelin-foundry-upgrades/Options.sol";
 
 /// What is deployed, and what each contract is built from.
@@ -13,11 +14,17 @@ import {Options} from "openzeppelin-foundry-upgrades/Options.sol";
 ///   1. Edit the contract in place, e.g. `src/DataRegistry.sol`. The file and the
 ///      contract keep their names, so the pull request shows what changed. What it is
 ///      checked against is the build of the live version, in
-///      `deployed/DataRegistry/<implementation address>/`.
+///      `deployed/<chain id>/DataRegistry/<implementation address>/`.
 ///   2. `forge script script/Upgrade.s.sol --sig "run(string)" DataRegistry --force …`
 ///      It records the build of the new version next to the old one. Commit it.
 library Deployments {
     uint256 internal constant ARBITRUM_SEPOLIA = 421614;
+    uint256 internal constant BASE_SEPOLIA = 84532;
+
+    /// Every chain the contracts are deployed on, or may be.
+    function chains() internal pure returns (uint256[2] memory) {
+        return [ARBITRUM_SEPOLIA, BASE_SEPOLIA];
+    }
 
     /// Each contract's source: what a new proxy is deployed with, and what an existing
     /// proxy is upgraded to. Written as `File.sol:Contract`, because a file that also
@@ -60,6 +67,12 @@ library Deployments {
             if (n == keccak256("DataRegistry")) return 0x72B5f83526F3893aF9f1eE0f32A27218EA09f8aE;
             if (n == keccak256("MembershipRegistry")) return 0xDF17030Cd65435C86eb043F31DDACa99E819E347;
         }
+        if (chainId == BASE_SEPOLIA) {
+            // Deployed with Deploy.s.sol all(), in block 48340483.
+            if (n == keccak256("AppRegistry")) return 0x0D3e98399df41b558048Cdd7D71723c37A3A9D6F;
+            if (n == keccak256("DataRegistry")) return 0xE9183f768865dd2Cde5f1B71F8446F0Cd798ebe0;
+            if (n == keccak256("MembershipRegistry")) return 0x0e96C012b5c53622EcDAA82F342E31C2623A04f5;
+        }
         return address(0);
     }
 
@@ -68,14 +81,17 @@ library Deployments {
     function options(string memory) internal pure returns (Options memory opts) {}
 
     /// The options `name` is upgraded with: the ones above, plus what the new code is
-    /// checked against. That is a build of a deployed version, committed under
-    /// `deployed/<name>/<build>/`, and not a second copy of the source: the contract
+    /// checked against. That is a build of a version deployed on `chainId`, committed under
+    /// `deployed/<chainId>/<name>/<build>/`, and not a second copy of the source: the contract
     /// keeps its file and its name from one version to the next. `build` is the address
     /// of the implementation it is the build of; `Upgrade.s.sol` writes each one.
-    // ponytail: one chain. Add the chain id to the path when a second one is deployed.
-    function upgradeOptions(string memory name, string memory build) internal pure returns (Options memory opts) {
+    function upgradeOptions(string memory name, uint256 chainId, string memory build)
+        internal
+        pure
+        returns (Options memory opts)
+    {
         opts = options(name);
-        opts.referenceBuildInfoDir = string.concat("deployed/", name, "/", build);
+        opts.referenceBuildInfoDir = string.concat("deployed/", Strings.toString(chainId), "/", name, "/", build);
         // `<build directory>:<contract>`
         opts.referenceContract = string.concat(build, ":", name);
     }

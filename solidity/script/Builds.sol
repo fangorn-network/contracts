@@ -5,7 +5,7 @@ import {Script} from "forge-std/Script.sol";
 import {VmSafe} from "forge-std/Vm.sol";
 
 /// The builds of deployed versions, committed under
-/// `deployed/<Contract>/<implementation address>/`: what the next upgrade of each
+/// `deployed/<chain id>/<Contract>/<implementation address>/`: what the next upgrade of each
 /// contract is checked against. Deploy.s.sol writes the first one and Upgrade.s.sol
 /// each one after, so nobody builds a reference by hand.
 abstract contract Builds is Script {
@@ -16,15 +16,21 @@ abstract contract Builds is Script {
         uint256 start;
     }
 
-    function _dir(string memory name, address implementation) internal pure returns (string memory) {
-        return string.concat("deployed/", name, "/", vm.toString(implementation));
+    /// This chain's builds of `name`. Each chain has its own, so a deployment on one
+    /// never touches another's.
+    function _builds(string memory name) internal view returns (string memory) {
+        return string.concat("deployed/", vm.toString(block.chainid), "/", name);
+    }
+
+    function _dir(string memory name, address implementation) internal view returns (string memory) {
+        return string.concat(_builds(name), "/", vm.toString(implementation));
     }
 
     /// Builds `name` into the directory of `next`, the implementation this run deploys,
     /// and removes every other build of `name` but the one of `live` (none, for a
     /// first deployment: pass the zero address).
     function _record(string memory name, address live, address next) internal {
-        string memory parent = string.concat("deployed/", name);
+        string memory parent = _builds(name);
         VmSafe.DirEntry[] memory builds = vm.isDir(parent) ? vm.readDir(parent) : new VmSafe.DirEntry[](0);
         for (uint256 i = 0; i < builds.length; i++) {
             string[] memory path = vm.split(builds[i].path, "/");
@@ -52,7 +58,7 @@ abstract contract Builds is Script {
         _requireReferenceIsLive(name, next);
     }
 
-    /// Reverts unless the one build in `deployed/<name>/<implementation>/` is the
+    /// Reverts unless the one build in `deployed/<chain id>/<name>/<implementation>/` is the
     /// runtime code at `implementation`, instruction for instruction.
     ///
     /// A build is several megabytes, and each JSON lookup below copies it into memory

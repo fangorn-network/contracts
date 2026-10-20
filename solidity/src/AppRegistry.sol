@@ -9,30 +9,24 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC5643} from "./IERC5643.sol";
 
-/// The DataRegistry's one write, which accepts calls from this contract only.
-interface IDataRegistry {
-    function commitStateRoot(bytes32 app_id, address publisher, bytes32 subspace_id, bytes32 old_root, bytes32 new_root)
-        external;
-}
-
 /// AppRegistry
 ///
-/// An application is a named domain and a set of agreements for associating data with
-/// it. A wallet claims an app (`registerApp`) and owns it; the owner invites publishers
-/// (`invitePublisher`), who join by accepting the app's terms (`joinApp`). Only a publisher
-/// who has joined may publish to the app's namespace in the DataRegistry
-/// (`canPublish`).
+/// An application is sponsored storage for the publishers it accepts. A wallet claims
+/// an app (`registerApp`) and owns it; the owner accepts publishers (`acceptPublisher`).
+/// An accepted publisher uploads with storage the app provides, and the app includes its
+/// data: the latest head of each of its repos, less what the owner excludes (`exclude`).
+/// A repo lives in the DataRegistry and belongs to no app; nothing here reads or records
+/// a head. One rule, `canPublish`, says whether both hold for a publisher now.
 ///
 /// An app IS a storage subscription: claiming one pulls the subscription fee (USDC)
 /// for one period, and the off-chain upload gate reads `access` to decide whether to
 /// serve its publishers.
 ///
-/// Two payments, both in USDC and kept apart. The subscription fee is the protocol's:
-/// set by the admin, paid by the app's owner, and taken out by the admin
-/// (`withdrawToken`). The join fee is the app owner's: set by the owner, paid by each
-/// publisher who joins, held here and credited to the owner until they take it out
-/// (`withdrawJoinFees`). The admin can only take the protocol's share: the owners'
-/// balances (`totalJoinFeesOwed`) are out of reach. The contract holds no ETH.
+/// The subscription fee is the one payment, in USDC: set by the admin, paid by the app's
+/// owner, and taken out by the admin (`withdrawToken`). Join fees, which earlier versions
+/// collected from publishers, are no longer charged; what an owner is still owed stays
+/// theirs to take out (`withdrawJoinFees`), out of the admin's reach
+/// (`totalJoinFeesOwed`). The contract holds no ETH.
 ///
 /// Each app is also an ERC-721 token, minted to its owner at claim, and its
 /// subscription follows ERC-5643: `expiresAt`, `isRenewable`, `renewSubscription` and
@@ -41,17 +35,8 @@ interface IDataRegistry {
 /// the contract the app id. The token cannot be transferred.
 ///
 /// The expiry is enforced here. Once an app's subscription has lapsed or been
-/// cancelled, nobody can commit to it and nobody can join it, so no join fee is paid
-/// into an app that cannot be used. Renewing lifts all of it at once, and nothing is
-/// lost meanwhile.
-/// Membership management (inviting, accepting updated terms, suspending) stays open,
-/// and fees already earned can still be withdrawn.
-///
-/// Every commit goes through this contract (`commitStateRoot`). It checks that the
-/// sender may publish under the app — the protocol admin's network-wide ban is kept
-/// here too — and forwards the commit to the DataRegistry, which accepts commits from
-/// this contract alone.
-///
+/// cancelled, it provides no storage and includes nothing. Renewing lifts it at once,
+/// and nothing is lost meanwhile. Managing publishers stays open.
 /// Deployed behind an ERC-1967 proxy (UUPS): the proxy holds the state and the address,
 /// and the admin can point it at a new implementation. Storage is therefore
 /// append-only: add state variables after the last one and fields at the end of
@@ -63,13 +48,14 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     /// A publisher's standing in one app. In the ABI it is a uint8, in this order.
     enum Status {
-        /// Never added to the app.
+        /// Never accepted by the app.
         None,
-        /// Joined: accepted the app's terms and paid its join fee.
+        /// Accepted by the app's owner (`acceptPublisher`).
         Active,
-        /// Joined, then suspended from the app by its owner.
+        /// Accepted, then suspended from the app by its owner.
         Suspended,
-        /// Added by the app owner, terms not yet accepted.
+        /// Retired: invited under the old join flow, and never joined. Not a member;
+        /// `acceptPublisher` accepts it like `None`.
         Invited
     }
 
@@ -90,52 +76,28 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     error AppNotFound();
     /// `registerApp`: an app with this id already exists
     error AppAlreadyRegistered();
-    /// Claiming or setting terms: the terms hash is zero. An app always has terms, so
-    /// that there is something to accept.
-    error TermsNotSet();
-    /// The protocol admin has taken the app down (`setAppSuspended`)
-    error AppSuspended();
     /// `withdrawJoinFees`: the caller is owed nothing
     error NothingToWithdraw();
 
     // Membership
-    /// The wallet was never invited to this app, or its invitation was revoked
-    error NotInvited();
-    /// `invitePublisher`: the wallet is already invited to, a member of, or suspended from
-    /// this app
-    error AlreadyInvited();
-    /// Committing, accepting updated terms or being suspended: invited, but has not
-    /// joined (`joinApp`). An invitation is taken back with `revokeInvitation`.
-    error NotJoined();
-    /// `joinApp`: the publisher has already joined. After the terms change, a member
-    /// accepts the new ones with `acceptUpdatedTerms`, not by joining again.
-    error AlreadyJoined();
-    /// Joining or accepting updated terms: not the app's current terms. Committing: the
-    /// terms the publisher accepted are no longer the app's; accept the new ones with
-    /// `acceptUpdatedTerms`.
-    error TermsMismatch();
-    /// `acceptUpdatedTerms`: the publisher has already accepted the app's current terms
-    error TermsAlreadyAccepted();
-    /// `joinApp`: the app's join fee is above the most the joiner agreed to pay
-    error JoinFeeTooHigh();
-    /// `joinApp`: the join fee could not be collected: the token refused the transfer,
-    /// usually because the joiner's allowance or balance is too low
-    error JoinFeeRequired();
-    /// The app's owner has suspended the publisher from this app (`setPublisherSuspended`)
-    error PublisherSuspendedApp();
+    /// `setPublisherSuspended`: the app never accepted this wallet
+    error NotAccepted();
+    /// `acceptPublisher`: the app has already accepted this wallet (suspended or not)
+    error AlreadyAccepted();
     /// `setPublisherSuspended(…, false)`: the publisher is not suspended from this app
     error PublisherNotSuspended();
     /// `setPublisherSuspended`: an app's owner cannot suspend themselves from it
     error CannotSuspendOwner();
     /// The protocol admin has suspended this wallet network-wide (`setGlobalSuspension`):
-    /// the caller, the publisher named, or (for inviting and changing what the app points
-    /// to) the app's owner
+    /// the caller, the publisher named, or (for accepting a publisher and moving the
+    /// agent card) the app's owner
     error PublisherSuspendedGlobal();
 
-    // Publishing
-    /// Raised by the DataRegistry and passed through by `commitStateRoot`: `old_root` is
-    /// not the current head. Declared here so it is in this contract's ABI.
-    error StaleStateRoot();
+    // Presenting
+    /// `exclude`: already excluded
+    error AlreadyExcluded();
+    /// `restore`: not excluded
+    error NotExcluded();
 
     // Subscription
     /// The subscription fee could not be collected: the token refused the transfer,
@@ -153,9 +115,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     error NotTransferable();
     /// The subscription period cannot be zero
     error ZeroPeriod();
-    /// Committing or joining: the app's subscription has expired or been cancelled.
-    /// Renew it (`renewSubscription`).
-    error SubscriptionExpired();
 
     // Events, grouped the same way. The subscription's own event, `SubscriptionUpdate`,
     // is ERC-5643's, declared in `IERC5643`.
@@ -163,11 +122,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     // Apps
     /// A wallet claimed an app
     event AppRegistered(bytes32 indexed app_id, address indexed owner);
-    /// The app's terms changed and every publisher on the old hash must accept the new
-    /// terms before they can publish again
-    event AppTermsChanged(bytes32 indexed app_id, bytes32 terms_hash, string terms_uri);
-    /// The app's join fee, in USDC base units, was set: at registration, or by its owner
-    event JoinFeeChanged(bytes32 indexed app_id, uint256 join_fee);
     /// An app owner took out the join fees they were owed
     event JoinFeesWithdrawn(address indexed owner, address to, uint256 amount);
     /// The app's agent card moved
@@ -176,18 +130,25 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     event AppSuspensionChanged(bytes32 indexed app_id, bool suspended);
 
     // Membership
-    /// An app owner added a publisher, who may now accept the terms and join
-    event PublisherInvited(bytes32 indexed app_id, address indexed publisher);
-    /// An app owner took back an invitation before it was accepted
-    event PublisherInvitationRevoked(bytes32 indexed app_id, address indexed publisher);
-    /// A publisher joined an app AND accepted `terms_hash`, paying `join_fee`
-    event PublisherJoined(bytes32 indexed app_id, address indexed publisher, bytes32 terms_hash, uint256 join_fee);
-    /// A member accepted the app's updated terms, `terms_hash`, and can publish again
-    event UpdatedTermsAccepted(bytes32 indexed app_id, address indexed publisher, bytes32 terms_hash);
+    /// An app's owner accepted a publisher: it may upload with the app's storage, and the
+    /// app includes its data
+    event PublisherAccepted(bytes32 indexed app_id, address indexed publisher);
     /// An app owner suspended a publisher from their app, or lifted the suspension
     event PublisherSuspensionChanged(bytes32 indexed app_id, address indexed publisher, bool suspended);
     /// The protocol admin banned a wallet network-wide, or lifted the ban
     event GlobalSuspensionChanged(address indexed publisher, bool suspended);
+
+    // Presenting
+    /// An exclusion changed: odd `count` means in force. `repo_id` and `key_id` are zero
+    /// for the levels it does not name.
+    event ExclusionChanged(
+        bytes32 indexed app_id,
+        address indexed publisher,
+        bytes32 indexed exclusion_id,
+        bytes32 repo_id,
+        bytes32 key_id,
+        uint64 count
+    );
 
     // Protocol admin
     /// The admin changed the subscription fee, in USDC base units: it applies from the
@@ -195,7 +156,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     event SubscriptionFeeChanged(uint256 fee);
     /// The admin changed the period: it applies from each app's next payment
     event SubscriptionPeriodChanged(uint64 period);
-    /// The admin pointed commits at another DataRegistry
+    /// The admin pointed the DataRegistry address at another one
     event DataRegistryChanged(address previous_registry, address new_registry);
     /// The admin sent an ERC-20 the contract held: subscription fees, or a token sent
     /// here by mistake
@@ -211,44 +172,47 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     address public usdc;
     /// Subscription fee, denominated in USDC base units (6 decimals).
     uint256 public subscriptionFee;
-    /// The DataRegistry that commits are forwarded to
+    /// The DataRegistry this app registry names. Nothing here calls it.
     address public dataRegistry;
 
     struct App {
         // The first three fields share one storage slot (20 + 1 + 8 bytes): keep them
         // adjacent.
         /// Zero means the app is unclaimed. Always the same as the token's owner
-        /// (`ownerOf`): the token cannot move. Kept here as well so that every commit
+        /// (`ownerOf`): the token cannot move. Kept here as well so that `canPublish`
         /// reads the owner, the takedown flag and the expiry from one storage slot.
         address owner;
         /// Admin takedown flag. A suspended app is dead for every publisher at once.
         bool isAppSuspended;
         /// When the subscription expires (Unix seconds). Zero once cancelled.
         uint64 expiry;
-        /// Hash of the app's current publisher terms. Zero means none are set.
+        /// Retired: the publisher terms hash of the old join flow. Kept for the layout.
         bytes32 appTerms;
-        /// URI to read the terms
+        /// Retired: where the terms were read. Kept for the layout.
         string appTermsUri;
-        /// Join fee, in USDC base units. Can be zero.
+        /// Retired: the old join fee. Kept for the layout.
         uint256 joinFee;
         /// URI of the app's ERC-8004 agent card. Empty means the app has none.
         string appAgentUri;
     }
 
-    /// app_id => app. Internal: the getters below are the ABI the SDK reads.
+    /// app_id => app. Internal: the getters below are the ABI clients read.
     mapping(bytes32 => App) internal apps;
     /// app_id => publisher => standing in the app
     mapping(bytes32 => mapping(address => Status)) public statusForApp;
-    /// app_id => publisher => the terms hash they actually accepted
-    mapping(bytes32 => mapping(address => bytes32)) public acceptedTerms;
+    /// Retired: app_id => publisher => the terms hash they joined on. Kept for the layout.
+    mapping(bytes32 => mapping(address => bytes32)) internal acceptedTerms;
     /// wallet => banned network-wide by the protocol admin
     mapping(address => bool) public globalSuspensions;
-    /// app owner => join fees paid to their apps and not yet withdrawn, in USDC base
-    /// units
+    /// app owner => join fees paid to their apps under the old join flow and not yet
+    /// withdrawn, in USDC base units. Nothing adds to it any more.
     mapping(address => uint256) public joinFeesOwed;
     /// The sum of `joinFeesOwed`: the part of the contract's USDC that belongs to app
     /// owners, which `withdrawToken` cannot touch
     uint256 public totalJoinFeesOwed;
+
+    /// app_id => exclusionId => changes so far; odd means excluded
+    mapping(bytes32 => mapping(bytes32 => uint64)) public exclusionCount;
 
     /// The implementation is only ever used through a proxy. Lock it, so nobody can
     /// initialize it directly.
@@ -274,16 +238,11 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     /// Register a unique app id.
     ///
-    /// * `terms_hash`: the hash of the terms and conditions for using the app. Not zero.
-    /// * `terms_uri`: where the terms can be read. NOT the app's agent card — that
-    ///   goes in `setAppAgentUri`, which carries no hash precisely so that moving it
-    ///   does not make every publisher accept the terms again.
-    /// * `join_fee`: what joining the app costs a publisher, in USDC base units
     /// * `max_subscription_fee`: the most the caller will pay for the first period. The
     ///   fee charged is `subscriptionFee()` when the registration lands; if the admin has raised
     ///   it above this in the meantime, the registration reverts instead.
     ///
-    /// The caller becomes the app's first publisher, already joined.
+    /// The caller becomes the app's first publisher, already accepted.
     ///
     /// Registration pays the subscription fee (USDC) for one period, so an app cannot exist
     /// unpaid. The caller must `approve` this contract for `subscriptionFee()` first.
@@ -291,67 +250,29 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     ///
     /// The caller must not be banned network-wide (`globalSuspensions`), so a wallet the
     /// protocol admin has banned cannot come back as an app owner.
-    function registerApp(
-        bytes32 app_id,
-        bytes32 terms_hash,
-        string calldata terms_uri,
-        uint256 join_fee,
-        uint256 max_subscription_fee
-    ) external nonReentrant {
+    function registerApp(bytes32 app_id, uint256 max_subscription_fee) external nonReentrant {
         App storage app = apps[app_id];
         address owner = msg.sender;
         if (globalSuspensions[owner]) revert PublisherSuspendedGlobal();
         if (app.owner != address(0)) revert AppAlreadyRegistered();
-        if (terms_hash == bytes32(0)) revert TermsNotSet();
         if (subscriptionFee > max_subscription_fee) revert SubscriptionFeeTooHigh();
         _paySubscription(app_id, owner);
 
         app.owner = owner;
-        app.appTerms = terms_hash;
-        app.appTermsUri = terms_uri;
-        app.joinFee = join_fee;
-        _joinOwner(app_id, owner, terms_hash);
+        statusForApp[app_id][owner] = Status.Active;
         _mint(owner, uint256(app_id));
 
         emit AppRegistered(app_id, owner);
-        emit AppTermsChanged(app_id, terms_hash, terms_uri);
-        emit JoinFeeChanged(app_id, join_fee);
+        emit PublisherAccepted(app_id, owner);
     }
 
     function getAppOwner(bytes32 app_id) external view returns (address) {
         return apps[app_id].owner;
     }
 
-    /// Publish (or update) an app's publisher agreement. Only callable by the app owner.
-    ///
-    /// Note: every publisher who accepted the previous terms can no longer publish
-    /// until they accept the new ones (`acceptUpdatedTerms`, free).
-    ///
-    /// An owner banned network-wide cannot change the terms (`PublisherSuspendedGlobal`):
-    /// their app keeps running as it is, but they cannot change what it points to.
-    function setAppTerms(bytes32 app_id, bytes32 terms_hash, string calldata terms_uri) external onlyAppOwner(app_id) {
-        if (globalSuspensions[msg.sender]) revert PublisherSuspendedGlobal();
-        if (terms_hash == bytes32(0)) revert TermsNotSet();
-        App storage app = apps[app_id];
-        app.appTerms = terms_hash;
-        app.appTermsUri = terms_uri;
-        // The owner accepts their own terms by publishing them. Without this they are
-        // locked out of their own app by every edit.
-        _joinOwner(app_id, msg.sender, terms_hash);
-        emit AppTermsChanged(app_id, terms_hash, terms_uri);
-    }
-
-    /// Set the app's join fee, in USDC base units. A joiner caps what they pay
-    /// (`joinApp`), so a raise cannot be charged to a join already on its way.
-    function setJoinFee(bytes32 app_id, uint256 join_fee) external onlyAppOwner(app_id) {
-        apps[app_id].joinFee = join_fee;
-        emit JoinFeeChanged(app_id, join_fee);
-    }
-
     /// Take out every join fee owed to the caller, as the owner of one or more apps,
-    /// and send it, in USDC, to `to`. Join fees are credited to the owner when a publisher
-    /// joins (`joinApp`) and wait here until withdrawn. If the transfer fails, the
-    /// balance stays owed.
+    /// and send it, in USDC, to `to`. Only fees collected under the old join flow are
+    /// owed. If the transfer fails, the balance stays owed.
     function withdrawJoinFees(address to) external nonReentrant {
         uint256 amount = joinFeesOwed[msg.sender];
         if (amount == 0) revert NothingToWithdraw();
@@ -371,88 +292,30 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     // ── Membership ────────────────────────────────────────────────────────────
 
-    /// Invite a publisher to this app. Only callable by the app owner.
-    ///
-    /// This is an invitation, not a membership: the publisher still has to accept the
-    /// terms (and pay the join fee) with `joinApp`. Nobody can join uninvited.
-    /// Take an invitation back with `revokeInvitation`.
+    /// Accept a publisher into this app. Only callable by the app owner. From here the
+    /// publisher may upload with storage the app provides, and the app includes its data,
+    /// for as long as `canPublish` holds.
     ///
     /// Neither side may be banned network-wide (`PublisherSuspendedGlobal`): an owner
     /// cannot bring in a wallet the protocol admin has banned, and a banned owner cannot
     /// bring in anyone, which would let them keep publishing through new wallets.
-    function invitePublisher(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
+    /// A publisher the app already accepted reverts `AlreadyAccepted`; one it suspended
+    /// comes back with `setPublisherSuspended(…, false)`.
+    function acceptPublisher(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
         if (globalSuspensions[msg.sender]) revert PublisherSuspendedGlobal();
         if (globalSuspensions[publisher]) revert PublisherSuspendedGlobal();
-        if (statusForApp[app_id][publisher] != Status.None) revert AlreadyInvited();
-        statusForApp[app_id][publisher] = Status.Invited;
-        emit PublisherInvited(app_id, publisher);
-    }
-
-    /// Take back an invitation the publisher has not accepted yet. They are as if never
-    /// invited: they cannot join, and the owner can invite them again (`invitePublisher`).
-    /// Only callable by the app owner. Reverts `NotInvited` for a wallet the app does not
-    /// know, and `AlreadyJoined` for one who has joined; a member is suspended instead.
-    function revokeInvitation(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
         Status status = statusForApp[app_id][publisher];
-        if (status == Status.None) revert NotInvited();
-        if (status != Status.Invited) revert AlreadyJoined();
-        statusForApp[app_id][publisher] = Status.None;
-        emit PublisherInvitationRevoked(app_id, publisher);
-    }
-
-    /// Join an app as a publisher, once. By joining, you agree to the app's current terms
-    /// (`terms_hash`) and pay its join fee in USDC (`approve` this contract first). The
-    /// app owner must have added you first (`invitePublisher`), and a wallet banned
-    /// network-wide cannot join. Nobody can join an app whose subscription has expired
-    /// (`SubscriptionExpired`).
-    ///
-    /// * `max_join_fee`: the most the joiner will pay. The fee charged is the app's join
-    ///   fee when the join lands; if the owner has raised it above this in the
-    ///   meantime, the join reverts instead (`JoinFeeTooHigh`).
-    ///
-    /// The join fee is held here and credited to the app owner, who takes it out with
-    /// `withdrawJoinFees`.
-    function joinApp(bytes32 app_id, bytes32 terms_hash, uint256 max_join_fee) external nonReentrant {
-        App storage app = apps[app_id];
-        if (_validateForApp(app, app_id, msg.sender) == Status.Active) revert AlreadyJoined();
-        if (app.expiry <= block.timestamp) revert SubscriptionExpired();
-        bytes32 current = app.appTerms;
-        if (terms_hash != current) revert TermsMismatch();
-        uint256 join_fee = app.joinFee;
-        if (join_fee > max_join_fee) revert JoinFeeTooHigh();
-
-        statusForApp[app_id][msg.sender] = Status.Active;
-        acceptedTerms[app_id][msg.sender] = current;
-        if (join_fee != 0) {
-            joinFeesOwed[app.owner] += join_fee;
-            totalJoinFeesOwed += join_fee;
-            if (!IERC20(usdc).trySafeTransferFrom(msg.sender, address(this), join_fee)) revert JoinFeeRequired();
-        }
-
-        emit PublisherJoined(app_id, msg.sender, current, join_fee);
-    }
-
-    /// Accept the app's updated terms (`terms_hash`), as a member whose accepted terms
-    /// the owner has since replaced. Free: an owner must not be able to bill every
-    /// member by editing the terms. Until a member accepts, they cannot publish.
-    function acceptUpdatedTerms(bytes32 app_id, bytes32 terms_hash) external {
-        App storage app = apps[app_id];
-        if (_validateForApp(app, app_id, msg.sender) == Status.Invited) revert NotJoined();
-        bytes32 current = app.appTerms;
-        if (terms_hash != current) revert TermsMismatch();
-        if (acceptedTerms[app_id][msg.sender] == current) revert TermsAlreadyAccepted();
-
-        acceptedTerms[app_id][msg.sender] = current;
-        emit UpdatedTermsAccepted(app_id, msg.sender, current);
+        if (status == Status.Active || status == Status.Suspended) revert AlreadyAccepted();
+        statusForApp[app_id][publisher] = Status.Active;
+        emit PublisherAccepted(app_id, publisher);
     }
 
     /// Suspend a member from this app (`true`), or lift the suspension (`false`). Only
     /// callable by the app owner, and only for this app: a network-wide ban is the
     /// protocol admin's (`setGlobalSuspension`).
     ///
-    /// Only a publisher who has joined can be suspended (`NotJoined` for one only
-    /// invited: take the invitation back with `revokeInvitation`), so lifting a
-    /// suspension always makes them a member again. Unlike the other suspension setters,
+    /// Only a publisher the app accepted can be suspended (`NotAccepted` otherwise), so
+    /// lifting a suspension always makes them a member again. Unlike the other suspension setters,
     /// lifting one that is not there reverts (`PublisherNotSuspended`), since it would
     /// otherwise change the publisher's status. The owner cannot suspend themselves
     /// (`CannotSuspendOwner`): an owner's membership of their own app is not theirs to
@@ -461,8 +324,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         Status status = statusForApp[app_id][publisher];
         if (is_suspended) {
             if (publisher == msg.sender) revert CannotSuspendOwner();
-            if (status == Status.None) revert NotInvited();
-            if (status == Status.Invited) revert NotJoined();
+            if (status != Status.Active) revert NotAccepted();
             statusForApp[app_id][publisher] = Status.Suspended;
         } else {
             if (status != Status.Suspended) revert PublisherNotSuspended();
@@ -471,38 +333,25 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         emit PublisherSuspensionChanged(app_id, publisher, is_suspended);
     }
 
-    // ── Publishing ────────────────────────────────────────────────────────────
+    // ── Presenting ────────────────────────────────────────────────────────────
 
-    /// Commit a new state root for one of your subspaces in an app. This is the only
-    /// way to publish: the DataRegistry accepts commits from this contract alone.
-    ///
-    /// The sender must be an active publisher of the app (`canPublish`), or the
-    /// commit reverts with the reason (see `_validatePublisher`). The DataRegistry then
-    /// compare-and-swaps the head of `app_id:sender:subspace_id`,
-    /// reverting `StaleStateRoot` if `old_root` is not the current head, and emits
-    /// `StateCommitted`. An app whose subscription has expired takes no commits
-    /// (`SubscriptionExpired`) until it is renewed.
-    function commitStateRoot(bytes32 app_id, bytes32 subspace_id, bytes32 old_root, bytes32 new_root)
-        external
-        nonReentrant
-    {
-        _validatePublisher(app_id, msg.sender);
-        IDataRegistry(dataRegistry).commitStateRoot(app_id, msg.sender, subspace_id, old_root, new_root);
+    /// Withdraw a publisher (`repo_id` and `key_id` zero), one of its repos (`key_id`
+    /// zero), or one record key of a repo from the app, for all of its past. Owner only.
+    function exclude(bytes32 app_id, address publisher, bytes32 repo_id, bytes32 key_id) external onlyAppOwner(app_id) {
+        _flipExclusion(app_id, publisher, repo_id, key_id, 0);
+    }
+
+    /// Lift an exclusion. Owner only.
+    function restore(bytes32 app_id, address publisher, bytes32 repo_id, bytes32 key_id) external onlyAppOwner(app_id) {
+        _flipExclusion(app_id, publisher, repo_id, key_id, 1);
+    }
+
+    /// The slot an exclusion is counted in. Names stay hashed.
+    function exclusionId(address publisher, bytes32 repo_id, bytes32 key_id) public pure returns (bytes32) {
+        return keccak256(abi.encode(publisher, repo_id, key_id));
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
-
-    function appTerms(bytes32 app_id) external view returns (bytes32) {
-        return apps[app_id].appTerms;
-    }
-
-    function appTermsUri(bytes32 app_id) external view returns (string memory) {
-        return apps[app_id].appTermsUri;
-    }
-
-    function joinFee(bytes32 app_id) external view returns (uint256) {
-        return apps[app_id].joinFee;
-    }
 
     function appAgentUri(bytes32 app_id) external view returns (string memory) {
         return apps[app_id].appAgentUri;
@@ -512,16 +361,15 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         return apps[app_id].isAppSuspended;
     }
 
-    /// May `publisher` publish to the app now? False if the publisher is banned
-    /// network-wide or suspended from the app, merely invited, on stale terms, or the
-    /// app is suspended or its subscription has expired. `commitStateRoot` requires it.
-    ///
-    /// The same rules as `_validatePublisher`, but as a yes or no. Change both together:
-    /// `test_each_refused_commit_says_why` checks that they agree.
+    /// May `publisher` publish to the app now? True while the app has accepted it and not
+    /// suspended it, it is not banned network-wide, and the app is neither taken down nor
+    /// past its subscription. The one rule an app has
+    /// for a publisher: while it holds, the upload gate bills the publisher's bytes to the
+    /// app, and the app presents the publisher's repos.
     function canPublish(bytes32 app_id, address publisher) public view returns (bool) {
         App storage app = apps[app_id];
         return !app.isAppSuspended && app.expiry > block.timestamp && !globalSuspensions[publisher]
-            && statusForApp[app_id][publisher] == Status.Active && acceptedTerms[app_id][publisher] == app.appTerms;
+            && statusForApp[app_id][publisher] == Status.Active;
     }
 
     /// The single oracle the upload gate reads: `(can_publish, owner, expires_at)`.
@@ -531,17 +379,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     function access(bytes32 app_id, address publisher) external view returns (bool, address, uint64) {
         App storage app = apps[app_id];
         return (canPublish(app_id, publisher), app.owner, app.expiry);
-    }
-
-    /// `(terms_hash, terms_uri, join_fee, status, can_publish)` — a join screen in one call
-    function joinInfo(bytes32 app_id, address publisher)
-        external
-        view
-        returns (bytes32, string memory, uint256, Status, bool)
-    {
-        App storage app = apps[app_id];
-        return
-            (app.appTerms, app.appTermsUri, app.joinFee, statusForApp[app_id][publisher], canPublish(app_id, publisher));
     }
 
     // ── Subscription (ERC-5643) ───────────────────────────────────────────────
@@ -632,7 +469,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         _setSubscriptionPeriod(period);
     }
 
-    /// Point commits at a DataRegistry. Until one is set, every commit reverts.
+    /// Point the DataRegistry address at another one.
     function setDataRegistry(address registry) external onlyAdmin {
         emit DataRegistryChanged(dataRegistry, registry);
         dataRegistry = registry;
@@ -649,7 +486,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     }
 
     /// Ban a wallet network-wide (`true`), or lift the ban (`false`). A banned wallet
-    /// can no longer claim an app, be added to one, join one, or publish in any
+    /// can no longer claim an app, be accepted into one, or publish in any
     /// (`canPublish` turns false). Any address can be banned, including one that
     /// has never published. Nothing else is touched, so lifting the ban restores
     /// everything, and the wallet's timelines in the DataRegistry resume where they
@@ -685,12 +522,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         _;
     }
 
-    /// Mark an app owner as an active publisher of their own app
-    function _joinOwner(bytes32 app_id, address owner, bytes32 terms_hash) private {
-        statusForApp[app_id][owner] = Status.Active;
-        acceptedTerms[app_id][owner] = terms_hash;
-    }
-
     /// Pull the subscription fee from `payer` and add one period to the app's expiry,
     /// counted from now if it has passed.
     function _paySubscription(bytes32 app_id, address payer) private {
@@ -705,33 +536,21 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         emit SubscriptionUpdate(uint256(app_id), expiry);
     }
 
+    /// exclude needs an even count, restore an odd one; both add one.
+    function _flipExclusion(bytes32 app_id, address publisher, bytes32 repo_id, bytes32 key_id, uint64 parity) private {
+        bytes32 xid = exclusionId(publisher, repo_id, key_id);
+        uint64 n = exclusionCount[app_id][xid];
+        if (n % 2 != parity) {
+            if (parity == 0) revert AlreadyExcluded();
+            revert NotExcluded();
+        }
+        exclusionCount[app_id][xid] = n + 1;
+        emit ExclusionChanged(app_id, publisher, xid, repo_id, key_id, n + 1);
+    }
+
     function _setSubscriptionPeriod(uint64 period) private {
         if (period == 0) revert ZeroPeriod();
         subscriptionPeriod = period;
         emit SubscriptionPeriodChanged(period);
-    }
-
-    /// Reverts unless `publisher` may publish under `app_id`, with the first reason that
-    /// applies, from the most basic to the most specific. `canPublish` is the
-    /// same rules as a yes or no; change both together.
-    function _validatePublisher(bytes32 app_id, address publisher) private view {
-        App storage app = apps[app_id];
-        Status status = _validateForApp(app, app_id, publisher);
-        if (app.expiry <= block.timestamp) revert SubscriptionExpired();
-        if (status == Status.Invited) revert NotJoined();
-        if (acceptedTerms[app_id][publisher] != app.appTerms) revert TermsMismatch();
-    }
-
-    /// The checks joining, accepting updated terms and committing share, in the order
-    /// all three report them: the app exists, the publisher is not banned network-wide,
-    /// the app is not taken down, and the publisher is in it and not suspended from it.
-    /// Returns their status, which is then Invited or Active.
-    function _validateForApp(App storage app, bytes32 app_id, address publisher) private view returns (Status status) {
-        if (app.owner == address(0)) revert AppNotFound();
-        if (globalSuspensions[publisher]) revert PublisherSuspendedGlobal();
-        if (app.isAppSuspended) revert AppSuspended();
-        status = statusForApp[app_id][publisher];
-        if (status == Status.Suspended) revert PublisherSuspendedApp();
-        if (status == Status.None) revert NotInvited();
     }
 }

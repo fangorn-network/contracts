@@ -65,8 +65,8 @@ interface IERC5192 {
 /// MembershipRegistry
 ///
 /// Time-limited access to an app's paid records, held by an address nobody can tie to
-/// the wallet that paid. Replaces the SettlementRegistry: the "resource" is now one app
-/// for one period, and settling mints or extends a membership token.
+/// the wallet that paid. What is bought is one app for one period, and settling mints or
+/// extends a membership token.
 ///
 ///   join   the payer signs an ERC-3009 `receiveWithAuthorization` for the app's price,
 ///          and their Semaphore identity commitment joins the group of (app, epoch). The
