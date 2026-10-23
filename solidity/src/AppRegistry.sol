@@ -276,14 +276,13 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         return apps[app_id].owner;
     }
 
-    /// How many apps have been claimed.
+    /// The total number of registered apps
     function appCount() external view returns (uint256) {
         return appIds.length;
     }
 
-    /// Up to `limit` app ids from position `offset`, oldest first. Past the end it
-    /// returns fewer, or none. Includes expired and suspended apps: the reads per app
-    /// say which.
+    /// Paged reads of registered app ids , starting from offset (oldest) to limit (newest) 
+    /// Includes expired and suspended apps
     function appsPage(uint256 offset, uint256 limit) external view returns (bytes32[] memory page) {
         // Clamped without adding offset and limit, which could overflow.
         uint256 left = offset < appIds.length ? appIds.length - offset : 0;
@@ -550,13 +549,14 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         _;
     }
 
-    /// Pull the subscription fee from `payer` and add one period to the app's expiry,
-    /// counted from now if it has passed.
+    /// lsit out all apps by a given owner
     function _list(bytes32 app_id, address owner) private {
         appIds.push(app_id);
         appIdsOf[owner].push(app_id);
     }
 
+    /// Pull the subscription fee from `payer` and add one period to the app's expiry,
+    /// counted from now if it has passed.
     function _paySubscription(bytes32 app_id, address payer) private {
         uint256 fee = subscriptionFee;
         if (fee != 0 && !IERC20(usdc).trySafeTransferFrom(payer, address(this), fee)) {
