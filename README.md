@@ -106,7 +106,9 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
 - `withdrawJoinFees(to)`: earlier versions charged publishers a join fee. Nothing collects one now, but an owner still takes out what they are owed (`joinFeesOwed(owner)`, one balance across all their apps), in USDC, to `to`. Reverts `NothingToWithdraw` if nothing is owed, and `TransferFailed` (leaving the balance owed) if the token refuses. Emits `JoinFeesWithdrawn`.
 - Admin: `setSubscriptionFee`, `setSubscriptionPeriod` (not zero, `ZeroPeriod`; applies from each app's next payment, emits `SubscriptionPeriodChanged`), `setDataRegistry` (emits `DataRegistryChanged`), `withdrawToken(token, to, amount)` (the protocol's USDC, or any ERC-20 sent here by mistake; emits `TokenWithdrawn`). Of USDC, only the protocol's share can be taken and is calculated by subtracting the contract's balance from the join fees owed to app owners (`totalJoinFeesOwed`), else it reverts `ExceedsProtocolBalance`. The fee token is fixed at `initialize`. Every token transfer goes through OpenZeppelin's `SafeERC20`, so tokens that return no value from `transfer` work too.
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
+- `appCount()`, `appsPage(offset, limit)`, `appsOf(owner)`: every claimed app id, and each owner's, oldest first. What clients list apps from instead of scanning `AppRegistered` logs. Expired and suspended apps stay listed; the per-app reads say which. `appsPage` returns fewer ids, or none, past the end.
 - `initialize(admin, usdc, subscription_fee, subscription_period)`.
+- `initializeV2(existing)`: admin-only, once (`reinitializer(2)`), in the upgrade transaction that adds the lists. Lists the apps claimed before it, oldest first, as their `AppRegistered` events give them. Reverts `AppNotFound` for an unclaimed id and `AppAlreadyRegistered` for one listed twice.
 
 **Global bans.** A wallet the protocol admin has banned can't claim an app or be accepted into one. A wallet banned later cannot publish in any app (`canPublish` is false), so no app presents it or sponsors its uploads. An *owner* banned later keeps the app, and its other publishers keep publishing, but the owner cannot accept anyone (which would let them keep publishing through new wallets) or move its agent card: `acceptPublisher` and `setAppAgentUri` revert `PublisherSuspendedGlobal`. The app can be taken down with `setAppSuspended`.
 
@@ -191,11 +193,25 @@ When a contract's ABI changes, clients need the new ABI.
 
 Deploys, upgrades and admin calls are Forge scripts in `solidity/script/`. Run them from `solidity/`.
 
+
+One-time setup for the forge keystore:
+
+``` sh
+cast wallet import deployer --interactive   # paste your private key, then choose a password
+cast wallet list                            # shows "deployer"
+cast wallet address --account deployer      # the address to pass to --sender
+```
+
+Then run:
+
 ```sh
 cd solidity
 forge script script/Deploy.s.sol --sig "all()" --force \
-  --rpc-url <rpc> --account <keystore> --sender <deployer address> --broadcast
+  --rpc-url <rpc> --account deployer --sender <deployer address> --broadcast
 ```
+
+forge script script/Deploy.s.sol --sig "all()" --force \
+  --rpc-url https://sepolia.base.org --account deployer --sender 0x7b16387C5A8c514880E48bcacd52782FCF9Da936 --broadcast
 
 | `--sig`                                 | Deploys                                                        |
 |-----------------------------------------|----------------------------------------------------------------|
@@ -211,11 +227,11 @@ This is for a contract that does not exist yet. To change one that is already de
 - **Signing.** Keep the key in a Foundry keystore (`cast wallet import <name> --interactive`) and pass `--account <name> --sender <its address>`. No script reads a private key from the environment.
 - **Nothing is sent unless everything would succeed.** Forge simulates the whole run first. A failed check, or a signer who is not the admin, stops it before the first transaction. Leave `--broadcast` off to only simulate.
 - **Parameters** are environment variables, listed with their defaults in `solidity/.env.example` (Forge reads a `.env` in `solidity/`). `ADMIN_ADDR` is required and has no default; for the two registries it must be the signer, because
-  the wiring calls are admin-only. `USDC_ADDR` and `SEMAPHORE_ADDR` default to the Arbitrum Sepolia deployments.
+  the wiring calls are admin-only. `USDC_ADDR` and `SEMAPHORE_ADDR` default to the deployments on Arbitrum Sepolia and Base Sepolia, and are required on any other chain.
 
 Each contract is two deployments: the implementation, then an ERC-1967 proxy (UUPS) whose constructor runs `initialize`. The proxy's address is the contract's address: it is what the script prints and what clients use. **Record it in `script/Deployments.sol`**, which is where the other scripts find it.
 
-With `--broadcast` the script also writes each new contract's build, under `deployed/<Contract>/<implementation address>/`, replacing any older build of that contract: it is what the first upgrade is checked against (see *Upgrade*). It should be committed together with the addresses in `Deployments.sol` and the broadcast log Forge writes under `solidity/broadcast/`. The `UpgradeSafety` test fails while the two disagree: a contract has builds when `Deployments.sol` records its proxy.
+With `--broadcast` the script also writes each new contract's build, under `deployed/<chain id>/<Contract>/<implementation address>/`, replacing any older build of that contract: it is what the first upgrade is checked against (see *Upgrade*). It should be committed together with the addresses in `Deployments.sol` and the broadcast log Forge writes under `solidity/broadcast/`. The `UpgradeSafety` test fails while the two disagree: a contract has builds when `Deployments.sol` records its proxy.
 
 `all()` deploys the AppRegistry, then the DataRegistry, points each at the other, then deploys the MembershipRegistry. It claims no app. `SUBSCRIPTION_FEE` (USDC base units, default 0) is what claiming or renewing an app costs, and `SUBSCRIPTION_PERIOD` (seconds, default 30 days) is how long one payment lasts.
 
@@ -232,7 +248,7 @@ forge script script/SetSubscriptionFee.s.sol --sig "run(uint256)" 5000000 \
 
 An upgrade replaces the code behind one proxy (`upgradeToAndCall`, admin-only). The address and all state stay, so there is nothing to migrate and nothing to repoint in clients or the other registry. If the ABI changed, clients need the new ABI.
 
-The OpenZeppelin Foundry Upgrades plugin checks every upgrade against the version it replaces. A contract keeps its file and its name from one version to the next, so a pull request shows what changed and not a second copy of the contract. What the plugin compares with is therefore the build of the live version, committed under `solidity/deployed/<Contract>/<implementation address>/` (its `referenceBuildInfoDir` option; `Deployments.upgradeOptions` sets it). That makes an upgrade two steps:
+The OpenZeppelin Foundry Upgrades plugin checks every upgrade against the version it replaces. A contract keeps its file and its name from one version to the next, so a pull request shows what changed and not a second copy of the contract. What the plugin compares with is therefore the build of the live version, committed under `solidity/deployed/<chain id>/<Contract>/<implementation address>/` (its `referenceBuildInfoDir` option; `Deployments.upgradeOptions` sets it). That makes an upgrade two steps:
 
 1. **Edit the contract in place** (`src/DataRegistry.sol`). From here `forge test` checks it against the builds in `deployed/`: the `UpgradeSafety` test fails on the pull request if a storage slot moved, changed type or disappeared.
 
@@ -245,9 +261,9 @@ The OpenZeppelin Foundry Upgrades plugin checks every upgrade against the versio
 
    The names are `AppRegistry`, `DataRegistry` or `MembershipRegistry`.
 
-The script takes the proxy's address and the contract from `Deployments.sol`, so one contract's code cannot be pointed at another contract's proxy. It runs the same check again, after confirming that the build it checks against is the code behind the proxy. If it is not, the script stops before sending anything. The script also writes the build of the new version, to `deployed/DataRegistry/<new implementation address>/`. Commit it with the broadcast log. The first build of each contract is written by `Deploy.s.sol`.
+The script takes the proxy's address and the contract from `Deployments.sol`, so one contract's code cannot be pointed at another contract's proxy. It runs the same check again, after confirming that the build it checks against is the code behind the proxy. If it is not, the script stops before sending anything. The script also writes the build of the new version, to `deployed/<chain id>/DataRegistry/<new implementation address>/`. Commit it with the broadcast log. The first build of each contract is written by `Deploy.s.sol`.
 
-**What is in `deployed/<Contract>/`.** One directory per build, named after the implementation it is the build of: the live one and, after an upgrade, the one it replaced, which the next upgrade removes. The new build is written next to the live one and not over it because the script runs before its transactions are sent. If they fail, the live build is untouched and the upgrade can simply be run again. Without `--broadcast` nothing is written. A rehearsal against a fork does write a build: delete it (`git clean -fd deployed`) or leave it for the real run to replace.
+**What is in `deployed/<chain id>/<Contract>/`.** Each chain has its own builds, so a deployment on one never touches another's. One directory per build, named after the implementation it is the build of: the live one and, after an upgrade, the one it replaced, which the next upgrade removes. The new build is written next to the live one and not over it because the script runs before its transactions are sent. If they fail, the live build is untouched and the upgrade can simply be run again. Without `--broadcast` nothing is written. A rehearsal against a fork does write a build: delete it (`git clean -fd deployed`) or leave it for the real run to replace.
 
 To confirm, without a signer, that every contract has a build of its live code:
 

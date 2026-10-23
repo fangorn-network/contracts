@@ -214,6 +214,13 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// app_id => exclusionId => changes so far; odd means excluded
     mapping(bytes32 => mapping(bytes32 => uint64)) public exclusionCount;
 
+    /// Every claimed app, in the order claimed. An app's token is never burned, so an
+    /// id never leaves. What clients list apps from, instead of scanning logs.
+    bytes32[] internal appIds;
+    /// owner => their apps, in the order claimed. The token never moves, so neither
+    /// does the app.
+    mapping(address => bytes32[]) internal appIdsOf;
+
     /// The implementation is only ever used through a proxy. Lock it, so nobody can
     /// initialize it directly.
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -232,6 +239,23 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         usdc = usdc_;
         subscriptionFee = subscriptionFee_;
         _setSubscriptionPeriod(subscriptionPeriod_);
+    }
+
+    /// Version 2 added the app lists (`appsPage`, `appsOf`). Lists the apps claimed
+    /// before it, oldest first, as their `AppRegistered` events give them. Runs once,
+    /// in the upgrade transaction (`upgradeToAndCall`), so no claim lands in between.
+    /// Each id must be claimed and listed only once.
+    function initializeV2(bytes32[] calldata existing) external reinitializer(2) onlyAdmin {
+        for (uint256 i = 0; i < existing.length; i++) {
+            bytes32 app_id = existing[i];
+            address owner = apps[app_id].owner;
+            if (owner == address(0)) revert AppNotFound();
+            // ponytail: O(n²), fine for the handful of apps claimed before v2.
+            for (uint256 j = 0; j < i; j++) {
+                if (existing[j] == app_id) revert AppAlreadyRegistered();
+            }
+            _list(app_id, owner);
+        }
     }
 
     // ── Apps ──────────────────────────────────────────────────────────────────
@@ -261,6 +285,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         app.owner = owner;
         statusForApp[app_id][owner] = Status.Active;
         _mint(owner, uint256(app_id));
+        _list(app_id, owner);
 
         emit AppRegistered(app_id, owner);
         emit PublisherAccepted(app_id, owner);
@@ -268,6 +293,28 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     function getAppOwner(bytes32 app_id) external view returns (address) {
         return apps[app_id].owner;
+    }
+
+    /// How many apps have been claimed.
+    function appCount() external view returns (uint256) {
+        return appIds.length;
+    }
+
+    /// Up to `limit` app ids from position `offset`, oldest first. Past the end it
+    /// returns fewer, or none. Includes expired and suspended apps: the reads per app
+    /// say which.
+    function appsPage(uint256 offset, uint256 limit) external view returns (bytes32[] memory page) {
+        // Clamped without adding offset and limit, which could overflow.
+        uint256 left = offset < appIds.length ? appIds.length - offset : 0;
+        page = new bytes32[](limit < left ? limit : left);
+        for (uint256 i = 0; i < page.length; i++) {
+            page[i] = appIds[offset + i];
+        }
+    }
+
+    /// The apps `owner` claimed, oldest first.
+    function appsOf(address owner) external view returns (bytes32[] memory) {
+        return appIdsOf[owner];
     }
 
     /// Take out every join fee owed to the caller, as the owner of one or more apps,
@@ -524,6 +571,11 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     /// Pull the subscription fee from `payer` and add one period to the app's expiry,
     /// counted from now if it has passed.
+    function _list(bytes32 app_id, address owner) private {
+        appIds.push(app_id);
+        appIdsOf[owner].push(app_id);
+    }
+
     function _paySubscription(bytes32 app_id, address payer) private {
         uint256 fee = subscriptionFee;
         if (fee != 0 && !IERC20(usdc).trySafeTransferFrom(payer, address(this), fee)) {
