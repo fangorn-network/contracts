@@ -247,63 +247,6 @@ contract AppRegistryTest is Test {
         assertEq(apps.appsOf(PUBLISHER).length, 0);
     }
 
-    /// Before v2, claims were not listed. Its initializer lists them, once, in the
-    /// upgrade transaction, and only claimed apps, each once.
-    function test_v2_lists_the_apps_claimed_before_it() public {
-        openApp();
-        vm.prank(STRANGER);
-        apps.registerApp(OTHER_APP, 0);
-        unlist(APP_OWNER);
-        unlist(STRANGER);
-        assertEq(apps.appCount(), 0);
-
-        bytes32[] memory existing = new bytes32[](2);
-        existing[0] = APP;
-        existing[1] = OTHER_APP;
-        address v2 = address(new AppRegistry());
-
-        vm.prank(STRANGER);
-        vm.expectRevert(AppRegistry.Unauthorized.selector);
-        apps.initializeV2(existing);
-
-        bytes32[] memory ghost = new bytes32[](1);
-        ghost[0] = GHOST_APP;
-        vm.prank(ADMIN);
-        vm.expectRevert(AppRegistry.AppNotFound.selector);
-        apps.upgradeToAndCall(v2, abi.encodeCall(AppRegistry.initializeV2, (ghost)));
-
-        bytes32[] memory twice = new bytes32[](2);
-        twice[0] = APP;
-        twice[1] = APP;
-        vm.prank(ADMIN);
-        vm.expectRevert(AppRegistry.AppAlreadyRegistered.selector);
-        apps.upgradeToAndCall(v2, abi.encodeCall(AppRegistry.initializeV2, (twice)));
-
-        vm.prank(ADMIN);
-        apps.upgradeToAndCall(v2, abi.encodeCall(AppRegistry.initializeV2, (existing)));
-        assertEq(apps.appCount(), 2);
-        assertEq(apps.appsPage(0, 2)[1], OTHER_APP);
-        assertEq(apps.appsOf(APP_OWNER)[0], APP);
-        assertEq(apps.appsOf(STRANGER)[0], OTHER_APP);
-
-        vm.prank(ADMIN);
-        vm.expectRevert(Initializable.InvalidInitialization.selector);
-        apps.initializeV2(existing);
-
-        // From here a claim lists itself, after the ones listed above.
-        vm.prank(PUBLISHER);
-        apps.registerApp(GHOST_APP, 0);
-        assertEq(apps.appsPage(2, 1)[0], GHOST_APP);
-    }
-
-    /// The lists as a pre-v2 proxy has them: empty. Claims stay.
-    function unlist(address owner) internal {
-        uint256 listSlot = stdstore.target(address(apps)).sig("appCount()").find();
-        vm.store(address(apps), bytes32(listSlot), 0);
-        // appIdsOf is declared right after appIds; an array's length sits at its slot.
-        vm.store(address(apps), keccak256(abi.encode(owner, listSlot + 1)), 0);
-    }
-
     // ── accepting publishers ──────────────────────────────────────────────────
 
     /// The owner's acceptance is the whole membership: no invitation, no terms, no fee.

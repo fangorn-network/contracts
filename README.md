@@ -108,7 +108,6 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
 - `appCount()`, `appsPage(offset, limit)`, `appsOf(owner)`: every claimed app id, and each owner's, oldest first. What clients list apps from instead of scanning `AppRegistered` logs. Expired and suspended apps stay listed; the per-app reads say which. `appsPage` returns fewer ids, or none, past the end.
 - `initialize(admin, usdc, subscription_fee, subscription_period)`.
-- `initializeV2(existing)`: admin-only, once (`reinitializer(2)`), in the upgrade transaction that adds the lists. Lists the apps claimed before it, oldest first, as their `AppRegistered` events give them. Reverts `AppNotFound` for an unclaimed id and `AppAlreadyRegistered` for one listed twice.
 
 **Global bans.** A wallet the protocol admin has banned can't claim an app or be accepted into one. A wallet banned later cannot publish in any app (`canPublish` is false), so no app presents it or sponsors its uploads. An *owner* banned later keeps the app, and its other publishers keep publishing, but the owner cannot accept anyone (which would let them keep publishing through new wallets) or move its agent card: `acceptPublisher` and `setAppAgentUri` revert `PublisherSuspendedGlobal`. The app can be taken down with `setAppSuspended`.
 

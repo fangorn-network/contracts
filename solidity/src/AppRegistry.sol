@@ -214,11 +214,9 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// app_id => exclusionId => changes so far; odd means excluded
     mapping(bytes32 => mapping(bytes32 => uint64)) public exclusionCount;
 
-    /// Every claimed app, in the order claimed. An app's token is never burned, so an
-    /// id never leaves. What clients list apps from, instead of scanning logs.
+    /// A fifo map of all claimed app ids 
     bytes32[] internal appIds;
-    /// owner => their apps, in the order claimed. The token never moves, so neither
-    /// does the app.
+    /// owner => owned apps (in the order claimed)
     mapping(address => bytes32[]) internal appIdsOf;
 
     /// The implementation is only ever used through a proxy. Lock it, so nobody can
@@ -239,23 +237,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         usdc = usdc_;
         subscriptionFee = subscriptionFee_;
         _setSubscriptionPeriod(subscriptionPeriod_);
-    }
-
-    /// Version 2 added the app lists (`appsPage`, `appsOf`). Lists the apps claimed
-    /// before it, oldest first, as their `AppRegistered` events give them. Runs once,
-    /// in the upgrade transaction (`upgradeToAndCall`), so no claim lands in between.
-    /// Each id must be claimed and listed only once.
-    function initializeV2(bytes32[] calldata existing) external reinitializer(2) onlyAdmin {
-        for (uint256 i = 0; i < existing.length; i++) {
-            bytes32 app_id = existing[i];
-            address owner = apps[app_id].owner;
-            if (owner == address(0)) revert AppNotFound();
-            // ponytail: O(n²), fine for the handful of apps claimed before v2.
-            for (uint256 j = 0; j < i; j++) {
-                if (existing[j] == app_id) revert AppAlreadyRegistered();
-            }
-            _list(app_id, owner);
-        }
     }
 
     // ── Apps ──────────────────────────────────────────────────────────────────
