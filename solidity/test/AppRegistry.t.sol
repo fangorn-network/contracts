@@ -221,6 +221,32 @@ contract AppRegistryTest is Test {
         assertTrue(apps.canPublish(APP, APP_OWNER));
     }
 
+    // ── listing apps ──────────────────────────────────────────────────────────
+
+    function test_claims_are_listed_in_order() public {
+        openApp();
+        vm.prank(STRANGER);
+        apps.registerApp(OTHER_APP, 0);
+
+        assertEq(apps.appCount(), 2);
+        bytes32[] memory page = apps.appsPage(0, 10);
+        assertEq(page.length, 2);
+        assertEq(page[0], APP);
+        assertEq(page[1], OTHER_APP);
+
+        page = apps.appsPage(1, type(uint256).max);
+        assertEq(page.length, 1);
+        assertEq(page[0], OTHER_APP);
+        assertEq(apps.appsPage(0, 1).length, 1);
+        assertEq(apps.appsPage(2, 1).length, 0);
+        assertEq(apps.appsPage(type(uint256).max, type(uint256).max).length, 0);
+
+        assertEq(apps.appsOf(APP_OWNER).length, 1);
+        assertEq(apps.appsOf(APP_OWNER)[0], APP);
+        assertEq(apps.appsOf(STRANGER)[0], OTHER_APP);
+        assertEq(apps.appsOf(PUBLISHER).length, 0);
+    }
+
     // ── accepting publishers ──────────────────────────────────────────────────
 
     /// The owner's acceptance is the whole membership: no invitation, no terms, no fee.
