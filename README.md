@@ -2,19 +2,21 @@
 
 The three core Fangorn contracts written in Solidity: the AppRegistry, the DataRegistry and the MembershipRegistry. Sources, tests and scripts are in `solidity/`.
 
-**The contracts are upgradeable.** Each implemented contract is behind its own ERC-1967 proxy (UUPS). See *Upgrade*.
+**The contracts are upgradeable.** Each implemented contract is behind its own ERC-1967 proxy (UUPS). See *Deploy and upgrade*.
 
 Almost nothing lives on-chain. A publisher's repo is `(publisher, name)`, and its head is one `bytes32` in the DataRegistry: the onchain pointer to its latest commit. The data itself is content-addressed and stored off-chain. A repo belongs to no app. An app is **sponsored storage**: it pays for its members' uploads, and presents its members' repos.
 
 ## Deployed
 
-Arbitrum Sepolia (chain 421614). Use the proxy address since upgrades only change the implementation behind it. `solidity/script/Deployments.sol` is the source of truth, and `forge script script/Upgrade.s.sol --sig "check()" --rpc-url <rpc>` confirms the builds in `solidity/deployed/` are the live code.
+Use the proxy addresses: an upgrade only changes the implementation behind them. `solidity/script/Deployments.sol` is the source of truth.
 
-| Contract | Proxy |
-|---|---|
-| AppRegistry | `0x55e6209ea1833ceD900989a3b3b22466934E04A5` (created in block 319536642) |
-| DataRegistry | `0x72B5f83526F3893aF9f1eE0f32A27218EA09f8aE` |
-| MembershipRegistry | `0xDF17030Cd65435C86eb043F31DDACa99E819E347` |
+| Contract           | Arbitrum Sepolia (421614)                    | Base Sepolia (84532)                         |
+| ------------------ | -------------------------------------------- | -------------------------------------------- |
+| AppRegistry        | `0x55e6209ea1833ceD900989a3b3b22466934E04A5` | `0x0D3e98399df41b558048Cdd7D71723c37A3A9D6F` |
+| DataRegistry       | `0x72B5f83526F3893aF9f1eE0f32A27218EA09f8aE` | `0xE9183f768865dd2Cde5f1B71F8446F0Cd798ebe0` |
+| MembershipRegistry | `0xDF17030Cd65435C86eb043F31DDACa99E819E347` | `0x0e96C012b5c53622EcDAA82F342E31C2623A04f5` |
+| Admin              | `0xB2F5361DBEF0715E1d6aa072284255dD7f1d43FC` | `0x7b16387C5A8c514880E48bcacd52782FCF9Da936` |
+| RPC                | `https://sepolia-rollup.arbitrum.io/rpc`     | `https://sepolia.base.org`                   |
 
 ## Architecture
 
@@ -61,20 +63,20 @@ There is no per-head acceptance: an app cannot hold a member at an older head, n
 
 ## Layout
 
-| Path                                    | What                                                    |
-|-----------------------------------------|---------------------------------------------------------|
-| `solidity/src/AppRegistry.sol`          | AppRegistry                                             |
-| `solidity/src/DataRegistry.sol`         | DataRegistry                                            |
-| `solidity/src/MembershipRegistry.sol`   | MembershipRegistry                                      |
-| `solidity/src/IERC5643.sol`             | The ERC-5643 subscription interface the Membership and App registries implement |
-| `solidity/test/`                        | Foundry tests and mocks                                 |
-| `solidity/script/Deploy.s.sol`          | Deploys the contracts behind their own UUPS proxy              |
-| `solidity/script/Upgrade.s.sol`         | Admin: upgrade a deployed contract in place             |
-| `solidity/script/SetSubscriptionFee.s.sol` | Admin: set the subscription fee on the AppRegistry   |
-| `solidity/script/Deployments.sol`       | Each proxy's address, and what each contract is upgraded with |
-| `solidity/script/Builds.sol`            | Writes and checks the builds in `deployed/`, for the two scripts above |
-| `solidity/deployed/`                    | The build of each contract that is live. What an upgrade, and the upgrade-safety test, compare storage with. |
-| `solidity/lib/`                         | `forge-std`, `openzeppelin-contracts-upgradeable`, `openzeppelin-foundry-upgrades` (submodules) |
+| Path                                       | What                                                                                                         |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `solidity/src/AppRegistry.sol`             | AppRegistry                                                                                                  |
+| `solidity/src/DataRegistry.sol`            | DataRegistry                                                                                                 |
+| `solidity/src/MembershipRegistry.sol`      | MembershipRegistry                                                                                           |
+| `solidity/src/IERC5643.sol`                | The ERC-5643 subscription interface the Membership and App registries implement                              |
+| `solidity/test/`                           | Foundry tests and mocks                                                                                      |
+| `solidity/script/Deploy.s.sol`             | Deploys the contracts behind their own UUPS proxy                                                            |
+| `solidity/script/Upgrade.s.sol`            | Admin: upgrade a deployed contract in place                                                                  |
+| `solidity/script/SetSubscriptionFee.s.sol` | Admin: set the subscription fee on the AppRegistry                                                           |
+| `solidity/script/Deployments.sol`          | Each proxy's address, and what each contract is upgraded with                                                |
+| `solidity/script/Builds.sol`               | Writes and checks the builds in `deployed/`, for the two scripts above                                       |
+| `solidity/deployed/`                       | The build of each contract that is live. What an upgrade, and the upgrade-safety test, compare storage with. |
+| `solidity/lib/`                            | `forge-std`, `openzeppelin-contracts-upgradeable`, `openzeppelin-foundry-upgrades` (submodules)              |
 
 ## Common to the contracts
 
@@ -106,6 +108,7 @@ Apps, who may publish under them, and who pays for their storage. **An app is sy
 - `withdrawJoinFees(to)`: earlier versions charged publishers a join fee. Nothing collects one now, but an owner still takes out what they are owed (`joinFeesOwed(owner)`, one balance across all their apps), in USDC, to `to`. Reverts `NothingToWithdraw` if nothing is owed, and `TransferFailed` (leaving the balance owed) if the token refuses. Emits `JoinFeesWithdrawn`.
 - Admin: `setSubscriptionFee`, `setSubscriptionPeriod` (not zero, `ZeroPeriod`; applies from each app's next payment, emits `SubscriptionPeriodChanged`), `setDataRegistry` (emits `DataRegistryChanged`), `withdrawToken(token, to, amount)` (the protocol's USDC, or any ERC-20 sent here by mistake; emits `TokenWithdrawn`). Of USDC, only the protocol's share can be taken and is calculated by subtracting the contract's balance from the join fees owed to app owners (`totalJoinFeesOwed`), else it reverts `ExceedsProtocolBalance`. The fee token is fixed at `initialize`. Every token transfer goes through OpenZeppelin's `SafeERC20`, so tokens that return no value from `transfer` work too.
 - Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
+- `appCount()`, `appsPage(offset, limit)`, `appsOf(owner)`: every claimed app id, and each owner's, oldest first. What clients list apps from instead of scanning `AppRegistered` logs. Expired and suspended apps stay listed; the per-app reads say which. `appsPage` returns fewer ids, or none, past the end.
 - `initialize(admin, usdc, subscription_fee, subscription_period)`.
 
 **Global bans.** A wallet the protocol admin has banned can't claim an app or be accepted into one. A wallet banned later cannot publish in any app (`canPublish` is false), so no app presents it or sponsors its uploads. An *owner* banned later keeps the app, and its other publishers keep publishing, but the owner cannot accept anyone (which would let them keep publishing through new wallets) or move its agent card: `acceptPublisher` and `setAppAgentUri` revert `PublisherSuspendedGlobal`. The app can be taken down with `setAppSuspended`.
@@ -177,7 +180,7 @@ Node.js is for that plugin: it checks upgrade safety by running `npx @openzeppel
 
 The tests check, among the rest, that only the owner accepts publishers, that join fees still owed reach the app owner and stay out of the admin's reach, that a revert unwinds state, and that every way out of an app (`canPublish` false) is also a refusal at the upload gate (`access`). The AppRegistry tests run against the real DataRegistry rather than a mock. USDC and Semaphore are mocks. Every test deploys its contracts behind a proxy, as the deploy script does, and each suite checks that only the admin can upgrade.
 
-**The tests never touch a real network.** `forge test` runs every test on a local chain that Forge simulates in memory. The contracts are deployed there, the ETH and tokens the tests use are made up (`vm.deal`, the mocks), and the chain is thrown away when the test ends. Nothing is deployed to Arbitrum Sepolia or any other network, and no test ETH is spent. The only commands that send real transactions are scripts run with `--broadcast` (see *Deploy* and *Upgrade*).
+**The tests never touch a real network.** `forge test` runs every test on a local chain that Forge simulates in memory. The contracts are deployed there, the ETH and tokens the tests use are made up (`vm.deal`, the mocks), and the chain is thrown away when the test ends. Nothing is deployed to Arbitrum Sepolia or any other network, and no test ETH is spent. The only commands that send real transactions are scripts run with `--broadcast` (see *Deploy and upgrade*).
 
 ## Generate ABI
 
@@ -187,83 +190,65 @@ The tests check, among the rest, that only the owner accepts publishers, that jo
 
 When a contract's ABI changes, clients need the new ABI.
 
-## Deploy
+## Deploy and upgrade
 
-Deploys, upgrades and admin calls are Forge scripts in `solidity/script/`. Run them from `solidity/`.
+Everything here runs from `solidity/`. `<keystore>` and `<admin>` are explained under *Signing*; the RPCs and admins are in *Deployed*.
 
-```sh
-cd solidity
-forge script script/Deploy.s.sol --sig "all()" --force \
-  --rpc-url <rpc> --account <keystore> --sender <deployer address> --broadcast
-```
+### Commands
 
-| `--sig`                                 | Deploys                                                        |
-|-----------------------------------------|----------------------------------------------------------------|
-| `"all()"`                               | All three registries, the AppRegistry and DataRegistry naming each other |
-| `"appRegistry(address)" <DataRegistry>` | A new AppRegistry in front of an existing DataRegistry, which is repointed at it |
-| `"dataRegistry(address)" <AppRegistry>` | A new DataRegistry behind an existing AppRegistry, which is repointed at it |
-| `"membershipRegistry(address)" <AppRegistry>` | A MembershipRegistry. The AppRegistry it reads app owners from cannot be changed later |
-
-This is for a contract that does not exist yet. To change one that is already deployed, see *Upgrade*: a redeploy starts empty at a new address.
-
-- **`--force` is required.** The upgrade-safety check needs a full build and refuses a
-  partial one.
-- **Signing.** Keep the key in a Foundry keystore (`cast wallet import <name> --interactive`) and pass `--account <name> --sender <its address>`. No script reads a private key from the environment.
-- **Nothing is sent unless everything would succeed.** Forge simulates the whole run first. A failed check, or a signer who is not the admin, stops it before the first transaction. Leave `--broadcast` off to only simulate.
-- **Parameters** are environment variables, listed with their defaults in `solidity/.env.example` (Forge reads a `.env` in `solidity/`). `ADMIN_ADDR` is required and has no default; for the two registries it must be the signer, because
-  the wiring calls are admin-only. `USDC_ADDR` and `SEMAPHORE_ADDR` default to the Arbitrum Sepolia deployments.
-
-Each contract is two deployments: the implementation, then an ERC-1967 proxy (UUPS) whose constructor runs `initialize`. The proxy's address is the contract's address: it is what the script prints and what clients use. **Record it in `script/Deployments.sol`**, which is where the other scripts find it.
-
-With `--broadcast` the script also writes each new contract's build, under `deployed/<Contract>/<implementation address>/`, replacing any older build of that contract: it is what the first upgrade is checked against (see *Upgrade*). It should be committed together with the addresses in `Deployments.sol` and the broadcast log Forge writes under `solidity/broadcast/`. The `UpgradeSafety` test fails while the two disagree: a contract has builds when `Deployments.sol` records its proxy.
-
-`all()` deploys the AppRegistry, then the DataRegistry, points each at the other, then deploys the MembershipRegistry. It claims no app. `SUBSCRIPTION_FEE` (USDC base units, default 0) is what claiming or renewing an app costs, and `SUBSCRIPTION_PERIOD` (seconds, default 30 days) is how long one payment lasts.
-
-### Setting the subscription fee
+**Ship what `src/` says.** This is the usual one. It upgrades every contract whose code changed since it was deployed and leaves the rest:
 
 ```sh
-forge script script/SetSubscriptionFee.s.sol --sig "run(uint256)" 5000000 \
-  --rpc-url <rpc> --account <keystore> --sender <admin address> --broadcast
+forge script script/Upgrade.s.sol --force \
+  --rpc-url <rpc> --account <keystore> --sender <admin> --broadcast
 ```
 
- Admin only. The fee is in USDC base units (6 decimals): `5000000` is 5 USDC.
+Then commit what it wrote under `deployed/` and `broadcast/`. Leave off `--broadcast` to see what it would do: it prints `up to date` or the upgrade for each contract.
 
-## Upgrade
+| What                                   | Command (add `--rpc-url <rpc> --account <keystore> --sender <admin> --broadcast`) |
+| -------------------------------------- | --------------------------------------------------------------------------------- |
+| Upgrade one contract only              | `forge script script/Upgrade.s.sol --force --sig "upgrade(string)" DataRegistry`  |
+| Set the subscription fee (USDC, 6 dp)  | `forge script script/SetSubscriptionFee.s.sol --sig "run(uint256)" 5000000`        |
+| Rotate the admin of all three          | `forge script script/RotateAdmin.s.sol --sig "run(address)" <new admin>`          |
+| First deployment on a new chain        | `forge script script/Deploy.s.sol --force --sig "all()"` (see *First deployment*) |
+| Check `deployed/` is the live code     | `forge script script/Upgrade.s.sol --sig "check()" --rpc-url <rpc>` (no signer)   |
 
-An upgrade replaces the code behind one proxy (`upgradeToAndCall`, admin-only). The address and all state stay, so there is nothing to migrate and nothing to repoint in clients or the other registry. If the ABI changed, clients need the new ABI.
+Every script simulates the whole run first and sends nothing unless all of it would succeed, so a wrong signer or a failed check costs nothing. `--force` is required wherever it is shown: the upgrade-safety check needs a full build.
 
-The OpenZeppelin Foundry Upgrades plugin checks every upgrade against the version it replaces. A contract keeps its file and its name from one version to the next, so a pull request shows what changed and not a second copy of the contract. What the plugin compares with is therefore the build of the live version, committed under `solidity/deployed/<Contract>/<implementation address>/` (its `referenceBuildInfoDir` option; `Deployments.upgradeOptions` sets it). That makes an upgrade two steps:
+### Signing
 
-1. **Edit the contract in place** (`src/DataRegistry.sol`). From here `forge test` checks it against the builds in `deployed/`: the `UpgradeSafety` test fails on the pull request if a storage slot moved, changed type or disappeared.
-
-2. **Run the upgrade**, signing as the contract's admin:
-
-   ```sh
-   forge script script/Upgrade.s.sol --sig "run(string)" DataRegistry --force \
-     --rpc-url <rpc> --account <keystore> --sender <admin address> --broadcast
-   ```
-
-   The names are `AppRegistry`, `DataRegistry` or `MembershipRegistry`.
-
-The script takes the proxy's address and the contract from `Deployments.sol`, so one contract's code cannot be pointed at another contract's proxy. It runs the same check again, after confirming that the build it checks against is the code behind the proxy. If it is not, the script stops before sending anything. The script also writes the build of the new version, to `deployed/DataRegistry/<new implementation address>/`. Commit it with the broadcast log. The first build of each contract is written by `Deploy.s.sol`.
-
-**What is in `deployed/<Contract>/`.** One directory per build, named after the implementation it is the build of: the live one and, after an upgrade, the one it replaced, which the next upgrade removes. The new build is written next to the live one and not over it because the script runs before its transactions are sent. If they fail, the live build is untouched and the upgrade can simply be run again. Without `--broadcast` nothing is written. A rehearsal against a fork does write a build: delete it (`git clean -fd deployed`) or leave it for the real run to replace.
-
-To confirm, without a signer, that every contract has a build of its live code:
+Scripts sign with a Foundry keystore: a private key stored encrypted under `~/.foundry/keystores/<name>`. `<keystore>` is that name. Import each key once:
 
 ```sh
-forge script script/Upgrade.s.sol --sig "check()" --rpc-url <rpc>
+cast wallet import admin-base --interactive   # paste the private key, then choose a password
+cast wallet list                              # the names you have imported
+cast wallet address --account admin-base      # the address behind it: pass it as --sender
 ```
 
-It compares runtime code, leaving out constructor-set immutables and the compiler's metadata hash, so a build from source that differs only in a comment passes and one from source with different logic does not. CI **does not** run it.
+Forge asks for the password when it signs. For a hardware wallet, pass `--ledger` instead of `--account`. No script reads a private key from the environment.
 
-Between merging a change and running its upgrade, `src/` is ahead of the chain: `deployed/` is what says which code is live. Earlier versions of a contract are in the git history.
+Each chain has its own admin, and every call except a first deployment must be signed by it. Import one keystore per admin (e.g. `admin-arb`, `admin-base`).
+
+### Rotating the admin
+
+Each registry keeps its own admin. `RotateAdmin.s.sol` moves all three at once, and first checks that all three still have the admin it records for the chain, so they cannot quietly drift apart. It refuses the zero address. After it runs, update the address it records.
+
+### How an upgrade works
+
+An upgrade replaces the code behind a proxy (`upgradeToAndCall`, admin-only). The address and all state stay, so nothing is migrated or repointed. If the ABI changed, clients need the new ABI.
+
+1. **Edit the contract in place** (e.g. `src/DataRegistry.sol`). `forge test` checks it against the builds of the live versions, committed under `deployed/<chain id>/<Contract>/<implementation address>/`: the `UpgradeSafety` test fails if a storage slot moved, changed type or disappeared.
+2. **Run the upgrade** (*Commands*), once per chain.
+
+The script finds each proxy and its source in `Deployments.sol`. It compares the code in `src/` with the live code, ignoring comments, to decide what is out of date. Before upgrading, it confirms that the build in `deployed/` is the live code, and the OpenZeppelin plugin checks the new code's storage against it. With `--broadcast` it writes the new version's build next to the live one, and removes the one before. Commit it with the broadcast log: it is what the next upgrade is checked against.
+
+Between merging a change and running its upgrade, `src/` is ahead of the chain. `deployed/` is what says which code is live.
 
 **Storage is append-only.** The proxy keeps its storage, so the new code must read every existing slot the way the old code wrote it:
 
 - Add state variables after the last one. Add struct fields at the end of the struct (`App` is only ever a mapping value, so it can grow).
 - Never reorder, retype or remove a state variable or a struct field, and do not change the order of the contracts a registry inherits from.
-- A constructor or an initial value on a state variable never reaches the proxy. New state that needs a starting value gets a `reinitializer(n)` function. Pass the call to it as a second argument and it runs in the upgrade transaction: `--sig "run(string,bytes)" DataRegistry $(cast calldata "initializeV2()")`.
+- A constructor or an initial value on a state variable never reaches the proxy. New state that needs a starting value gets a `reinitializer(n)` function. Pass the call to it as a second argument and it runs in the upgrade transaction: `--sig "upgrade(string,bytes)" DataRegistry $(cast calldata "initializeV2()")`.
 
 The plugin enforces the first two, and also refuses constructors, `selfdestruct` and `delegatecall` in a new version. A change that cannot keep the layout must be a full redeploy.
 
@@ -273,8 +258,39 @@ The contracts inherit OpenZeppelin's upgradeable variants (`ERC721Upgradeable`, 
 
 ```sh
 anvil --fork-url <rpc> --auto-impersonate
-forge script script/Upgrade.s.sol --sig "run(string)" DataRegistry --force \
-  --rpc-url http://127.0.0.1:8545 --unlocked --sender <admin address> --broadcast
+forge script script/Upgrade.s.sol --force \
+  --rpc-url http://127.0.0.1:8545 --unlocked --sender <admin> --broadcast
 ```
+
+A rehearsal writes a build under `deployed/`: delete it (`git clean -fd deployed`) or leave it for the real run to replace.
+
+### First deployment
+
+Only for a chain with nothing on it yet: a redeploy starts empty at a new address. To change a deployed contract, upgrade it.
+
+```sh
+forge script script/Deploy.s.sol --force --sig "all()" \
+  --rpc-url <rpc> --account <keystore> --sender <deployer> --broadcast
+```
+
+| `--sig`                                       | Deploys                                                                                |
+| --------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `"all()"`                                     | All three registries, the AppRegistry and DataRegistry naming each other               |
+| `"appRegistry(address)" <DataRegistry>`       | A new AppRegistry in front of an existing DataRegistry, which is repointed at it       |
+| `"dataRegistry(address)" <AppRegistry>`       | A new DataRegistry behind an existing AppRegistry, which is repointed at it            |
+| `"membershipRegistry(address)" <AppRegistry>` | A MembershipRegistry. The AppRegistry it reads app owners from cannot be changed later |
+
+Parameters are environment variables, with defaults in `solidity/.env.example` (Forge reads `solidity/.env`):
+
+- `ADMIN_ADDR`: required. For `all()`, `appRegistry()` and `dataRegistry()` it must be the signer, because the wiring calls are admin-only.
+- `USDC_ADDR`, `SEMAPHORE_ADDR`: default to Arbitrum Sepolia's and Base Sepolia's; required on any other chain.
+- `SUBSCRIPTION_FEE`: what claiming or renewing an app costs, in USDC base units. Default 0.
+- `SUBSCRIPTION_PERIOD`: how long one payment lasts, in seconds. Default 30 days.
+
+Afterwards:
+
+1. Record each printed proxy address in `script/Deployments.sol`. The other scripts find the contracts there.
+2. Commit the builds the script wrote under `deployed/<chain id>/`, along with the broadcast log. The first upgrade is checked against them. `UpgradeSafety` fails while the builds and `Deployments.sol` disagree.
+3. Add the admin to `script/RotateAdmin.s.sol` and the chain to *Deployed* above.
 
 MVP, not audited.

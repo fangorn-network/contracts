@@ -214,6 +214,11 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// app_id => exclusionId => changes so far; odd means excluded
     mapping(bytes32 => mapping(bytes32 => uint64)) public exclusionCount;
 
+    /// A fifo map of all claimed app ids 
+    bytes32[] internal appIds;
+    /// owner => owned apps (in the order claimed)
+    mapping(address => bytes32[]) internal appIdsOf;
+
     /// The implementation is only ever used through a proxy. Lock it, so nobody can
     /// initialize it directly.
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -261,6 +266,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         app.owner = owner;
         statusForApp[app_id][owner] = Status.Active;
         _mint(owner, uint256(app_id));
+        _list(app_id, owner);
 
         emit AppRegistered(app_id, owner);
         emit PublisherAccepted(app_id, owner);
@@ -268,6 +274,27 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     function getAppOwner(bytes32 app_id) external view returns (address) {
         return apps[app_id].owner;
+    }
+
+    /// The total number of registered apps
+    function appCount() external view returns (uint256) {
+        return appIds.length;
+    }
+
+    /// Paged reads of registered app ids , starting from offset (oldest) to limit (newest) 
+    /// Includes expired and suspended apps
+    function appsPage(uint256 offset, uint256 limit) external view returns (bytes32[] memory page) {
+        // Clamped without adding offset and limit, which could overflow.
+        uint256 left = offset < appIds.length ? appIds.length - offset : 0;
+        page = new bytes32[](limit < left ? limit : left);
+        for (uint256 i = 0; i < page.length; i++) {
+            page[i] = appIds[offset + i];
+        }
+    }
+
+    /// The apps `owner` claimed, oldest first.
+    function appsOf(address owner) external view returns (bytes32[] memory) {
+        return appIdsOf[owner];
     }
 
     /// Take out every join fee owed to the caller, as the owner of one or more apps,
@@ -520,6 +547,12 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         if (owner == address(0)) revert AppNotFound();
         if (msg.sender != owner) revert Unauthorized();
         _;
+    }
+
+    /// lsit out all apps by a given owner
+    function _list(bytes32 app_id, address owner) private {
+        appIds.push(app_id);
+        appIdsOf[owner].push(app_id);
     }
 
     /// Pull the subscription fee from `payer` and add one period to the app's expiry,
