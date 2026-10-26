@@ -15,7 +15,7 @@ import {Options} from "openzeppelin-foundry-upgrades/Options.sol";
 ///      contract keep their names, so the pull request shows what changed. What it is
 ///      checked against is the build of the live version, in
 ///      `deployed/<chain id>/DataRegistry/<implementation address>/`.
-///   2. `forge script script/Upgrade.s.sol --sig "run(string)" DataRegistry --force …`
+///   2. `forge script script/Upgrade.s.sol --force …` upgrades whatever changed.
 ///      It records the build of the new version next to the old one. Commit it.
 library Deployments {
     uint256 internal constant ARBITRUM_SEPOLIA = 421614;

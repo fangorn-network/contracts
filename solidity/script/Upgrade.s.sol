@@ -7,15 +7,18 @@ import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
 import {Builds} from "./Builds.sol";
 import {Deployments} from "./Deployments.sol";
 
-/// Upgrades one deployed contract in place, to what its source in `src/` now says.
+/// Upgrades the deployed contracts in place, to what their source in `src/` now says.
 ///
-///   forge script script/Upgrade.s.sol --sig "run(string)" DataRegistry --force \
+///   forge script script/Upgrade.s.sol --force \
 ///     --rpc-url <rpc> --account <keystore> --sender <admin address> --broadcast
+///
+/// upgrades every contract whose code changed since it was deployed, and leaves the rest.
+/// To upgrade one contract only, add `--sig "upgrade(string)" <name>`, where `<name>` is
+/// AppRegistry, DataRegistry or MembershipRegistry.
 ///
 /// `--force` is not optional: the upgrade-safety check needs a full build.
 ///
-/// `name` is AppRegistry, DataRegistry or MembershipRegistry. The proxy's address and
-/// state stay; only the implementation behind it changes.
+/// The proxy's address and state stay; only the implementation behind it changes.
 ///
 /// Before anything is sent, the plugin checks the new code against the build of the
 /// live version, committed under `deployed/<chain id>/<name>/<implementation address>/`: a moved,
@@ -35,13 +38,27 @@ import {Deployments} from "./Deployments.sol";
 /// there and the upgrade can be run again. The build of the version before the live one
 /// is removed at the same time, so `deployed/<chain id>/<name>/` never holds more than two.
 contract Upgrade is Builds {
-    function run(string calldata name) external {
-        run(name, "");
+    /// Upgrades every contract whose code in `src/` is not the live code.
+    function run() external {
+        string[3] memory names = Deployments.names();
+        for (uint256 i = 0; i < names.length; i++) {
+            address live = Upgrades.getImplementationAddress(Deployments.proxy(names[i], block.chainid));
+            _requireReferenceIsLive(names[i], live);
+            if (_isUpToDate(names[i], live)) {
+                console.log("%s: up to date", names[i]);
+            } else {
+                upgrade(names[i], "");
+            }
+        }
+    }
+
+    function upgrade(string calldata name) external {
+        upgrade(name, "");
     }
 
     /// `data` is a call to make on the new implementation in the upgrade transaction,
     /// for an upgrade that has to set up new state (a `reinitializer` function).
-    function run(string calldata name, bytes memory data) public {
+    function upgrade(string memory name, bytes memory data) public {
         address proxy = Deployments.proxy(name, block.chainid);
         string memory version = Deployments.current(name);
         address previous = Upgrades.getImplementationAddress(proxy);

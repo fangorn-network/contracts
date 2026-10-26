@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Script} from "forge-std/Script.sol";
 import {VmSafe} from "forge-std/Vm.sol";
+import {Deployments} from "./Deployments.sol";
 
 /// The builds of deployed versions, committed under
 /// `deployed/<chain id>/<Contract>/<implementation address>/`: what the next upgrade of each
@@ -60,17 +61,30 @@ abstract contract Builds is Script {
 
     /// Reverts unless the one build in `deployed/<chain id>/<name>/<implementation>/` is the
     /// runtime code at `implementation`, instruction for instruction.
-    ///
-    /// A build is several megabytes, and each JSON lookup below copies it into memory
-    /// again. Solidity never frees memory, and its gas cost grows with the square of its
-    /// size, so a script that checks two or three builds in a row ran out of gas
-    /// (MemoryOOG). Nothing allocated here is used after it returns, so it hands its
-    /// memory back at the end: the next check reuses the same space.
     function _requireReferenceIsLive(string memory name, address implementation) internal view {
-        uint256 freeMemory;
-        assembly {
-            freeMemory := mload(0x40)
-        }
+        uint256 freeMemory = _freeMemory();
+        string memory build = _readBuild(name, implementation);
+        require(
+            _isCodeAt(build, name, implementation, vm.parseJsonBytes(build, string.concat(_code(name), ".object"))),
+            string.concat(
+                _dir(name, implementation),
+                " is not the code at that address. Rebuild it from the commit that was deployed (README, How an upgrade works)."
+            )
+        );
+        _resetMemory(freeMemory);
+    }
+
+    /// Whether `name` as `src/` now builds it is the code at `implementation`, the live one:
+    /// false when the source changed in a way that changes the code, so an upgrade is due.
+    function _isUpToDate(string memory name, address implementation) internal view returns (bool same) {
+        uint256 freeMemory = _freeMemory();
+        string memory build = _readBuild(name, implementation);
+        same = _isCodeAt(build, name, implementation, vm.getDeployedCode(Deployments.current(name)));
+        _resetMemory(freeMemory);
+    }
+
+    /// The one build in `deployed/<chain id>/<name>/<implementation>/`.
+    function _readBuild(string memory name, address implementation) private view returns (string memory) {
         string memory dir = _dir(name, implementation);
         require(
             vm.isDir(dir),
@@ -80,16 +94,26 @@ abstract contract Builds is Script {
         );
         VmSafe.DirEntry[] memory builds = vm.readDir(dir);
         require(builds.length == 1, string.concat(dir, " must hold exactly one build"));
-        string memory build = vm.readFile(builds[0].path);
-        string memory code = string.concat('.output.contracts["src/', name, '.sol"].', name, ".evm.deployedBytecode");
+        return vm.readFile(builds[0].path);
+    }
 
-        bytes memory built = vm.parseJsonBytes(build, string.concat(code, ".object"));
+    function _code(string memory name) private pure returns (string memory) {
+        return string.concat('.output.contracts["src/', name, '.sol"].', name, ".evm.deployedBytecode");
+    }
+
+    /// Whether `built`, runtime code as solc emits it, is the code at `implementation`.
+    /// `build` is the build of the live version: where its immutables sit.
+    function _isCodeAt(string memory build, string memory name, address implementation, bytes memory built)
+        private
+        view
+        returns (bool same)
+    {
         bytes memory live = implementation.code;
-        bool same = live.length == built.length;
+        same = live.length == built.length;
 
         // An immutable is zero in a build and filled in when the contract is created
         // (a UUPS implementation holds its own address), so blank them on the live side.
-        string memory immutables = string.concat(code, ".immutableReferences");
+        string memory immutables = string.concat(_code(name), ".immutableReferences");
         string[] memory ids = vm.parseJsonKeys(build, immutables);
         for (uint256 i = 0; same && i < ids.length; i++) {
             ImmutableRef[] memory refs =
@@ -112,14 +136,21 @@ abstract contract Builds is Script {
                 mstore(built, n)
             }
         }
+        same = same && keccak256(live) == keccak256(built);
+    }
 
-        require(
-            same && keccak256(live) == keccak256(built),
-            string.concat(
-                dir, " is not the code at that address. Rebuild it from the commit that was deployed (README, Upgrade)."
-            )
-        );
+    /// A build is several megabytes, and each JSON lookup copies it into memory again.
+    /// Solidity never frees memory, and its gas cost grows with the square of its size,
+    /// so a script that checks two or three builds in a row ran out of gas (MemoryOOG).
+    /// Nothing a check allocates is used after it returns, so it hands its memory back at
+    /// the end: the next check reuses the same space.
+    function _freeMemory() private pure returns (uint256 freeMemory) {
+        assembly {
+            freeMemory := mload(0x40)
+        }
+    }
 
+    function _resetMemory(uint256 freeMemory) private pure {
         assembly {
             mstore(0x40, freeMemory)
         }
