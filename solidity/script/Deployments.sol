@@ -60,10 +60,10 @@ library Deployments {
         current(name); // an unknown name is a different mistake from a missing address
         bytes32 n = keccak256(bytes(name));
         if (chainId == BASE_SEPOLIA) {
-            // Deployed with Deploy.s.sol all(), in block 50557088.
-            if (n == keccak256("AppRegistry")) return 0x4010ee3a2182D5Ab76E0bf95C17b88bb35Ea711B;
-            if (n == keccak256("DataRegistry")) return 0x5f0B6f0D3ca6266b06fb55CCE5725EB4770dbeFd;
-            if (n == keccak256("MembershipRegistry")) return 0x99bb5101263a4Fc0E64c9887d43b87aeB3f3F32c;
+            // Deployed with Deploy.s.sol all(), in block 51469588.
+            if (n == keccak256("AppRegistry")) return 0x6E07C2c7393963242899e5Fb0eb1B6B787927E81;
+            if (n == keccak256("DataRegistry")) return 0x7a34882568f1b22FC4C4944113B1E4Ca4cF6900f;
+            if (n == keccak256("MembershipRegistry")) return 0x9De2C2A6261927f91b246C73e7ca86824a357FA6;
         }
         return address(0);
     }
