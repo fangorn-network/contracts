@@ -17,10 +17,10 @@ import {Deployments} from "./Deployments.sol";
 ///
 /// `--force` is not optional: the upgrade-safety check needs a full build.
 ///
-///   all()                               all three registries, the AppRegistry and the
-///                                       DataRegistry naming each other
-///   appRegistry(address dataRegistry)   a new AppRegistry in front of an existing
-///                                       DataRegistry, which is repointed at it
+///   all()                               all three registries, the AppRegistry naming
+///                                       the DataRegistry
+///   appRegistry(address dataRegistry)   a new AppRegistry naming an existing
+///                                       DataRegistry
 ///   dataRegistry(address appRegistry)   a new DataRegistry behind an existing
 ///                                       AppRegistry, which is repointed at it
 ///   membershipRegistry(address appRegistry)
@@ -42,21 +42,19 @@ import {Deployments} from "./Deployments.sol";
 ///                           appRegistry() and dataRegistry() it must be the signer,
 ///                           because the wiring calls are admin-only.
 ///   USDC_ADDR, SEMAPHORE_ADDR
-///                           default to Arbitrum Sepolia's or Base Sepolia's; required on any
-///                           other chain
+///                           default to Base Sepolia's; required on any other chain
 ///   SUBSCRIPTION_FEE        claiming an app, in USDC base units. Default 0
 ///   SUBSCRIPTION_PERIOD     how long one payment lasts, in seconds. Default 30 days
 contract Deploy is Builds {
-    address internal constant ARBITRUM_SEPOLIA_USDC = 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d;
     address internal constant BASE_SEPOLIA_USDC = 0x036CbD53842c5426634e7929541eC2318f3dCF7e;
-    /// Semaphore v4: the same contract at the same address on both chains.
+    /// Semaphore v4
     address internal constant SEMAPHORE = 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D;
 
     function all() external {
         address admin = _admin();
         vm.startBroadcast();
         AppRegistry apps = _deployAppRegistry(admin);
-        DataRegistry data = _deployDataRegistry(admin, address(apps));
+        DataRegistry data = _deployDataRegistry(admin);
         apps.setDataRegistry(address(data));
         address membership = _deployMembershipRegistry(admin, address(apps));
         vm.stopBroadcast();
@@ -74,7 +72,6 @@ contract Deploy is Builds {
         AppRegistry apps = _deployAppRegistry(admin);
         // Repo heads stay; apps, memberships and bans do not carry over.
         apps.setDataRegistry(dataRegistry_);
-        data.setAppRegistry(address(apps));
         vm.stopBroadcast();
         _report(apps, data);
         _recordBuild("AppRegistry", address(apps));
@@ -85,7 +82,7 @@ contract Deploy is Builds {
         AppRegistry apps = AppRegistry(appRegistry_);
         vm.startBroadcast();
         // Repo heads do not carry over.
-        DataRegistry data = _deployDataRegistry(admin, appRegistry_);
+        DataRegistry data = _deployDataRegistry(admin);
         apps.setDataRegistry(address(data));
         vm.stopBroadcast();
         _report(apps, data);
@@ -125,11 +122,11 @@ contract Deploy is Builds {
         );
     }
 
-    function _deployDataRegistry(address admin, address appRegistry_) internal returns (DataRegistry) {
+    function _deployDataRegistry(address admin) internal returns (DataRegistry) {
         return DataRegistry(
             Upgrades.deployUUPSProxy(
                 Deployments.DATA_REGISTRY,
-                abi.encodeCall(DataRegistry.initialize, (admin, appRegistry_)),
+                abi.encodeCall(DataRegistry.initialize, (admin)),
                 Deployments.options("DataRegistry")
             )
         );
@@ -148,7 +145,6 @@ contract Deploy is Builds {
         require(apps.admin() == admin, "AppRegistry admin");
         require(data.admin() == admin, "DataRegistry admin");
         require(apps.dataRegistry() == address(data), "AppRegistry does not point at the DataRegistry");
-        require(data.appRegistry() == address(apps), "DataRegistry does not point at the AppRegistry");
         console.log("AppRegistry:  %s", address(apps));
         console.log("DataRegistry: %s", address(data));
         console.log("Record the new address(es) in script/Deployments.sol.");
@@ -180,21 +176,16 @@ contract Deploy is Builds {
     }
 
     function _usdc() internal view returns (address) {
-        return _external("USDC_ADDR", ARBITRUM_SEPOLIA_USDC, BASE_SEPOLIA_USDC);
+        return _external("USDC_ADDR", BASE_SEPOLIA_USDC);
     }
 
     function _semaphore() internal view returns (address) {
-        return _external("SEMAPHORE_ADDR", SEMAPHORE, SEMAPHORE);
+        return _external("SEMAPHORE_ADDR", SEMAPHORE);
     }
 
     /// An address this deployment depends on. The known ones are only defaults on the
-    /// chains they belong to; anywhere else it has to be given.
-    function _external(string memory name, address onArbitrumSepolia, address onBaseSepolia)
-        private
-        view
-        returns (address)
-    {
-        if (block.chainid == Deployments.ARBITRUM_SEPOLIA) return vm.envOr(name, onArbitrumSepolia);
+    /// chain they belong to; anywhere else it has to be given.
+    function _external(string memory name, address onBaseSepolia) private view returns (address) {
         if (block.chainid == Deployments.BASE_SEPOLIA) return vm.envOr(name, onBaseSepolia);
         return vm.envAddress(name);
     }

@@ -11,22 +11,19 @@ import {IERC5643} from "./IERC5643.sol";
 
 /// AppRegistry
 ///
-/// An application is sponsored storage for the publishers it accepts. A wallet claims
-/// an app (`registerApp`) and owns it; the owner accepts publishers (`acceptPublisher`).
+/// Applications in Fangorn are emergent. An app "owner" sponsors storage (pinning) for the publishers it accepts.
+/// Publishers, operating independently, provide
+/// A wallet claims an app (`registerApp`) and owns it;  the owner accepts publishers (`acceptPublisher`).
 /// An accepted publisher uploads with storage the app provides, and the app includes its
-/// data: the latest head of each of its repos, less what the owner excludes (`exclude`).
-/// A repo lives in the DataRegistry and belongs to no app; nothing here reads or records
-/// a head. One rule, `canPublish`, says whether both hold for a publisher now.
+/// data: the latest head of each of its repos, with explicit owner excludes (`exclude`) filtered out.
+/// Each potential publisher's rights can be checked with `canPublish`.
 ///
 /// An app IS a storage subscription: claiming one pulls the subscription fee (USDC)
 /// for one period, and the off-chain upload gate reads `access` to decide whether to
 /// serve its publishers.
 ///
 /// The subscription fee is the one payment, in USDC: set by the admin, paid by the app's
-/// owner, and taken out by the admin (`withdrawToken`). Join fees, which earlier versions
-/// collected from publishers, are no longer charged; what an owner is still owed stays
-/// theirs to take out (`withdrawJoinFees`), out of the admin's reach
-/// (`totalJoinFeesOwed`). The contract holds no ETH.
+/// owner, and taken out by the admin (`withdrawToken`). The contract holds no ETH.
 ///
 /// Each app is also an ERC-721 token, minted to its owner at claim, and its
 /// subscription follows ERC-5643: `expiresAt`, `isRenewable`, `renewSubscription` and
@@ -59,10 +56,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         /// Accepted by the app's owner (`acceptPublisher`).
         Active,
         /// Accepted, then suspended from the app by its owner.
-        Suspended,
-        /// Retired: invited under the old join flow, and never joined. Not a member;
-        /// `acceptPublisher` accepts it like `None`.
-        Invited
+        Suspended
     }
 
     // Errors, grouped by topic.
@@ -71,11 +65,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// The caller may not do this: not the admin, for an admin function; not the
     /// app's owner, for an owner function or `cancelSubscription`
     error Unauthorized();
-    /// Sending USDC (`withdrawJoinFees`) or an ERC-20 (`withdrawToken`) failed
+    /// Sending an ERC-20 (`withdrawToken`) failed
     error TransferFailed();
-    /// `withdrawToken`: more USDC than the protocol's share, which is the contract's
-    /// balance minus the join fees owed to app owners
-    error ExceedsProtocolBalance();
 
     // Apps
     /// No app has been registered with this id
@@ -84,8 +75,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     error AppAlreadyRegistered();
     /// `registerApp`, `renameApp`: the zero id is what an unset alias reads as
     error ZeroAppId();
-    /// `withdrawJoinFees`: the caller is owed nothing
-    error NothingToWithdraw();
 
     // Membership
     /// `setPublisherSuspended`: the app never accepted this wallet
@@ -130,8 +119,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     // Apps
     /// A wallet claimed an app
     event AppRegistered(bytes32 indexed app_id, address indexed owner);
-    /// An app owner took out the join fees they were owed
-    event JoinFeesWithdrawn(address indexed owner, address to, uint256 amount);
     /// An app took a new id. `app_id` is its canonical id; `new_id` resolves to it
     /// from now on, as every id it went by before still does.
     event AppRenamed(bytes32 indexed app_id, bytes32 indexed new_id);
@@ -197,12 +184,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         bool isAppSuspended;
         /// When the subscription expires (Unix seconds). Zero once cancelled.
         uint64 expiry;
-        /// Retired: the publisher terms hash of the old join flow. Kept for the layout.
-        bytes32 appTerms;
-        /// Retired: where the terms were read. Kept for the layout.
-        string appTermsUri;
-        /// Retired: the old join fee. Kept for the layout.
-        uint256 joinFee;
         /// URI of the app's ERC-8004 agent card. Empty means the app has none.
         string appAgentUri;
     }
@@ -213,23 +194,15 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// through any id the app goes by.
     /// @custom:oz-renamed-from statusForApp
     mapping(bytes32 => mapping(address => Status)) internal statuses;
-    /// Retired: app_id => publisher => the terms hash they joined on. Kept for the layout.
-    mapping(bytes32 => mapping(address => bytes32)) internal acceptedTerms;
     /// wallet => banned network-wide by the protocol admin
     mapping(address => bool) public globalSuspensions;
-    /// app owner => join fees paid to their apps under the old join flow and not yet
-    /// withdrawn, in USDC base units. Nothing adds to it any more.
-    mapping(address => uint256) public joinFeesOwed;
-    /// The sum of `joinFeesOwed`: the part of the contract's USDC that belongs to app
-    /// owners, which `withdrawToken` cannot touch
-    uint256 public totalJoinFeesOwed;
 
     /// app_id => exclusionId => changes so far; odd means excluded. Internal:
     /// `exclusionCount` reads it through any id the app goes by.
     /// @custom:oz-renamed-from exclusionCount
     mapping(bytes32 => mapping(bytes32 => uint64)) internal exclusions;
 
-    /// A fifo map of all claimed app ids 
+    /// A fifo map of all claimed app ids
     bytes32[] internal appIds;
     /// owner => owned apps (in the order claimed)
     mapping(address => bytes32[]) internal appIdsOf;
@@ -339,7 +312,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         return appIds.length;
     }
 
-    /// Paged reads of registered app ids (canonical; see `currentAppId`), starting from offset (oldest) to limit (newest) 
+    /// Paged reads of registered app ids (canonical; see `currentAppId`), starting from offset (oldest) to limit (newest)
     /// Includes expired and suspended apps
     function appsPage(uint256 offset, uint256 limit) external view returns (bytes32[] memory page) {
         // Clamped without adding offset and limit, which could overflow.
@@ -353,18 +326,6 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// The apps `owner` claimed, oldest first.
     function appsOf(address owner) external view returns (bytes32[] memory) {
         return appIdsOf[owner];
-    }
-
-    /// Take out every join fee owed to the caller, as the owner of one or more apps,
-    /// and send it, in USDC, to `to`. Only fees collected under the old join flow are
-    /// owed. If the transfer fails, the balance stays owed.
-    function withdrawJoinFees(address to) external nonReentrant {
-        uint256 amount = joinFeesOwed[msg.sender];
-        if (amount == 0) revert NothingToWithdraw();
-        joinFeesOwed[msg.sender] = 0;
-        totalJoinFeesOwed -= amount;
-        if (!IERC20(usdc).trySafeTransfer(to, amount)) revert TransferFailed();
-        emit JoinFeesWithdrawn(msg.sender, to, amount);
     }
 
     /// Point at the app's ERC-8004 agent card. Only callable by the app owner, and not
@@ -391,8 +352,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         app_id = _onlyAppOwner(app_id);
         if (globalSuspensions[msg.sender]) revert PublisherSuspendedGlobal();
         if (globalSuspensions[publisher]) revert PublisherSuspendedGlobal();
-        Status status = statuses[app_id][publisher];
-        if (status == Status.Active || status == Status.Suspended) revert AlreadyAccepted();
+        if (statuses[app_id][publisher] != Status.None) revert AlreadyAccepted();
         statuses[app_id][publisher] = Status.Active;
         emit PublisherAccepted(app_id, publisher);
     }
@@ -600,12 +560,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     /// Send `amount` of an ERC-20 the contract holds to `to`: the collected subscription
     /// fees (USDC), or any token sent here by mistake, including one that returns no
-    /// value from `transfer`. Of USDC, only the protocol's share can be taken: the
-    /// contract's balance less the join fees owed to app owners (`ExceedsProtocolBalance`).
+    /// value from `transfer`.
     function withdrawToken(address token, address to, uint256 amount) external nonReentrant onlyAdmin {
-        if (token == usdc && IERC20(usdc).balanceOf(address(this)) < totalJoinFeesOwed + amount) {
-            revert ExceedsProtocolBalance();
-        }
         if (!IERC20(token).trySafeTransfer(to, amount)) revert TransferFailed();
         emit TokenWithdrawn(token, to, amount);
     }

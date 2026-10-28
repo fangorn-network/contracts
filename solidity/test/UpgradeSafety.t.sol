@@ -25,7 +25,7 @@ import {Deployments} from "../script/Deployments.sol";
 contract UpgradeSafetyTest is Test {
     function test_current_versions_are_upgrade_safe() public {
         string[3] memory names = Deployments.names();
-        uint256[2] memory chains = Deployments.chains();
+        uint256[1] memory chains = Deployments.chains();
         for (uint256 i = 0; i < names.length; i++) {
             // Safe behind a proxy at all, whether or not it is deployed anywhere yet.
             Upgrades.validateImplementation(Deployments.current(names[i]), Deployments.options(names[i]));

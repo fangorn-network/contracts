@@ -20,7 +20,6 @@ interface IAdmin {
 /// this checks that all three still name the admin recorded below for the chain. Once it
 /// has run, update that address to the new admin.
 contract RotateAdmin is Script {
-    address internal constant ARBITRUM_SEPOLIA_ADMIN = 0xB2F5361DBEF0715E1d6aa072284255dD7f1d43FC;
     address internal constant BASE_SEPOLIA_ADMIN = 0x7b16387C5A8c514880E48bcacd52782FCF9Da936;
 
     function run(address newAdmin) external {
@@ -47,7 +46,6 @@ contract RotateAdmin is Script {
     }
 
     function currentAdmin() public view returns (address) {
-        if (block.chainid == Deployments.ARBITRUM_SEPOLIA) return ARBITRUM_SEPOLIA_ADMIN;
         if (block.chainid == Deployments.BASE_SEPOLIA) return BASE_SEPOLIA_ADMIN;
         revert("no admin recorded for this chain");
     }

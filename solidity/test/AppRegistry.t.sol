@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test, stdStorage, StdStorage} from "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
@@ -90,7 +90,6 @@ contract AppRegistryTest is Test {
     bytes32 constant GHOST_APP = bytes32(uint256(0xCC));
     bytes32 constant RENAMED = bytes32(uint256(0xDD));
     bytes32 constant RENAMED_AGAIN = bytes32(uint256(0xEE01));
-    uint256 constant FEE = 0.001 ether;
     uint256 constant SUB_FEE = 2_000_000; // 2 USDC (6 decimals)
     uint64 constant PERIOD = 30 days;
     uint64 constant T0 = 1_700_000_000;
@@ -101,8 +100,6 @@ contract AppRegistryTest is Test {
 
     bytes32 constant DOCS = keccak256("docs");
 
-    using stdStorage for StdStorage;
-
     AppRegistry apps;
     DataRegistry data;
     MockUSDC usdc;
@@ -112,7 +109,7 @@ contract AppRegistryTest is Test {
     function setUp() public {
         usdc = new MockUSDC();
         apps = Proxied.appRegistry(ADMIN, address(usdc), 0, PERIOD);
-        data = Proxied.dataRegistry(ADMIN, address(apps));
+        data = Proxied.dataRegistry(ADMIN);
         vm.prank(ADMIN);
         apps.setDataRegistry(address(data));
 
@@ -132,15 +129,6 @@ contract AppRegistryTest is Test {
     function accept(bytes32 app, address who) internal {
         vm.prank(apps.getAppOwner(app));
         apps.acceptPublisher(app, who);
-    }
-
-    /// Join fees owed to `owner` from the old join flow, which nothing collects any more:
-    /// written straight into storage, with the USDC to back them.
-    function owe(address owner, uint256 amount) internal {
-        stdstore.target(address(apps)).sig("joinFeesOwed(address)").with_key(owner).checked_write(amount);
-        stdstore.target(address(apps)).sig("totalJoinFeesOwed()").checked_write(apps.totalJoinFeesOwed() + amount);
-        vm.prank(STRANGER);
-        usdc.transfer(address(apps), amount);
     }
 
     // ── apps ──────────────────────────────────────────────────────────────────
@@ -410,20 +398,6 @@ contract AppRegistryTest is Test {
         vm.stopPrank();
     }
 
-    /// An invitation left over from the old join flow is not a membership, and the
-    /// owner accepts that wallet like any other.
-    function test_a_leftover_invitation_is_accepted_like_none() public {
-        openApp();
-        stdstore.target(address(apps)).sig("statusForApp(bytes32,address)").with_key(APP).with_key(PUBLISHER)
-            .checked_write(uint256(3));
-        assertFalse(apps.canPublish(APP, PUBLISHER));
-        vm.prank(APP_OWNER);
-        vm.expectRevert(AppRegistry.NotAccepted.selector);
-        apps.setPublisherSuspended(APP, PUBLISHER, true);
-        accept(APP, PUBLISHER);
-        assertTrue(apps.canPublish(APP, PUBLISHER));
-    }
-
     function test_membership_is_per_app() public {
         openApp();
         vm.prank(APP_OWNER);
@@ -481,41 +455,7 @@ contract AppRegistryTest is Test {
         assertTrue(apps.canPublish(APP, APP_OWNER));
     }
 
-    // ── join fees from the old flow ───────────────────────────────────────────
-
-    /// Nothing collects join fees any more, but what an owner was owed stays theirs:
-    /// only they take it out, all of it, once, and a refused payout leaves it owed.
-    function test_join_fees_still_owed_go_to_their_owner() public {
-        owe(APP_OWNER, 3 * FEE);
-
-        vm.prank(STRANGER);
-        vm.expectRevert(AppRegistry.NothingToWithdraw.selector);
-        apps.withdrawJoinFees(STRANGER);
-
-        usdc.setMode(MockUSDC.Mode.ReturnFalse);
-        vm.prank(APP_OWNER);
-        vm.expectRevert(AppRegistry.TransferFailed.selector);
-        apps.withdrawJoinFees(APP_OWNER);
-        assertEq(apps.joinFeesOwed(APP_OWNER), 3 * FEE);
-        assertEq(apps.totalJoinFeesOwed(), 3 * FEE);
-        usdc.setMode(MockUSDC.Mode.Ok);
-
-        vm.expectEmit(true, true, true, true, address(apps));
-        emit AppRegistry.JoinFeesWithdrawn(APP_OWNER, STRANGER, 3 * FEE);
-        vm.prank(APP_OWNER);
-        apps.withdrawJoinFees(STRANGER);
-        assertEq(usdc.lastTo(), STRANGER);
-        assertEq(usdc.lastAmount(), 3 * FEE);
-        assertEq(apps.joinFeesOwed(APP_OWNER), 0);
-        assertEq(apps.totalJoinFeesOwed(), 0);
-        assertEq(usdc.balanceOf(address(apps)), 0);
-        vm.prank(APP_OWNER);
-        vm.expectRevert(AppRegistry.NothingToWithdraw.selector);
-        apps.withdrawJoinFees(APP_OWNER);
-    }
-
-    /// Moving the fee token hands control to the token, during a claim, a renewal and a
-    /// payout. A guarded function called from there is refused, even one the caller
+    /// Moving the fee token hands control to the token, during a claim and a renewal. A guarded function called from there is refused, even one the caller
     /// could otherwise use: here, the token claiming an app.
     function test_a_fee_transfer_cannot_reenter() public {
         ReentrantToken token = new ReentrantToken();
@@ -533,13 +473,6 @@ contract AppRegistryTest is Test {
         token.clear();
         vm.prank(APP_OWNER);
         apps.renewSubscription(uint256(APP), PERIOD);
-        assertEq(token.refusal(), guarded);
-
-        token.clear();
-        stdstore.target(address(apps)).sig("joinFeesOwed(address)").with_key(APP_OWNER).checked_write(FEE);
-        stdstore.target(address(apps)).sig("totalJoinFeesOwed()").checked_write(FEE);
-        vm.prank(APP_OWNER);
-        apps.withdrawJoinFees(APP_OWNER);
         assertEq(token.refusal(), guarded);
         assertEq(apps.getAppOwner(REENTERED), address(0));
     }
@@ -822,23 +755,17 @@ contract AppRegistryTest is Test {
     }
 
     /// The admin sweeps the protocol's USDC (subscription fees) and any other token sent
-    /// here by mistake, but never the join fees still owed to app owners.
+    /// here by mistake.
     function test_only_the_admin_sweeps_tokens() public {
         vm.prank(ADMIN);
         apps.setSubscriptionFee(SUB_FEE);
         vm.prank(APP_OWNER);
         apps.registerApp(APP, SUB_FEE);
-        owe(APP_OWNER, FEE);
-        assertEq(usdc.balanceOf(address(apps)), SUB_FEE + FEE);
+        assertEq(usdc.balanceOf(address(apps)), SUB_FEE);
 
         vm.prank(APP_OWNER);
         vm.expectRevert(AppRegistry.Unauthorized.selector);
         apps.withdrawToken(address(usdc), STRANGER, SUB_FEE);
-
-        // One base unit more than the protocol's share would reach into the owner's.
-        vm.prank(ADMIN);
-        vm.expectRevert(AppRegistry.ExceedsProtocolBalance.selector);
-        apps.withdrawToken(address(usdc), STRANGER, SUB_FEE + 1);
 
         // A transfer the token refuses changes nothing.
         usdc.setMode(MockUSDC.Mode.ReturnFalse);
@@ -852,14 +779,9 @@ contract AppRegistryTest is Test {
         vm.prank(ADMIN);
         apps.withdrawToken(address(usdc), STRANGER, SUB_FEE);
         assertEq(usdc.lastTo(), STRANGER);
-        assertEq(usdc.balanceOf(address(apps)), FEE, "the owner's join fee is still there");
-
-        // The owner's fee is still theirs to take.
-        vm.prank(APP_OWNER);
-        apps.withdrawJoinFees(APP_OWNER);
         assertEq(usdc.balanceOf(address(apps)), 0);
 
-        // Another token is not held for anyone, so any amount can go.
+        // Any other token sent here can go too.
         MockUSDC stray = new MockUSDC();
         vm.prank(ADMIN);
         apps.withdrawToken(address(stray), STRANGER, 5);
