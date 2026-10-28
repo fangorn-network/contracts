@@ -12,10 +12,10 @@ Use the proxy addresses: an upgrade only changes the implementation behind them.
 
 | Contract           | Base Sepolia (84532)                         |
 | ------------------ | -------------------------------------------- |
-| AppRegistry        | `0x4010ee3a2182D5Ab76E0bf95C17b88bb35Ea711B` |
-| DataRegistry       | `0x5f0B6f0D3ca6266b06fb55CCE5725EB4770dbeFd` |
-| MembershipRegistry | `0x99bb5101263a4Fc0E64c9887d43b87aeB3f3F32c` |
-| Admin              | `0x7b16387C5A8c514880E48bcacd52782FCF9Da936` |
+| AppRegistry        | `0x6E07C2c7393963242899e5Fb0eb1B6B787927E81` |
+| DataRegistry       | `0x7a34882568f1b22FC4C4944113B1E4Ca4cF6900f` |
+| MembershipRegistry | `0x9De2C2A6261927f91b246C73e7ca86824a357FA6` |
+| Admin (wallet)     | `0x7b16387C5A8c514880E48bcacd52782FCF9Da936` |
 | RPC                | `https://sepolia.base.org`                   |
 
 ## Architecture
@@ -204,13 +204,13 @@ forge script script/Upgrade.s.sol --force \
 
 Then commit what it wrote under `deployed/` and `broadcast/`. Leave off `--broadcast` to see what it would do: it prints `up to date` or the upgrade for each contract.
 
-| What                                   | Command (add `--rpc-url <rpc> --account <keystore> --sender <admin> --broadcast`) |
-| -------------------------------------- | --------------------------------------------------------------------------------- |
-| Upgrade one contract only              | `forge script script/Upgrade.s.sol --force --sig "upgrade(string)" DataRegistry`  |
-| Set the subscription fee (USDC, 6 dp)  | `forge script script/SetSubscriptionFee.s.sol --sig "run(uint256)" 5000000`        |
-| Rotate the admin of all three          | `forge script script/RotateAdmin.s.sol --sig "run(address)" <new admin>`          |
-| First deployment on a new chain        | `forge script script/Deploy.s.sol --force --sig "all()"` (see *First deployment*) |
-| Check `deployed/` is the live code     | `forge script script/Upgrade.s.sol --sig "check()" --rpc-url <rpc>` (no signer)   |
+| What                                  | Command (add `--rpc-url <rpc> --account <keystore> --sender <admin> --broadcast`) |
+| ------------------------------------- | --------------------------------------------------------------------------------- |
+| Upgrade one contract only             | `forge script script/Upgrade.s.sol --force --sig "upgrade(string)" DataRegistry`  |
+| Set the subscription fee (USDC, 6 dp) | `forge script script/SetSubscriptionFee.s.sol --sig "run(uint256)" 5000000`       |
+| Rotate the admin of all three         | `forge script script/RotateAdmin.s.sol --sig "run(address)" <new admin>`          |
+| First deployment on a new chain       | `forge script script/Deploy.s.sol --force --sig "all()"` (see *First deployment*) |
+| Check `deployed/` is the live code    | `forge script script/Upgrade.s.sol --sig "check()" --rpc-url <rpc>` (no signer)   |
 
 Every script simulates the whole run first and sends nothing unless all of it would succeed, so a wrong signer or a failed check costs nothing. `--force` is required wherever it is shown: the upgrade-safety check needs a full build.
 
