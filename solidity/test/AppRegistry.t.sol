@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test, stdStorage, StdStorage} from "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
@@ -88,7 +88,8 @@ contract AppRegistryTest is Test {
     bytes32 constant APP = bytes32(uint256(0xAA));
     bytes32 constant OTHER_APP = bytes32(uint256(0xBB));
     bytes32 constant GHOST_APP = bytes32(uint256(0xCC));
-    uint256 constant FEE = 0.001 ether;
+    bytes32 constant RENAMED = bytes32(uint256(0xDD));
+    bytes32 constant RENAMED_AGAIN = bytes32(uint256(0xEE01));
     uint256 constant SUB_FEE = 2_000_000; // 2 USDC (6 decimals)
     uint64 constant PERIOD = 30 days;
     uint64 constant T0 = 1_700_000_000;
@@ -99,8 +100,6 @@ contract AppRegistryTest is Test {
 
     bytes32 constant DOCS = keccak256("docs");
 
-    using stdStorage for StdStorage;
-
     AppRegistry apps;
     DataRegistry data;
     MockUSDC usdc;
@@ -110,7 +109,7 @@ contract AppRegistryTest is Test {
     function setUp() public {
         usdc = new MockUSDC();
         apps = Proxied.appRegistry(ADMIN, address(usdc), 0, PERIOD);
-        data = Proxied.dataRegistry(ADMIN, address(apps));
+        data = Proxied.dataRegistry(ADMIN);
         vm.prank(ADMIN);
         apps.setDataRegistry(address(data));
 
@@ -130,15 +129,6 @@ contract AppRegistryTest is Test {
     function accept(bytes32 app, address who) internal {
         vm.prank(apps.getAppOwner(app));
         apps.acceptPublisher(app, who);
-    }
-
-    /// Join fees owed to `owner` from the old join flow, which nothing collects any more:
-    /// written straight into storage, with the USDC to back them.
-    function owe(address owner, uint256 amount) internal {
-        stdstore.target(address(apps)).sig("joinFeesOwed(address)").with_key(owner).checked_write(amount);
-        stdstore.target(address(apps)).sig("totalJoinFeesOwed()").checked_write(apps.totalJoinFeesOwed() + amount);
-        vm.prank(STRANGER);
-        usdc.transfer(address(apps), amount);
     }
 
     // ── apps ──────────────────────────────────────────────────────────────────
@@ -221,6 +211,130 @@ contract AppRegistryTest is Test {
         assertTrue(apps.canPublish(APP, APP_OWNER));
     }
 
+    function test_the_zero_id_cannot_be_claimed() public {
+        vm.prank(APP_OWNER);
+        vm.expectRevert(AppRegistry.ZeroAppId.selector);
+        apps.registerApp(bytes32(0), 0);
+    }
+
+    // ── renaming apps ─────────────────────────────────────────────────────────
+
+    /// A rename moves nothing: the new id is an alias, and the app's publishers,
+    /// exclusions, token and listing answer to every id it has gone by.
+    function test_a_renamed_app_answers_to_every_id_it_went_by() public {
+        openApp();
+        accept(APP, PUBLISHER);
+        bytes32 xid = apps.exclusionId(PUBLISHER, DOCS, bytes32(0));
+        vm.prank(APP_OWNER);
+        apps.exclude(APP, PUBLISHER, DOCS, bytes32(0));
+
+        vm.expectEmit(true, true, true, true, address(apps));
+        emit AppRegistry.AppRenamed(APP, RENAMED);
+        vm.prank(APP_OWNER);
+        apps.renameApp(APP, RENAMED);
+
+        assertEq(apps.currentAppId(APP), RENAMED);
+        assertEq(apps.currentAppId(RENAMED), RENAMED);
+        assertEq(apps.canonicalAppId(RENAMED), APP);
+        assertEq(apps.canonicalAppId(GHOST_APP), GHOST_APP);
+        assertEq(apps.currentAppId(GHOST_APP), GHOST_APP);
+
+        bytes32[2] memory ids = [APP, RENAMED];
+        for (uint256 i = 0; i < ids.length; i++) {
+            assertEq(apps.getAppOwner(ids[i]), APP_OWNER);
+            assertTrue(apps.canPublish(ids[i], PUBLISHER));
+            (bool allowed, address owner, uint64 expiry) = apps.access(ids[i], PUBLISHER);
+            assertTrue(allowed);
+            assertEq(owner, APP_OWNER);
+            assertEq(expiry, apps.expiresAt(uint256(APP)));
+            assertEq(uint8(apps.statusForApp(ids[i], PUBLISHER)), STATUS_ACTIVE);
+            assertEq(apps.exclusionCount(ids[i], xid), 1);
+        }
+
+        // The owner manages it under its new id; events keep the canonical one.
+        vm.startPrank(APP_OWNER);
+        vm.expectEmit(true, true, true, true, address(apps));
+        emit AppRegistry.PublisherAccepted(APP, STRANGER);
+        apps.acceptPublisher(RENAMED, STRANGER);
+        apps.restore(RENAMED, PUBLISHER, DOCS, bytes32(0));
+        apps.setAppAgentUri(RENAMED, "ipfs://card");
+        vm.stopPrank();
+        assertTrue(apps.canPublish(APP, STRANGER));
+        assertEq(apps.exclusionCount(APP, xid), 2);
+        assertEq(apps.appAgentUri(APP), "ipfs://card");
+
+        // So does the admin.
+        vm.prank(ADMIN);
+        apps.setAppSuspended(RENAMED, true);
+        assertTrue(apps.isAppSuspended(APP));
+        assertFalse(apps.canPublish(RENAMED, PUBLISHER));
+
+        // The token and the listing keep the id it was claimed under.
+        assertEq(apps.ownerOf(uint256(APP)), APP_OWNER);
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, uint256(RENAMED)));
+        apps.ownerOf(uint256(RENAMED));
+        assertEq(apps.appCount(), 1);
+        assertEq(apps.appsPage(0, 10)[0], APP);
+        assertEq(apps.appsOf(APP_OWNER)[0], APP);
+    }
+
+    /// An id an app has gone by stays its own: nobody can claim it, and the app can
+    /// take it back.
+    function test_an_app_keeps_every_id_it_went_by() public {
+        openApp();
+        vm.startPrank(APP_OWNER);
+        apps.renameApp(APP, RENAMED);
+        apps.renameApp(RENAMED, RENAMED_AGAIN);
+        vm.stopPrank();
+        assertEq(apps.currentAppId(APP), RENAMED_AGAIN);
+        assertEq(apps.canonicalAppId(RENAMED), APP);
+        assertEq(apps.canonicalAppId(RENAMED_AGAIN), APP);
+
+        vm.startPrank(STRANGER);
+        vm.expectRevert(AppRegistry.AppAlreadyRegistered.selector);
+        apps.registerApp(RENAMED, 0);
+        apps.registerApp(OTHER_APP, 0);
+        vm.expectRevert(AppRegistry.AppAlreadyRegistered.selector);
+        apps.renameApp(OTHER_APP, RENAMED);
+        vm.expectRevert(AppRegistry.AppAlreadyRegistered.selector);
+        apps.renameApp(OTHER_APP, APP);
+        vm.stopPrank();
+
+        // Back to an earlier id, and to the one it was claimed under.
+        vm.startPrank(APP_OWNER);
+        apps.renameApp(RENAMED_AGAIN, RENAMED);
+        assertEq(apps.currentAppId(RENAMED_AGAIN), RENAMED);
+        apps.renameApp(RENAMED, APP);
+        assertEq(apps.currentAppId(RENAMED), APP);
+        assertEq(apps.canonicalAppId(APP), APP);
+        assertEq(apps.canonicalAppId(RENAMED_AGAIN), APP);
+        vm.stopPrank();
+    }
+
+    function test_only_the_owner_renames_an_existing_app_to_a_free_id() public {
+        openApp();
+        vm.prank(APP_OWNER);
+        apps.registerApp(OTHER_APP, 0);
+
+        vm.prank(STRANGER);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.renameApp(APP, RENAMED);
+        vm.prank(ADMIN);
+        vm.expectRevert(AppRegistry.Unauthorized.selector);
+        apps.renameApp(APP, RENAMED);
+
+        vm.startPrank(APP_OWNER);
+        vm.expectRevert(AppRegistry.AppNotFound.selector);
+        apps.renameApp(GHOST_APP, RENAMED);
+        vm.expectRevert(AppRegistry.ZeroAppId.selector);
+        apps.renameApp(APP, bytes32(0));
+        // Not even onto another app of the same owner's.
+        vm.expectRevert(AppRegistry.AppAlreadyRegistered.selector);
+        apps.renameApp(APP, OTHER_APP);
+        vm.stopPrank();
+        assertEq(apps.currentAppId(APP), APP);
+    }
+
     // ── listing apps ──────────────────────────────────────────────────────────
 
     function test_claims_are_listed_in_order() public {
@@ -284,20 +398,6 @@ contract AppRegistryTest is Test {
         vm.stopPrank();
     }
 
-    /// An invitation left over from the old join flow is not a membership, and the
-    /// owner accepts that wallet like any other.
-    function test_a_leftover_invitation_is_accepted_like_none() public {
-        openApp();
-        stdstore.target(address(apps)).sig("statusForApp(bytes32,address)").with_key(APP).with_key(PUBLISHER)
-            .checked_write(uint256(3));
-        assertFalse(apps.canPublish(APP, PUBLISHER));
-        vm.prank(APP_OWNER);
-        vm.expectRevert(AppRegistry.NotAccepted.selector);
-        apps.setPublisherSuspended(APP, PUBLISHER, true);
-        accept(APP, PUBLISHER);
-        assertTrue(apps.canPublish(APP, PUBLISHER));
-    }
-
     function test_membership_is_per_app() public {
         openApp();
         vm.prank(APP_OWNER);
@@ -355,41 +455,7 @@ contract AppRegistryTest is Test {
         assertTrue(apps.canPublish(APP, APP_OWNER));
     }
 
-    // ── join fees from the old flow ───────────────────────────────────────────
-
-    /// Nothing collects join fees any more, but what an owner was owed stays theirs:
-    /// only they take it out, all of it, once, and a refused payout leaves it owed.
-    function test_join_fees_still_owed_go_to_their_owner() public {
-        owe(APP_OWNER, 3 * FEE);
-
-        vm.prank(STRANGER);
-        vm.expectRevert(AppRegistry.NothingToWithdraw.selector);
-        apps.withdrawJoinFees(STRANGER);
-
-        usdc.setMode(MockUSDC.Mode.ReturnFalse);
-        vm.prank(APP_OWNER);
-        vm.expectRevert(AppRegistry.TransferFailed.selector);
-        apps.withdrawJoinFees(APP_OWNER);
-        assertEq(apps.joinFeesOwed(APP_OWNER), 3 * FEE);
-        assertEq(apps.totalJoinFeesOwed(), 3 * FEE);
-        usdc.setMode(MockUSDC.Mode.Ok);
-
-        vm.expectEmit(true, true, true, true, address(apps));
-        emit AppRegistry.JoinFeesWithdrawn(APP_OWNER, STRANGER, 3 * FEE);
-        vm.prank(APP_OWNER);
-        apps.withdrawJoinFees(STRANGER);
-        assertEq(usdc.lastTo(), STRANGER);
-        assertEq(usdc.lastAmount(), 3 * FEE);
-        assertEq(apps.joinFeesOwed(APP_OWNER), 0);
-        assertEq(apps.totalJoinFeesOwed(), 0);
-        assertEq(usdc.balanceOf(address(apps)), 0);
-        vm.prank(APP_OWNER);
-        vm.expectRevert(AppRegistry.NothingToWithdraw.selector);
-        apps.withdrawJoinFees(APP_OWNER);
-    }
-
-    /// Moving the fee token hands control to the token, during a claim, a renewal and a
-    /// payout. A guarded function called from there is refused, even one the caller
+    /// Moving the fee token hands control to the token, during a claim and a renewal. A guarded function called from there is refused, even one the caller
     /// could otherwise use: here, the token claiming an app.
     function test_a_fee_transfer_cannot_reenter() public {
         ReentrantToken token = new ReentrantToken();
@@ -407,13 +473,6 @@ contract AppRegistryTest is Test {
         token.clear();
         vm.prank(APP_OWNER);
         apps.renewSubscription(uint256(APP), PERIOD);
-        assertEq(token.refusal(), guarded);
-
-        token.clear();
-        stdstore.target(address(apps)).sig("joinFeesOwed(address)").with_key(APP_OWNER).checked_write(FEE);
-        stdstore.target(address(apps)).sig("totalJoinFeesOwed()").checked_write(FEE);
-        vm.prank(APP_OWNER);
-        apps.withdrawJoinFees(APP_OWNER);
         assertEq(token.refusal(), guarded);
         assertEq(apps.getAppOwner(REENTERED), address(0));
     }
@@ -696,23 +755,17 @@ contract AppRegistryTest is Test {
     }
 
     /// The admin sweeps the protocol's USDC (subscription fees) and any other token sent
-    /// here by mistake, but never the join fees still owed to app owners.
+    /// here by mistake.
     function test_only_the_admin_sweeps_tokens() public {
         vm.prank(ADMIN);
         apps.setSubscriptionFee(SUB_FEE);
         vm.prank(APP_OWNER);
         apps.registerApp(APP, SUB_FEE);
-        owe(APP_OWNER, FEE);
-        assertEq(usdc.balanceOf(address(apps)), SUB_FEE + FEE);
+        assertEq(usdc.balanceOf(address(apps)), SUB_FEE);
 
         vm.prank(APP_OWNER);
         vm.expectRevert(AppRegistry.Unauthorized.selector);
         apps.withdrawToken(address(usdc), STRANGER, SUB_FEE);
-
-        // One base unit more than the protocol's share would reach into the owner's.
-        vm.prank(ADMIN);
-        vm.expectRevert(AppRegistry.ExceedsProtocolBalance.selector);
-        apps.withdrawToken(address(usdc), STRANGER, SUB_FEE + 1);
 
         // A transfer the token refuses changes nothing.
         usdc.setMode(MockUSDC.Mode.ReturnFalse);
@@ -726,14 +779,9 @@ contract AppRegistryTest is Test {
         vm.prank(ADMIN);
         apps.withdrawToken(address(usdc), STRANGER, SUB_FEE);
         assertEq(usdc.lastTo(), STRANGER);
-        assertEq(usdc.balanceOf(address(apps)), FEE, "the owner's join fee is still there");
-
-        // The owner's fee is still theirs to take.
-        vm.prank(APP_OWNER);
-        apps.withdrawJoinFees(APP_OWNER);
         assertEq(usdc.balanceOf(address(apps)), 0);
 
-        // Another token is not held for anyone, so any amount can go.
+        // Any other token sent here can go too.
         MockUSDC stray = new MockUSDC();
         vm.prank(ADMIN);
         apps.withdrawToken(address(stray), STRANGER, 5);
@@ -818,6 +866,8 @@ contract AppRegistryTest is Test {
         apps.acceptPublisher(APP, makeAddr("sock-puppet"));
         vm.expectRevert(AppRegistry.PublisherSuspendedGlobal.selector);
         apps.setAppAgentUri(APP, "https://elsewhere.example/card");
+        vm.expectRevert(AppRegistry.PublisherSuspendedGlobal.selector);
+        apps.renameApp(APP, RENAMED);
         vm.stopPrank();
         assertEq(uint8(apps.statusForApp(APP, makeAddr("sock-puppet"))), STATUS_NONE);
         assertEq(apps.appAgentUri(APP), "");

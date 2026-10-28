@@ -11,28 +11,31 @@ import {IERC5643} from "./IERC5643.sol";
 
 /// AppRegistry
 ///
-/// An application is sponsored storage for the publishers it accepts. A wallet claims
-/// an app (`registerApp`) and owns it; the owner accepts publishers (`acceptPublisher`).
+/// Applications in Fangorn are emergent. An app "owner" sponsors storage (pinning) for the publishers it accepts.
+/// Publishers, operating independently, provide
+/// A wallet claims an app (`registerApp`) and owns it;  the owner accepts publishers (`acceptPublisher`).
 /// An accepted publisher uploads with storage the app provides, and the app includes its
-/// data: the latest head of each of its repos, less what the owner excludes (`exclude`).
-/// A repo lives in the DataRegistry and belongs to no app; nothing here reads or records
-/// a head. One rule, `canPublish`, says whether both hold for a publisher now.
+/// data: the latest head of each of its repos, with explicit owner excludes (`exclude`) filtered out.
+/// Each potential publisher's rights can be checked with `canPublish`.
 ///
 /// An app IS a storage subscription: claiming one pulls the subscription fee (USDC)
 /// for one period, and the off-chain upload gate reads `access` to decide whether to
 /// serve its publishers.
 ///
 /// The subscription fee is the one payment, in USDC: set by the admin, paid by the app's
-/// owner, and taken out by the admin (`withdrawToken`). Join fees, which earlier versions
-/// collected from publishers, are no longer charged; what an owner is still owed stays
-/// theirs to take out (`withdrawJoinFees`), out of the admin's reach
-/// (`totalJoinFeesOwed`). The contract holds no ETH.
+/// owner, and taken out by the admin (`withdrawToken`). The contract holds no ETH.
 ///
 /// Each app is also an ERC-721 token, minted to its owner at claim, and its
 /// subscription follows ERC-5643: `expiresAt`, `isRenewable`, `renewSubscription` and
 /// `cancelSubscription`. The token id and the app id are the same 32 bytes,
 /// `uint256(app_id)`: the ERC-721 and ERC-5643 functions take the token id, the rest of
 /// the contract the app id. The token cannot be transferred.
+///
+/// An app can be renamed (`renameApp`): its new id becomes an alias of the id it was
+/// claimed under, and every function that takes an app id accepts any of them. The
+/// claimed id stays the app's canonical id: the token id, the key of its state, and the
+/// `app_id` in its events. Ids an app has gone by stay its own, so nobody can claim one
+/// and pass as the app to clients that still use it.
 ///
 /// The expiry is enforced here. Once an app's subscription has lapsed or been
 /// cancelled, it provides no storage and includes nothing. Renewing lifts it at once,
@@ -53,10 +56,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         /// Accepted by the app's owner (`acceptPublisher`).
         Active,
         /// Accepted, then suspended from the app by its owner.
-        Suspended,
-        /// Retired: invited under the old join flow, and never joined. Not a member;
-        /// `acceptPublisher` accepts it like `None`.
-        Invited
+        Suspended
     }
 
     // Errors, grouped by topic.
@@ -65,19 +65,16 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// The caller may not do this: not the admin, for an admin function; not the
     /// app's owner, for an owner function or `cancelSubscription`
     error Unauthorized();
-    /// Sending USDC (`withdrawJoinFees`) or an ERC-20 (`withdrawToken`) failed
+    /// Sending an ERC-20 (`withdrawToken`) failed
     error TransferFailed();
-    /// `withdrawToken`: more USDC than the protocol's share, which is the contract's
-    /// balance minus the join fees owed to app owners
-    error ExceedsProtocolBalance();
 
     // Apps
     /// No app has been registered with this id
     error AppNotFound();
-    /// `registerApp`: an app with this id already exists
+    /// `registerApp`, `renameApp`: an app with this id, or going by it, already exists
     error AppAlreadyRegistered();
-    /// `withdrawJoinFees`: the caller is owed nothing
-    error NothingToWithdraw();
+    /// `registerApp`, `renameApp`: the zero id is what an unset alias reads as
+    error ZeroAppId();
 
     // Membership
     /// `setPublisherSuspended`: the app never accepted this wallet
@@ -122,8 +119,9 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     // Apps
     /// A wallet claimed an app
     event AppRegistered(bytes32 indexed app_id, address indexed owner);
-    /// An app owner took out the join fees they were owed
-    event JoinFeesWithdrawn(address indexed owner, address to, uint256 amount);
+    /// An app took a new id. `app_id` is its canonical id; `new_id` resolves to it
+    /// from now on, as every id it went by before still does.
+    event AppRenamed(bytes32 indexed app_id, bytes32 indexed new_id);
     /// The app's agent card moved
     event AppAgentChanged(bytes32 indexed app_id, string agent_uri);
     /// The protocol admin suspended (or reinstated) an entire app
@@ -186,38 +184,34 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         bool isAppSuspended;
         /// When the subscription expires (Unix seconds). Zero once cancelled.
         uint64 expiry;
-        /// Retired: the publisher terms hash of the old join flow. Kept for the layout.
-        bytes32 appTerms;
-        /// Retired: where the terms were read. Kept for the layout.
-        string appTermsUri;
-        /// Retired: the old join fee. Kept for the layout.
-        uint256 joinFee;
         /// URI of the app's ERC-8004 agent card. Empty means the app has none.
         string appAgentUri;
     }
 
     /// app_id => app. Internal: the getters below are the ABI clients read.
     mapping(bytes32 => App) internal apps;
-    /// app_id => publisher => standing in the app
-    mapping(bytes32 => mapping(address => Status)) public statusForApp;
-    /// Retired: app_id => publisher => the terms hash they joined on. Kept for the layout.
-    mapping(bytes32 => mapping(address => bytes32)) internal acceptedTerms;
+    /// app_id => publisher => standing in the app. Internal: `statusForApp` reads it
+    /// through any id the app goes by.
+    /// @custom:oz-renamed-from statusForApp
+    mapping(bytes32 => mapping(address => Status)) internal statuses;
     /// wallet => banned network-wide by the protocol admin
     mapping(address => bool) public globalSuspensions;
-    /// app owner => join fees paid to their apps under the old join flow and not yet
-    /// withdrawn, in USDC base units. Nothing adds to it any more.
-    mapping(address => uint256) public joinFeesOwed;
-    /// The sum of `joinFeesOwed`: the part of the contract's USDC that belongs to app
-    /// owners, which `withdrawToken` cannot touch
-    uint256 public totalJoinFeesOwed;
 
-    /// app_id => exclusionId => changes so far; odd means excluded
-    mapping(bytes32 => mapping(bytes32 => uint64)) public exclusionCount;
+    /// app_id => exclusionId => changes so far; odd means excluded. Internal:
+    /// `exclusionCount` reads it through any id the app goes by.
+    /// @custom:oz-renamed-from exclusionCount
+    mapping(bytes32 => mapping(bytes32 => uint64)) internal exclusions;
 
-    /// A fifo map of all claimed app ids 
+    /// A fifo map of all claimed app ids
     bytes32[] internal appIds;
     /// owner => owned apps (in the order claimed)
     mapping(address => bytes32[]) internal appIdsOf;
+
+    /// id an app was renamed to => the app's canonical id. Zero for an id that is no
+    /// alias.
+    mapping(bytes32 => bytes32) internal canonicalOf;
+    /// canonical id => the id the app was last renamed to. Zero for one never renamed.
+    mapping(bytes32 => bytes32) internal renamedTo;
 
     /// The implementation is only ever used through a proxy. Lock it, so nobody can
     /// initialize it directly.
@@ -259,12 +253,13 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         App storage app = apps[app_id];
         address owner = msg.sender;
         if (globalSuspensions[owner]) revert PublisherSuspendedGlobal();
-        if (app.owner != address(0)) revert AppAlreadyRegistered();
+        if (app_id == bytes32(0)) revert ZeroAppId();
+        if (app.owner != address(0) || canonicalOf[app_id] != bytes32(0)) revert AppAlreadyRegistered();
         if (subscriptionFee > max_subscription_fee) revert SubscriptionFeeTooHigh();
         _paySubscription(app_id, owner);
 
         app.owner = owner;
-        statusForApp[app_id][owner] = Status.Active;
+        statuses[app_id][owner] = Status.Active;
         _mint(owner, uint256(app_id));
         _list(app_id, owner);
 
@@ -273,7 +268,43 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     }
 
     function getAppOwner(bytes32 app_id) external view returns (address) {
-        return apps[app_id].owner;
+        return apps[_canonical(app_id)].owner;
+    }
+
+    /// Give the app a new id, `new_id`, from now on its current id (`currentAppId`).
+    /// Only callable by the app owner, and not by one banned network-wide
+    /// (`PublisherSuspendedGlobal`). `app_id` may be any id the app goes by.
+    ///
+    /// Nothing moves: `new_id` becomes an alias of the canonical id, so the app's
+    /// publishers, exclusions, subscription and token carry on as they were, and every
+    /// id it went by keeps resolving to it. `new_id` must be unclaimed, or an id this
+    /// app already goes by (renaming back); one held by another app reverts
+    /// `AppAlreadyRegistered`.
+    function renameApp(bytes32 app_id, bytes32 new_id) external {
+        app_id = _onlyAppOwner(app_id);
+        if (globalSuspensions[msg.sender]) revert PublisherSuspendedGlobal();
+        if (new_id == bytes32(0)) revert ZeroAppId();
+        bytes32 holder = _canonical(new_id);
+        if (holder != app_id) {
+            if (apps[holder].owner != address(0)) revert AppAlreadyRegistered();
+            canonicalOf[new_id] = app_id;
+        }
+        renamedTo[app_id] = new_id;
+        emit AppRenamed(app_id, new_id);
+    }
+
+    /// The id `app_id` resolves to: the one its app was claimed under. Any other id
+    /// comes back unchanged.
+    function canonicalAppId(bytes32 app_id) external view returns (bytes32) {
+        return _canonical(app_id);
+    }
+
+    /// The id the app `app_id` (any id it goes by) currently goes by: the last it was
+    /// renamed to, or its canonical id. Any other id comes back unchanged.
+    function currentAppId(bytes32 app_id) external view returns (bytes32) {
+        app_id = _canonical(app_id);
+        bytes32 current = renamedTo[app_id];
+        return current == bytes32(0) ? app_id : current;
     }
 
     /// The total number of registered apps
@@ -281,7 +312,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         return appIds.length;
     }
 
-    /// Paged reads of registered app ids , starting from offset (oldest) to limit (newest) 
+    /// Paged reads of registered app ids (canonical; see `currentAppId`), starting from offset (oldest) to limit (newest)
     /// Includes expired and suspended apps
     function appsPage(uint256 offset, uint256 limit) external view returns (bytes32[] memory page) {
         // Clamped without adding offset and limit, which could overflow.
@@ -297,21 +328,10 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         return appIdsOf[owner];
     }
 
-    /// Take out every join fee owed to the caller, as the owner of one or more apps,
-    /// and send it, in USDC, to `to`. Only fees collected under the old join flow are
-    /// owed. If the transfer fails, the balance stays owed.
-    function withdrawJoinFees(address to) external nonReentrant {
-        uint256 amount = joinFeesOwed[msg.sender];
-        if (amount == 0) revert NothingToWithdraw();
-        joinFeesOwed[msg.sender] = 0;
-        totalJoinFeesOwed -= amount;
-        if (!IERC20(usdc).trySafeTransfer(to, amount)) revert TransferFailed();
-        emit JoinFeesWithdrawn(msg.sender, to, amount);
-    }
-
     /// Point at the app's ERC-8004 agent card. Only callable by the app owner, and not
     /// by one banned network-wide (`PublisherSuspendedGlobal`).
-    function setAppAgentUri(bytes32 app_id, string calldata agent_uri) external onlyAppOwner(app_id) {
+    function setAppAgentUri(bytes32 app_id, string calldata agent_uri) external {
+        app_id = _onlyAppOwner(app_id);
         if (globalSuspensions[msg.sender]) revert PublisherSuspendedGlobal();
         apps[app_id].appAgentUri = agent_uri;
         emit AppAgentChanged(app_id, agent_uri);
@@ -328,12 +348,12 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// bring in anyone, which would let them keep publishing through new wallets.
     /// A publisher the app already accepted reverts `AlreadyAccepted`; one it suspended
     /// comes back with `setPublisherSuspended(…, false)`.
-    function acceptPublisher(bytes32 app_id, address publisher) external onlyAppOwner(app_id) {
+    function acceptPublisher(bytes32 app_id, address publisher) external {
+        app_id = _onlyAppOwner(app_id);
         if (globalSuspensions[msg.sender]) revert PublisherSuspendedGlobal();
         if (globalSuspensions[publisher]) revert PublisherSuspendedGlobal();
-        Status status = statusForApp[app_id][publisher];
-        if (status == Status.Active || status == Status.Suspended) revert AlreadyAccepted();
-        statusForApp[app_id][publisher] = Status.Active;
+        if (statuses[app_id][publisher] != Status.None) revert AlreadyAccepted();
+        statuses[app_id][publisher] = Status.Active;
         emit PublisherAccepted(app_id, publisher);
     }
 
@@ -347,15 +367,16 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// otherwise change the publisher's status. The owner cannot suspend themselves
     /// (`CannotSuspendOwner`): an owner's membership of their own app is not theirs to
     /// take away.
-    function setPublisherSuspended(bytes32 app_id, address publisher, bool is_suspended) external onlyAppOwner(app_id) {
-        Status status = statusForApp[app_id][publisher];
+    function setPublisherSuspended(bytes32 app_id, address publisher, bool is_suspended) external {
+        app_id = _onlyAppOwner(app_id);
+        Status status = statuses[app_id][publisher];
         if (is_suspended) {
             if (publisher == msg.sender) revert CannotSuspendOwner();
             if (status != Status.Active) revert NotAccepted();
-            statusForApp[app_id][publisher] = Status.Suspended;
+            statuses[app_id][publisher] = Status.Suspended;
         } else {
             if (status != Status.Suspended) revert PublisherNotSuspended();
-            statusForApp[app_id][publisher] = Status.Active;
+            statuses[app_id][publisher] = Status.Active;
         }
         emit PublisherSuspensionChanged(app_id, publisher, is_suspended);
     }
@@ -364,12 +385,14 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     /// Withdraw a publisher (`repo_id` and `key_id` zero), one of its repos (`key_id`
     /// zero), or one record key of a repo from the app, for all of its past. Owner only.
-    function exclude(bytes32 app_id, address publisher, bytes32 repo_id, bytes32 key_id) external onlyAppOwner(app_id) {
+    function exclude(bytes32 app_id, address publisher, bytes32 repo_id, bytes32 key_id) external {
+        app_id = _onlyAppOwner(app_id);
         _flipExclusion(app_id, publisher, repo_id, key_id, 0);
     }
 
     /// Lift an exclusion. Owner only.
-    function restore(bytes32 app_id, address publisher, bytes32 repo_id, bytes32 key_id) external onlyAppOwner(app_id) {
+    function restore(bytes32 app_id, address publisher, bytes32 repo_id, bytes32 key_id) external {
+        app_id = _onlyAppOwner(app_id);
         _flipExclusion(app_id, publisher, repo_id, key_id, 1);
     }
 
@@ -381,11 +404,21 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     // ── Views ─────────────────────────────────────────────────────────────────
 
     function appAgentUri(bytes32 app_id) external view returns (string memory) {
-        return apps[app_id].appAgentUri;
+        return apps[_canonical(app_id)].appAgentUri;
     }
 
     function isAppSuspended(bytes32 app_id) external view returns (bool) {
-        return apps[app_id].isAppSuspended;
+        return apps[_canonical(app_id)].isAppSuspended;
+    }
+
+    /// `publisher`'s standing in the app `app_id` (any id it goes by)
+    function statusForApp(bytes32 app_id, address publisher) external view returns (Status) {
+        return statuses[_canonical(app_id)][publisher];
+    }
+
+    /// Changes so far to one of the app's exclusions; odd means excluded
+    function exclusionCount(bytes32 app_id, bytes32 exclusion_id) external view returns (uint64) {
+        return exclusions[_canonical(app_id)][exclusion_id];
     }
 
     /// May `publisher` publish to the app now? True while the app has accepted it and not
@@ -394,9 +427,10 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// for a publisher: while it holds, the upload gate bills the publisher's bytes to the
     /// app, and the app presents the publisher's repos.
     function canPublish(bytes32 app_id, address publisher) public view returns (bool) {
+        app_id = _canonical(app_id);
         App storage app = apps[app_id];
         return !app.isAppSuspended && app.expiry > block.timestamp && !globalSuspensions[publisher]
-            && statusForApp[app_id][publisher] == Status.Active;
+            && statuses[app_id][publisher] == Status.Active;
     }
 
     /// The single oracle the upload gate reads: `(can_publish, owner, expires_at)`.
@@ -404,7 +438,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// `expires_at` is when the app's subscription expires; once it has passed,
     /// `can_publish` is false.
     function access(bytes32 app_id, address publisher) external view returns (bool, address, uint64) {
-        App storage app = apps[app_id];
+        App storage app = apps[_canonical(app_id)];
         return (canPublish(app_id, publisher), app.owner, app.expiry);
     }
 
@@ -506,6 +540,7 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// Admin-only. Memberships are left intact, so putting it back restores them
     /// exactly.
     function setAppSuspended(bytes32 app_id, bool is_suspended) external onlyAdmin {
+        app_id = _canonical(app_id);
         App storage app = apps[app_id];
         if (app.owner == address(0)) revert AppNotFound();
         app.isAppSuspended = is_suspended;
@@ -525,12 +560,8 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
 
     /// Send `amount` of an ERC-20 the contract holds to `to`: the collected subscription
     /// fees (USDC), or any token sent here by mistake, including one that returns no
-    /// value from `transfer`. Of USDC, only the protocol's share can be taken: the
-    /// contract's balance less the join fees owed to app owners (`ExceedsProtocolBalance`).
+    /// value from `transfer`.
     function withdrawToken(address token, address to, uint256 amount) external nonReentrant onlyAdmin {
-        if (token == usdc && IERC20(usdc).balanceOf(address(this)) < totalJoinFeesOwed + amount) {
-            revert ExceedsProtocolBalance();
-        }
         if (!IERC20(token).trySafeTransfer(to, amount)) revert TransferFailed();
         emit TokenWithdrawn(token, to, amount);
     }
@@ -542,11 +573,19 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
         _;
     }
 
-    modifier onlyAppOwner(bytes32 app_id) {
+    /// Resolve `app_id` to the app's canonical id, and require the caller to own it.
+    function _onlyAppOwner(bytes32 app_id) private view returns (bytes32) {
+        app_id = _canonical(app_id);
         address owner = apps[app_id].owner;
         if (owner == address(0)) revert AppNotFound();
         if (msg.sender != owner) revert Unauthorized();
-        _;
+        return app_id;
+    }
+
+    /// The canonical id of the app going by `app_id`, or `app_id` if it is no alias.
+    function _canonical(bytes32 app_id) private view returns (bytes32) {
+        bytes32 canonical = canonicalOf[app_id];
+        return canonical == bytes32(0) ? app_id : canonical;
     }
 
     /// lsit out all apps by a given owner
@@ -572,12 +611,12 @@ contract AppRegistry is Initializable, UUPSUpgradeable, ERC721Upgradeable, Reent
     /// exclude needs an even count, restore an odd one; both add one.
     function _flipExclusion(bytes32 app_id, address publisher, bytes32 repo_id, bytes32 key_id, uint64 parity) private {
         bytes32 xid = exclusionId(publisher, repo_id, key_id);
-        uint64 n = exclusionCount[app_id][xid];
+        uint64 n = exclusions[app_id][xid];
         if (n % 2 != parity) {
             if (parity == 0) revert AlreadyExcluded();
             revert NotExcluded();
         }
-        exclusionCount[app_id][xid] = n + 1;
+        exclusions[app_id][xid] = n + 1;
         emit ExclusionChanged(app_id, publisher, xid, repo_id, key_id, n + 1);
     }
 

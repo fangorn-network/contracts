@@ -39,14 +39,8 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
         bytes32 head;
     }
 
-    /// Protocol admin: upgrades, and repoints the AppRegistry
+    /// Protocol admin: upgrades
     address public admin;
-    /// The AppRegistry this one was deployed with. Nothing here calls it any more; kept
-    /// so that storage stays append-only.
-    address public appRegistry;
-    /// Retired: heads keyed by app, from when a repo lived under one app. Kept so that
-    /// storage stays append-only.
-    mapping(bytes32 => bytes32) internal namespaceHeads;
     /// publisher => keccak256(repo) => (position, head); (0, 0) for a repo never written
     mapping(address => mapping(bytes32 => Head)) internal heads;
 
@@ -59,9 +53,8 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
 
     /// Takes the place of a constructor: runs once, in the proxy's storage, as part of
     /// the proxy's deployment.
-    function initialize(address admin_, address appRegistry_) external initializer {
+    function initialize(address admin_) external initializer {
         admin = admin_;
-        appRegistry = appRegistry_;
     }
 
     /// Move the sender's `repo` from `parent` to `head`. Reverts `StaleStateRoot` unless
@@ -81,11 +74,6 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
     function getHead(address publisher, bytes32 repo_id) external view returns (uint64 pos, bytes32 head) {
         Head storage h = heads[publisher][repo_id];
         return (h.pos, h.head);
-    }
-
-    /// Repoint the AppRegistry this one names.
-    function setAppRegistry(address registry) external onlyAdmin {
-        appRegistry = registry;
     }
 
     /// Hand the admin role to another address. The admin is also who may upgrade this

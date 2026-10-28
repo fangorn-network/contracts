@@ -18,12 +18,11 @@ import {Options} from "openzeppelin-foundry-upgrades/Options.sol";
 ///   2. `forge script script/Upgrade.s.sol --force …` upgrades whatever changed.
 ///      It records the build of the new version next to the old one. Commit it.
 library Deployments {
-    uint256 internal constant ARBITRUM_SEPOLIA = 421614;
     uint256 internal constant BASE_SEPOLIA = 84532;
 
     /// Every chain the contracts are deployed on, or may be.
-    function chains() internal pure returns (uint256[2] memory) {
-        return [ARBITRUM_SEPOLIA, BASE_SEPOLIA];
+    function chains() internal pure returns (uint256[1] memory) {
+        return [BASE_SEPOLIA];
     }
 
     /// Each contract's source: what a new proxy is deployed with, and what an existing
@@ -60,18 +59,11 @@ library Deployments {
     function recorded(string memory name, uint256 chainId) internal pure returns (address) {
         current(name); // an unknown name is a different mistake from a missing address
         bytes32 n = keccak256(bytes(name));
-        if (chainId == ARBITRUM_SEPOLIA) {
-            // Deployed with Deploy.s.sol all(); the AppRegistry's proxy was created in
-            // block 319536642.
-            if (n == keccak256("AppRegistry")) return 0x55e6209ea1833ceD900989a3b3b22466934E04A5;
-            if (n == keccak256("DataRegistry")) return 0x72B5f83526F3893aF9f1eE0f32A27218EA09f8aE;
-            if (n == keccak256("MembershipRegistry")) return 0xDF17030Cd65435C86eb043F31DDACa99E819E347;
-        }
         if (chainId == BASE_SEPOLIA) {
-            // Deployed with Deploy.s.sol all(), in block 48340483.
-            if (n == keccak256("AppRegistry")) return 0x0D3e98399df41b558048Cdd7D71723c37A3A9D6F;
-            if (n == keccak256("DataRegistry")) return 0xE9183f768865dd2Cde5f1B71F8446F0Cd798ebe0;
-            if (n == keccak256("MembershipRegistry")) return 0x0e96C012b5c53622EcDAA82F342E31C2623A04f5;
+            // Deployed with Deploy.s.sol all(), in block 51469588.
+            if (n == keccak256("AppRegistry")) return 0x6E07C2c7393963242899e5Fb0eb1B6B787927E81;
+            if (n == keccak256("DataRegistry")) return 0x7a34882568f1b22FC4C4944113B1E4Ca4cF6900f;
+            if (n == keccak256("MembershipRegistry")) return 0x9De2C2A6261927f91b246C73e7ca86824a357FA6;
         }
         return address(0);
     }

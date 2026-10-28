@@ -17,7 +17,6 @@ contract DataRegistryUpgradeMock is DataRegistry {
 contract DataRegistryTest is Test {
     address constant ADMIN = 0x1111111111111111111111111111111111111111;
     address constant PUB = 0x2222222222222222222222222222222222222222;
-    address constant APPS = 0x3333333333333333333333333333333333333333;
     bytes32 constant ROOT_A = bytes32(uint256(5));
     bytes32 constant ROOT_B = bytes32(uint256(6));
 
@@ -28,7 +27,7 @@ contract DataRegistryTest is Test {
     DataRegistry registry;
 
     function setUp() public {
-        registry = Proxied.dataRegistry(ADMIN, APPS);
+        registry = Proxied.dataRegistry(ADMIN);
     }
 
     function update(address who, string memory repo, bytes32 parent, bytes32 head) internal {
@@ -42,7 +41,6 @@ contract DataRegistryTest is Test {
 
     function test_initialization() public view {
         assertEq(registry.admin(), ADMIN);
-        assertEq(registry.appRegistry(), APPS);
     }
 
     /// Any address updates its own repos, with no app and no registration.
@@ -92,17 +90,6 @@ contract DataRegistryTest is Test {
         registry.update("a", bytes32(0), bytes32(0));
     }
 
-    /// Only the admin repoints the AppRegistry it names.
-    function test_only_the_admin_repoints_the_app_registry() public {
-        vm.prank(PUB);
-        vm.expectRevert(DataRegistry.Unauthorized.selector);
-        registry.setAppRegistry(PUB);
-
-        vm.prank(ADMIN);
-        registry.setAppRegistry(PUB);
-        assertEq(registry.appRegistry(), PUB);
-    }
-
     // ── upgrades ──────────────────────────────────────────────────────────────
 
     /// A new implementation takes over the same address and the same state — every
@@ -120,7 +107,6 @@ contract DataRegistryTest is Test {
 
         assertEq(DataRegistryUpgradeMock(address(registry)).version(), 2);
         assertEq(registry.admin(), ADMIN);
-        assertEq(registry.appRegistry(), APPS);
         (, bytes32 head) = headOf(PUB, "a");
         assertEq(head, ROOT_A);
 
@@ -134,11 +120,11 @@ contract DataRegistryTest is Test {
     /// on the bare implementation, which nobody should be able to take over.
     function test_initialize_runs_once_and_never_on_the_implementation() public {
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        registry.initialize(PUB, APPS);
+        registry.initialize(PUB);
 
         DataRegistry implementation = new DataRegistry();
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        implementation.initialize(PUB, APPS);
+        implementation.initialize(PUB);
     }
 
     /// The admin role moves, and the right to upgrade moves with it.
