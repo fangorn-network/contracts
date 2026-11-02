@@ -1,10 +1,10 @@
 # Fangorn contracts
 
-The three core Fangorn contracts, in Solidity: the DataRegistry, the SettlementRegistry and the AppRegistry. Sources, tests and scripts are in `solidity/`.
+The two core Fangorn contracts, in Solidity: the DataRegistry and the SettlementRegistry. Sources, tests and scripts are in `solidity/`.
 
 **The contracts are upgradeable.** Each is behind its own ERC-1967 proxy (UUPS). See *Deploy and upgrade*.
 
-Almost nothing lives on-chain. A publisher's repo is `(publisher, name)`, and its head is one `bytes32` in the DataRegistry: the name of its latest commit. The data is content-addressed and stored off-chain. A repo belongs to no app: an app is a curator's repo of citations, and the AppRegistry only names it.
+Almost nothing lives on-chain. A publisher's repo is `(publisher, name)`, and its head is one `bytes32` in the DataRegistry: the name of its latest commit. The data is content-addressed and stored off-chain.
 
 ## Deployed
 
@@ -12,7 +12,6 @@ Use the proxy addresses: an upgrade only changes the implementation behind them.
 
 | Contract           | Base Sepolia (84532)                         |
 | ------------------ | -------------------------------------------- |
-| AppRegistry        | `0x197A44c42276F31DC2CeA34C138380a59A28D1C0` |
 | DataRegistry       | `0x0F3eb0E62CF610dbaC6B3aD4Bf4cE38Ab50EBCC5` |
 | SettlementRegistry | `0x61A5A195B54F57ada786Ba6689CdB04553cf7fBc` |
 | Admin (wallet)     | `0x7b16387C5A8c514880E48bcacd52782FCF9Da936` |
@@ -27,11 +26,9 @@ Use the proxy addresses: an upgrade only changes the implementation behind them.
   Buyer ── register(terms, sig, pay) ──▶ SettlementRegistry  USDC split publisher / referrer
        ── settle(proof, reader)                               Semaphore group per subject
   Access worker ── canRead(reader, P, repo, key)
-
-  Curator ── registerApp / setCurator ──▶ AppRegistry        app id → curator repo, payout, agent card
 ```
 
-No contract calls another. A referrer in the SettlementRegistry is an address; clients pass an app's `payoutOf`.
+No contract calls another. A referrer in the SettlementRegistry is an address.
 
 ## Layout
 
@@ -39,7 +36,6 @@ No contract calls another. A referrer in the SettlementRegistry is an address; c
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `solidity/src/DataRegistry.sol`     | DataRegistry                                                                                                 |
 | `solidity/src/SettlementRegistry.sol` | SettlementRegistry                                                                                         |
-| `solidity/src/AppRegistry.sol`      | AppRegistry                                                                                                  |
 | `solidity/test/`                    | Foundry tests and mocks                                                                                      |
 | `solidity/script/Deploy.s.sol`      | Deploys the contracts behind their own UUPS proxy                                                            |
 | `solidity/script/Upgrade.s.sol`     | Admin: upgrade a deployed contract in place                                                                  |
@@ -51,7 +47,7 @@ No contract calls another. A referrer in the SettlementRegistry is an address; c
 
 ## Common to the contracts
 
-- *Names.* Functions are `camelCase`. Arguments and event fields are `snake_case` (`app_id`, `repo_id`).
+- *Names.* Functions are `camelCase`. Arguments and event fields are `snake_case` (`repo_id`, `new_admin`).
 - *Reentrancy.* Functions that move funds use OpenZeppelin's `ReentrancyGuardTransient`.
 - *Upgradeability.* Each contract takes its initial arguments through `initialize(…)` and has `upgradeToAndCall`, `proxiableUUID` and `UPGRADE_INTERFACE_VERSION`.
 - *Admin.* One address per contract, which is also who may upgrade it. `setAdmin(new_admin)` hands the role over and emits `AdminChanged`. Setting zero **renounces the role and permanently stops upgrades**.
@@ -77,19 +73,6 @@ Sells read access to a *subject* `(publisher, repo, key)`: `repo` is `keccak256`
 - Views: `subjectOf`, `registerNonce`, `hashTerms`, `generationOf`, `isDenied`, `isDisabled`, `groupOf`, `isRegistered`, `isSettled`, `usdc`, `semaphore`, `admin`.
 - `initialize(admin, usdc, semaphore)`.
 
-## AppRegistry
-
-Names apps. An app is a curator's repo of citations in the DataRegistry; this contract maps a short id to that repo, to the address paid when the app refers a sale, and to its ERC-8004 agent card. It decides nothing about data. Registering is free.
-
-- `registerApp(app_id)`: first come, first served. Reverts `ZeroAppId`, or `AppAlreadyRegistered` for an id any app goes by.
-- `setCurator(app_id, curator, repo)`, `setPayout(app_id, payout)`, `setAppAgentUri(app_id, uri)`: owner only. `curatorOf` and `payoutOf` fall back to the owner when unset.
-- `renameApp(app_id, new_id)`: owner only. `new_id` becomes an alias of the id the app was registered under, and **every function taking an `app_id` accepts any id the app has gone by**. Events and listings keep the canonical id; `currentAppId` gives the id it goes by now, `canonicalAppId` the one it was registered under.
-- Views: `getAppOwner`, `curatorOf`, `payoutOf`, `appAgentUri`, `isAppSuspended`, `appCount`, `appsPage(offset, limit)`, `appsOf(owner)`, `dataRegistry`, `admin`.
-- Admin: `setAppSuspended(app_id, bool)` (takedown of the name), `setDataRegistry`, `withdrawToken`.
-- `initialize(admin)`.
-
-Storage from earlier versions is kept, unused, so the deployed proxy upgrades in place.
-
 ## Build and test
 
 ```sh
@@ -109,7 +92,7 @@ USDC and Semaphore are mocks. Every test deploys its contracts behind a proxy, a
 ## Generate ABI
 
 ```sh
-(cd solidity && forge inspect src/AppRegistry.sol:AppRegistry abi --json)
+(cd solidity && forge inspect src/DataRegistry.sol:DataRegistry abi --json)
 ```
 
 When a contract's ABI changes, clients need the new ABI.
@@ -169,7 +152,7 @@ Between merging a change and running its upgrade, `src/` is ahead of the chain. 
 
 **Storage is append-only.** The proxy keeps its storage, so the new code must read every existing slot the way the old code wrote it:
 
-- Add state variables after the last one. Add struct fields at the end of the struct (`App` is only ever a mapping value, so it can grow).
+- Add state variables after the last one. Add struct fields at the end of the struct (a struct that is only ever a mapping value can grow).
 - Never reorder, retype or remove a state variable or a struct field, and do not change the order of the contracts a registry inherits from.
 - A constructor or an initial value on a state variable never reaches the proxy. New state that needs a starting value gets a `reinitializer(n)` function. Pass the call to it as a second argument and it runs in the upgrade transaction: `--sig "upgrade(string,bytes)" DataRegistry $(cast calldata "initializeV2()")`.
 
@@ -196,16 +179,15 @@ forge script script/Deploy.s.sol --force --sig "all()" \
   --rpc-url <rpc> --account <keystore> --sender <deployer> --broadcast
 ```
 
-| `--sig`                                       | Deploys                                                                                |
-| --------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `"all()"`                                     | Every registry, the AppRegistry naming the DataRegistry                                |
-| `"appRegistry(address)" <DataRegistry>`       | A new AppRegistry naming an existing DataRegistry                                      |
-| `"dataRegistry(address)" <AppRegistry>`       | A new DataRegistry, which an existing AppRegistry is repointed at                      |
-| `"settlementRegistry()"`                      | A SettlementRegistry                                                                   |
+| `--sig`                  | Deploys              |
+| ------------------------ | -------------------- |
+| `"all()"`                | Every registry       |
+| `"dataRegistry()"`       | A DataRegistry       |
+| `"settlementRegistry()"` | A SettlementRegistry |
 
 Parameters are environment variables, with defaults in `solidity/.env.example` (Forge reads `solidity/.env`):
 
-- `ADMIN_ADDR`: required. For `all()`, `appRegistry()` and `dataRegistry()` it must be the signer, because the wiring calls are admin-only.
+- `ADMIN_ADDR`: required.
 - `USDC_ADDR`, `SEMAPHORE_ADDR`: default to Base Sepolia's; required on any other chain.
 
 Afterwards:

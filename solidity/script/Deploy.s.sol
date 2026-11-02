@@ -4,7 +4,6 @@ pragma solidity ^0.8.24;
 import {console} from "forge-std/Script.sol";
 import {VmSafe} from "forge-std/Vm.sol";
 import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
-import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
 import {SettlementRegistry} from "../src/SettlementRegistry.sol";
 import {Builds} from "./Builds.sol";
@@ -17,12 +16,8 @@ import {Deployments} from "./Deployments.sol";
 ///
 /// `--force` is not optional: the upgrade-safety check needs a full build.
 ///
-///   all()                               every registry, the AppRegistry naming the
-///                                       DataRegistry
-///   appRegistry(address dataRegistry)   a new AppRegistry naming an existing
-///                                       DataRegistry
-///   dataRegistry(address appRegistry)   a new DataRegistry behind an existing
-///                                       AppRegistry, which is repointed at it
+///   all()                 every registry
+///   dataRegistry()
 ///   settlementRegistry()
 ///
 /// With --broadcast, each new contract's build is written under
@@ -34,13 +29,11 @@ import {Deployments} from "./Deployments.sol";
 /// Upgrade.s.sol: it keeps the address and the state. A redeploy starts empty at a new
 /// address.
 ///
-/// The whole run is simulated before anything is sent, so a failed check below, or a
-/// signer who is not the admin, stops it with nothing deployed.
+/// The whole run is simulated before anything is sent, so a failed check below stops it
+/// with nothing deployed.
 ///
 /// Parameters are environment variables (Forge also reads a `.env` in this directory):
-///   ADMIN_ADDR              required. Takedowns and upgrades. For all(),
-///                           appRegistry() and dataRegistry() it must be the signer,
-///                           because the wiring calls are admin-only.
+///   ADMIN_ADDR              required. Takedowns and upgrades.
 ///   USDC_ADDR, SEMAPHORE_ADDR
 ///                           default to Base Sepolia's; required on any other chain
 contract Deploy is Builds {
@@ -51,39 +44,21 @@ contract Deploy is Builds {
     function all() external {
         address admin = _admin();
         vm.startBroadcast();
-        AppRegistry apps = _deployAppRegistry(admin);
         DataRegistry data = _deployDataRegistry(admin);
-        apps.setDataRegistry(address(data));
         address settlement = _deploySettlementRegistry(admin);
         vm.stopBroadcast();
-        _report(apps, data);
+        _report(data);
         _reportSettlement(settlement, admin);
-        _recordBuild("AppRegistry", address(apps));
         _recordBuild("DataRegistry", address(data));
         _recordBuild("SettlementRegistry", settlement);
     }
 
-    function appRegistry(address dataRegistry_) external {
+    function dataRegistry() external {
         address admin = _admin();
-        DataRegistry data = DataRegistry(dataRegistry_);
         vm.startBroadcast();
-        AppRegistry apps = _deployAppRegistry(admin);
-        // Repo heads stay; apps do not carry over.
-        apps.setDataRegistry(dataRegistry_);
-        vm.stopBroadcast();
-        _report(apps, data);
-        _recordBuild("AppRegistry", address(apps));
-    }
-
-    function dataRegistry(address appRegistry_) external {
-        address admin = _admin();
-        AppRegistry apps = AppRegistry(appRegistry_);
-        vm.startBroadcast();
-        // Repo heads do not carry over.
         DataRegistry data = _deployDataRegistry(admin);
-        apps.setDataRegistry(address(data));
         vm.stopBroadcast();
-        _report(apps, data);
+        _report(data);
         _recordBuild("DataRegistry", address(data));
     }
 
@@ -98,16 +73,6 @@ contract Deploy is Builds {
     }
 
     // ── Steps ─────────────────────────────────────────────────────────────────
-
-    function _deployAppRegistry(address admin) internal returns (AppRegistry) {
-        return AppRegistry(
-            Upgrades.deployUUPSProxy(
-                Deployments.APP_REGISTRY,
-                abi.encodeCall(AppRegistry.initialize, (admin)),
-                Deployments.options("AppRegistry")
-            )
-        );
-    }
 
     function _deployDataRegistry(address admin) internal returns (DataRegistry) {
         return DataRegistry(
@@ -127,12 +92,8 @@ contract Deploy is Builds {
         );
     }
 
-    function _report(AppRegistry apps, DataRegistry data) internal view {
-        address admin = _admin();
-        require(apps.admin() == admin, "AppRegistry admin");
-        require(data.admin() == admin, "DataRegistry admin");
-        require(apps.dataRegistry() == address(data), "AppRegistry does not point at the DataRegistry");
-        console.log("AppRegistry:  %s", address(apps));
+    function _report(DataRegistry data) internal view {
+        require(data.admin() == _admin(), "DataRegistry admin");
         console.log("DataRegistry: %s", address(data));
         console.log("Record the new address(es) in script/Deployments.sol.");
     }
@@ -156,7 +117,7 @@ contract Deploy is Builds {
 
     // ── Parameters ────────────────────────────────────────────────────────────
 
-    /// No default: the admin can take apps down and upgrade the contracts,
+    /// No default: the admin can take subjects down and upgrade the contracts,
     /// so it is never chosen for the caller. Zero is refused: nobody could upgrade.
     function _admin() internal view returns (address admin) {
         admin = vm.envAddress("ADMIN_ADDR");

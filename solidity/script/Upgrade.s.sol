@@ -14,7 +14,7 @@ import {Deployments} from "./Deployments.sol";
 ///
 /// upgrades every contract whose code changed since it was deployed, and leaves the rest.
 /// To upgrade one contract only, add `--sig "upgrade(string)" <name>`, where `<name>` is
-/// AppRegistry, DataRegistry or SettlementRegistry. Contracts not
+/// DataRegistry or SettlementRegistry. Contracts not
 /// yet deployed on the chain are skipped.
 ///
 /// `--force` is not optional: the upgrade-safety check needs a full build.
@@ -41,7 +41,7 @@ import {Deployments} from "./Deployments.sol";
 contract Upgrade is Builds {
     /// Upgrades every contract whose code in `src/` is not the live code.
     function run() external {
-        string[3] memory names = Deployments.names();
+        string[2] memory names = Deployments.names();
         for (uint256 i = 0; i < names.length; i++) {
             if (Deployments.recorded(names[i], block.chainid) == address(0)) continue;
             address live = Upgrades.getImplementationAddress(Deployments.proxy(names[i], block.chainid));
@@ -86,7 +86,7 @@ contract Upgrade is Builds {
     /// Confirms that every build under `deployed/` is the code that is live on this
     /// chain. Sends nothing and needs no signer.
     function check() external view {
-        string[3] memory names = Deployments.names();
+        string[2] memory names = Deployments.names();
         for (uint256 i = 0; i < names.length; i++) {
             if (Deployments.recorded(names[i], block.chainid) == address(0)) continue;
             address implementation = Upgrades.getImplementationAddress(Deployments.proxy(names[i], block.chainid));

@@ -28,7 +28,6 @@ library Deployments {
     /// Each contract's source: what a new proxy is deployed with, and what an existing
     /// proxy is upgraded to. Written as `File.sol:Contract`, because a file that also
     /// declares interfaces has more than one artifact.
-    string internal constant APP_REGISTRY = "AppRegistry.sol:AppRegistry";
     string internal constant DATA_REGISTRY = "DataRegistry.sol:DataRegistry";
     string internal constant SETTLEMENT_REGISTRY = "SettlementRegistry.sol:SettlementRegistry";
 
@@ -36,14 +35,13 @@ library Deployments {
     error NoProxyRecorded(string name, uint256 chainId);
 
     /// Every contract that sits behind a proxy, by the name the scripts take.
-    function names() internal pure returns (string[3] memory) {
-        return ["AppRegistry", "DataRegistry", "SettlementRegistry"];
+    function names() internal pure returns (string[2] memory) {
+        return ["DataRegistry", "SettlementRegistry"];
     }
 
     /// The artifact of `name`, built from its source in `src/`.
     function current(string memory name) internal pure returns (string memory) {
         bytes32 n = keccak256(bytes(name));
-        if (n == keccak256("AppRegistry")) return APP_REGISTRY;
         if (n == keccak256("DataRegistry")) return DATA_REGISTRY;
         if (n == keccak256("SettlementRegistry")) return SETTLEMENT_REGISTRY;
         revert UnknownContract(name);
@@ -61,7 +59,6 @@ library Deployments {
         bytes32 n = keccak256(bytes(name));
         if (chainId == BASE_SEPOLIA) {
             // Deployed with Deploy.s.sol all(), in blocks 53592845 to 53592851.
-            if (n == keccak256("AppRegistry")) return 0x197A44c42276F31DC2CeA34C138380a59A28D1C0;
             if (n == keccak256("DataRegistry")) return 0x0F3eb0E62CF610dbaC6B3aD4Bf4cE38Ab50EBCC5;
             if (n == keccak256("SettlementRegistry")) return 0x61A5A195B54F57ada786Ba6689CdB04553cf7fBc;
         }

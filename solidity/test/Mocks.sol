@@ -2,7 +2,6 @@
 pragma solidity ^0.8.24;
 
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
 
 /// A fee token that records what it was asked to move and can be told to refuse.
@@ -151,11 +150,6 @@ contract MockSemaphore {
 /// proxy that initializes it. What comes back is the proxy, so every test runs against
 /// proxy storage.
 library Proxied {
-    function appRegistry(address admin) internal returns (AppRegistry) {
-        bytes memory init = abi.encodeCall(AppRegistry.initialize, (admin));
-        return AppRegistry(address(new ERC1967Proxy(address(new AppRegistry()), init)));
-    }
-
     function dataRegistry(address admin) internal returns (DataRegistry) {
         bytes memory init = abi.encodeCall(DataRegistry.initialize, (admin));
         return DataRegistry(address(new ERC1967Proxy(address(new DataRegistry()), init)));
