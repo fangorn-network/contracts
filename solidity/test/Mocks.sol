@@ -147,47 +147,12 @@ contract MockSemaphore {
     }
 }
 
-/// A Semaphore whose createGroup returns 8 bytes instead of a uint256.
-contract ShortSemaphore {
-    fallback() external {
-        assembly {
-            return(0, 8)
-        }
-    }
-}
-
-/// An afterSettle hook that records what it was handed and can be told to fail.
-contract MockHook {
-    bool public fail;
-    uint256 public calls;
-    bytes32 public lastResource;
-    uint256 public lastNullifier;
-    uint256 public lastMessage;
-    bytes public lastData;
-
-    function setFail(bool f) external {
-        fail = f;
-    }
-
-    function afterSettle(bytes32 resourceId, uint256 nullifierHash, uint256 message, bytes calldata data) external {
-        require(!fail, "hook: no");
-        calls += 1;
-        lastResource = resourceId;
-        lastNullifier = nullifierHash;
-        lastMessage = message;
-        lastData = data;
-    }
-}
-
 /// Deploys each registry the way `deploy.sh` does: an implementation, and the ERC-1967
 /// proxy that initializes it. What comes back is the proxy, so every test runs against
 /// proxy storage.
 library Proxied {
-    function appRegistry(address admin, address usdc, uint256 subscriptionFee, uint64 subscriptionPeriod)
-        internal
-        returns (AppRegistry)
-    {
-        bytes memory init = abi.encodeCall(AppRegistry.initialize, (admin, usdc, subscriptionFee, subscriptionPeriod));
+    function appRegistry(address admin) internal returns (AppRegistry) {
+        bytes memory init = abi.encodeCall(AppRegistry.initialize, (admin));
         return AppRegistry(address(new ERC1967Proxy(address(new AppRegistry()), init)));
     }
 

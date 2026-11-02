@@ -6,7 +6,7 @@ import {VmSafe} from "forge-std/Vm.sol";
 import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
 import {AppRegistry} from "../src/AppRegistry.sol";
 import {DataRegistry} from "../src/DataRegistry.sol";
-import {MembershipRegistry} from "../src/MembershipRegistry.sol";
+import {SettlementRegistry} from "../src/SettlementRegistry.sol";
 import {Builds} from "./Builds.sol";
 import {Deployments} from "./Deployments.sol";
 
@@ -17,13 +17,13 @@ import {Deployments} from "./Deployments.sol";
 ///
 /// `--force` is not optional: the upgrade-safety check needs a full build.
 ///
-///   all()                               all three registries, the AppRegistry naming
-///                                       the DataRegistry
+///   all()                               every registry, the AppRegistry naming the
+///                                       DataRegistry
 ///   appRegistry(address dataRegistry)   a new AppRegistry naming an existing
 ///                                       DataRegistry
 ///   dataRegistry(address appRegistry)   a new DataRegistry behind an existing
 ///                                       AppRegistry, which is repointed at it
-///   membershipRegistry(address appRegistry)
+///   settlementRegistry()
 ///
 /// With --broadcast, each new contract's build is written under
 /// `deployed/<chain id>/<Contract>/<implementation address>/`, replacing any older build of it: the
@@ -38,13 +38,11 @@ import {Deployments} from "./Deployments.sol";
 /// signer who is not the admin, stops it with nothing deployed.
 ///
 /// Parameters are environment variables (Forge also reads a `.env` in this directory):
-///   ADMIN_ADDR              required. Fees, bans, takedowns and upgrades. For all(),
+///   ADMIN_ADDR              required. Takedowns and upgrades. For all(),
 ///                           appRegistry() and dataRegistry() it must be the signer,
 ///                           because the wiring calls are admin-only.
 ///   USDC_ADDR, SEMAPHORE_ADDR
 ///                           default to Base Sepolia's; required on any other chain
-///   SUBSCRIPTION_FEE        claiming an app, in USDC base units. Default 0
-///   SUBSCRIPTION_PERIOD     how long one payment lasts, in seconds. Default 30 days
 contract Deploy is Builds {
     address internal constant BASE_SEPOLIA_USDC = 0x036CbD53842c5426634e7929541eC2318f3dCF7e;
     /// Semaphore v4
@@ -56,13 +54,13 @@ contract Deploy is Builds {
         AppRegistry apps = _deployAppRegistry(admin);
         DataRegistry data = _deployDataRegistry(admin);
         apps.setDataRegistry(address(data));
-        address membership = _deployMembershipRegistry(admin, address(apps));
+        address settlement = _deploySettlementRegistry(admin);
         vm.stopBroadcast();
         _report(apps, data);
-        _reportMembership(membership, admin, address(apps));
+        _reportSettlement(settlement, admin);
         _recordBuild("AppRegistry", address(apps));
         _recordBuild("DataRegistry", address(data));
-        _recordBuild("MembershipRegistry", membership);
+        _recordBuild("SettlementRegistry", settlement);
     }
 
     function appRegistry(address dataRegistry_) external {
@@ -70,7 +68,7 @@ contract Deploy is Builds {
         DataRegistry data = DataRegistry(dataRegistry_);
         vm.startBroadcast();
         AppRegistry apps = _deployAppRegistry(admin);
-        // Repo heads stay; apps, memberships and bans do not carry over.
+        // Repo heads stay; apps do not carry over.
         apps.setDataRegistry(dataRegistry_);
         vm.stopBroadcast();
         _report(apps, data);
@@ -89,17 +87,14 @@ contract Deploy is Builds {
         _recordBuild("DataRegistry", address(data));
     }
 
-    /// The AppRegistry is an argument, not a default: the MembershipRegistry has no
-    /// setter for it, and it decides who may set an app's plan and who is paid.
-    function membershipRegistry(address appRegistry_) external {
+    function settlementRegistry() external {
         address admin = _admin();
-        require(appRegistry_.code.length != 0, "appRegistry has no code on this chain");
         vm.startBroadcast();
-        address proxy = _deployMembershipRegistry(admin, appRegistry_);
+        address proxy = _deploySettlementRegistry(admin);
         vm.stopBroadcast();
-        _reportMembership(proxy, admin, appRegistry_);
+        _reportSettlement(proxy, admin);
         console.log("Record it in script/Deployments.sol.");
-        _recordBuild("MembershipRegistry", proxy);
+        _recordBuild("SettlementRegistry", proxy);
     }
 
     // ── Steps ─────────────────────────────────────────────────────────────────
@@ -108,15 +103,7 @@ contract Deploy is Builds {
         return AppRegistry(
             Upgrades.deployUUPSProxy(
                 Deployments.APP_REGISTRY,
-                abi.encodeCall(
-                    AppRegistry.initialize,
-                    (
-                        admin,
-                        _usdc(),
-                        vm.envOr("SUBSCRIPTION_FEE", uint256(0)),
-                        uint64(vm.envOr("SUBSCRIPTION_PERIOD", uint256(30 days)))
-                    )
-                ),
+                abi.encodeCall(AppRegistry.initialize, (admin)),
                 Deployments.options("AppRegistry")
             )
         );
@@ -132,11 +119,11 @@ contract Deploy is Builds {
         );
     }
 
-    function _deployMembershipRegistry(address admin, address appRegistry_) internal returns (address) {
+    function _deploySettlementRegistry(address admin) internal returns (address) {
         return Upgrades.deployUUPSProxy(
-            Deployments.MEMBERSHIP_REGISTRY,
-            abi.encodeCall(MembershipRegistry.initialize, (admin, _usdc(), _semaphore(), appRegistry_)),
-            Deployments.options("MembershipRegistry")
+            Deployments.SETTLEMENT_REGISTRY,
+            abi.encodeCall(SettlementRegistry.initialize, (admin, _usdc(), _semaphore())),
+            Deployments.options("SettlementRegistry")
         );
     }
 
@@ -150,11 +137,12 @@ contract Deploy is Builds {
         console.log("Record the new address(es) in script/Deployments.sol.");
     }
 
-    function _reportMembership(address proxy, address admin, address appRegistry_) internal view {
-        MembershipRegistry membership = MembershipRegistry(proxy);
-        require(membership.admin() == admin, "MembershipRegistry admin");
-        require(membership.appRegistry() == appRegistry_, "MembershipRegistry appRegistry");
-        console.log("MembershipRegistry: %s", proxy);
+    function _reportSettlement(address proxy, address admin) internal view {
+        SettlementRegistry settlement = SettlementRegistry(proxy);
+        require(settlement.admin() == admin, "SettlementRegistry admin");
+        require(settlement.usdc() == _usdc(), "SettlementRegistry usdc");
+        require(settlement.semaphore() == _semaphore(), "SettlementRegistry semaphore");
+        console.log("SettlementRegistry: %s", proxy);
     }
 
     /// With --broadcast, writes the build of `proxy`'s implementation under `deployed/`
@@ -168,7 +156,7 @@ contract Deploy is Builds {
 
     // ── Parameters ────────────────────────────────────────────────────────────
 
-    /// No default: the admin can change fees, take apps down and upgrade the contracts,
+    /// No default: the admin can take apps down and upgrade the contracts,
     /// so it is never chosen for the caller. Zero is refused: nobody could upgrade.
     function _admin() internal view returns (address admin) {
         admin = vm.envAddress("ADMIN_ADDR");

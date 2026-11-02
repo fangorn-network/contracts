@@ -14,7 +14,8 @@ import {Deployments} from "./Deployments.sol";
 ///
 /// upgrades every contract whose code changed since it was deployed, and leaves the rest.
 /// To upgrade one contract only, add `--sig "upgrade(string)" <name>`, where `<name>` is
-/// AppRegistry, DataRegistry or MembershipRegistry.
+/// AppRegistry, DataRegistry or SettlementRegistry. Contracts not
+/// yet deployed on the chain are skipped.
 ///
 /// `--force` is not optional: the upgrade-safety check needs a full build.
 ///
@@ -42,6 +43,7 @@ contract Upgrade is Builds {
     function run() external {
         string[3] memory names = Deployments.names();
         for (uint256 i = 0; i < names.length; i++) {
+            if (Deployments.recorded(names[i], block.chainid) == address(0)) continue;
             address live = Upgrades.getImplementationAddress(Deployments.proxy(names[i], block.chainid));
             _requireReferenceIsLive(names[i], live);
             if (_isUpToDate(names[i], live)) {
@@ -86,6 +88,7 @@ contract Upgrade is Builds {
     function check() external view {
         string[3] memory names = Deployments.names();
         for (uint256 i = 0; i < names.length; i++) {
+            if (Deployments.recorded(names[i], block.chainid) == address(0)) continue;
             address implementation = Upgrades.getImplementationAddress(Deployments.proxy(names[i], block.chainid));
             _requireReferenceIsLive(names[i], implementation);
             console.log("%s is the code at %s", _builds(names[i]), implementation);

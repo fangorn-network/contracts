@@ -30,14 +30,14 @@ library Deployments {
     /// declares interfaces has more than one artifact.
     string internal constant APP_REGISTRY = "AppRegistry.sol:AppRegistry";
     string internal constant DATA_REGISTRY = "DataRegistry.sol:DataRegistry";
-    string internal constant MEMBERSHIP_REGISTRY = "MembershipRegistry.sol:MembershipRegistry";
+    string internal constant SETTLEMENT_REGISTRY = "SettlementRegistry.sol:SettlementRegistry";
 
     error UnknownContract(string name);
     error NoProxyRecorded(string name, uint256 chainId);
 
     /// Every contract that sits behind a proxy, by the name the scripts take.
     function names() internal pure returns (string[3] memory) {
-        return ["AppRegistry", "DataRegistry", "MembershipRegistry"];
+        return ["AppRegistry", "DataRegistry", "SettlementRegistry"];
     }
 
     /// The artifact of `name`, built from its source in `src/`.
@@ -45,7 +45,7 @@ library Deployments {
         bytes32 n = keccak256(bytes(name));
         if (n == keccak256("AppRegistry")) return APP_REGISTRY;
         if (n == keccak256("DataRegistry")) return DATA_REGISTRY;
-        if (n == keccak256("MembershipRegistry")) return MEMBERSHIP_REGISTRY;
+        if (n == keccak256("SettlementRegistry")) return SETTLEMENT_REGISTRY;
         revert UnknownContract(name);
     }
 
@@ -60,10 +60,10 @@ library Deployments {
         current(name); // an unknown name is a different mistake from a missing address
         bytes32 n = keccak256(bytes(name));
         if (chainId == BASE_SEPOLIA) {
-            // Deployed with Deploy.s.sol all(), in block 51469588.
-            if (n == keccak256("AppRegistry")) return 0x6E07C2c7393963242899e5Fb0eb1B6B787927E81;
-            if (n == keccak256("DataRegistry")) return 0x7a34882568f1b22FC4C4944113B1E4Ca4cF6900f;
-            if (n == keccak256("MembershipRegistry")) return 0x9De2C2A6261927f91b246C73e7ca86824a357FA6;
+            // Deployed with Deploy.s.sol all(), in blocks 53592845 to 53592851.
+            if (n == keccak256("AppRegistry")) return 0x197A44c42276F31DC2CeA34C138380a59A28D1C0;
+            if (n == keccak256("DataRegistry")) return 0x0F3eb0E62CF610dbaC6B3aD4Bf4cE38Ab50EBCC5;
+            if (n == keccak256("SettlementRegistry")) return 0x61A5A195B54F57ada786Ba6689CdB04553cf7fBc;
         }
         return address(0);
     }

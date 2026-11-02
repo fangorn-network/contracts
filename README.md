@@ -1,10 +1,10 @@
 # Fangorn contracts
 
-The three core Fangorn contracts written in Solidity: the AppRegistry, the DataRegistry and the MembershipRegistry. Sources, tests and scripts are in `solidity/`.
+The three core Fangorn contracts, in Solidity: the DataRegistry, the SettlementRegistry and the AppRegistry. Sources, tests and scripts are in `solidity/`.
 
-**The contracts are upgradeable.** Each implemented contract is behind its own ERC-1967 proxy (UUPS). See *Deploy and upgrade*.
+**The contracts are upgradeable.** Each is behind its own ERC-1967 proxy (UUPS). See *Deploy and upgrade*.
 
-Almost nothing lives on-chain. A publisher's repo is `(publisher, name)`, and its head is one `bytes32` in the DataRegistry: the onchain pointer to its latest commit. The data itself is content-addressed and stored off-chain. A repo belongs to no app. An app is **sponsored storage**: it pays for its members' uploads, and presents its members' repos.
+Almost nothing lives on-chain. A publisher's repo is `(publisher, name)`, and its head is one `bytes32` in the DataRegistry: the name of its latest commit. The data is content-addressed and stored off-chain. A repo belongs to no app: an app is a curator's repo of citations, and the AppRegistry only names it.
 
 ## Deployed
 
@@ -12,158 +12,83 @@ Use the proxy addresses: an upgrade only changes the implementation behind them.
 
 | Contract           | Base Sepolia (84532)                         |
 | ------------------ | -------------------------------------------- |
-| AppRegistry        | `0x6E07C2c7393963242899e5Fb0eb1B6B787927E81` |
-| DataRegistry       | `0x7a34882568f1b22FC4C4944113B1E4Ca4cF6900f` |
-| MembershipRegistry | `0x9De2C2A6261927f91b246C73e7ca86824a357FA6` |
+| AppRegistry        | `0x197A44c42276F31DC2CeA34C138380a59A28D1C0` |
+| DataRegistry       | `0x0F3eb0E62CF610dbaC6B3aD4Bf4cE38Ab50EBCC5` |
+| SettlementRegistry | `0x61A5A195B54F57ada786Ba6689CdB04553cf7fBc` |
 | Admin (wallet)     | `0x7b16387C5A8c514880E48bcacd52782FCF9Da936` |
 | RPC                | `https://sepolia.base.org`                   |
 
 ## Architecture
 
 ```
-  Publisher ── update(repo, parent, head) ──▶ DataRegistry   (P, keccak(repo)) → (pos, head)
-                anyone, for their own repos      emits Updated
+  Publisher ── update / updateBySig ──▶ DataRegistry        (P, keccak(repo)) → (pos, head)
+               own repos only                                update log: MMR peaks
 
-  App owner ── registerApp()                 ──▶  AppRegistry   app → owner, expiry
-     │ acceptPublisher(app, P)                │  (app, P) → status; canPublish = accepted, in good standing
-     │ setPublisherSuspended(app, P, bool)    │  (app, exclusion) → count; odd = excluded
-     │ exclude / restore  publisher, repo or key │  emits PublisherAccepted, ExclusionChanged
-  Admin ── setGlobalSuspension() / setAppSuspended() ┘
-                                                     │
-                                                     ▼
-                                               clients read views and logs
+  Buyer ── register(terms, sig, pay) ──▶ SettlementRegistry  USDC split publisher / referrer
+       ── settle(proof, reader)                               Semaphore group per subject
+  Access worker ── canRead(reader, P, repo, key)
 
-  An off-chain upload gate reads, for the app the caller names:
-    AppRegistry.access(app, addr)                → (canPublish, owner, expiresAt)
-
-  Reader ── join() / claim() ──▶ MembershipRegistry ──▶ Semaphore
-  (USDC, ERC-3009)               plan per app, locked expiring ERC-721
-                                 reads AppRegistry.getAppOwner(app): who sets the
-                                 plan, and who is paid
+  Curator ── registerApp / setCurator ──▶ AppRegistry        app id → curator repo, payout, agent card
 ```
 
-Publishing and membership are separate. Any address updates its own repos in the DataRegistry, and an update names no app. Membership of an app is the AppRegistry's, and the owner's alone: `acceptPublisher` is the whole of it. Neither contract calls the other.
-
-### How it behaves
-
-**An app is sponsored storage for the publishers it accepts, and includes their data.** The owner accepts a publisher (`acceptPublisher`); from then one rule, `canPublish(app, publisher)`, decides both: the upload gate pins the publisher's bytes for the app while it holds, and the app includes that publisher's repos while it holds. What an app presents of a repo is the publisher's latest head (`getHead`), unless the app excludes the publisher, the repo, or a record key in it. A repo read under no app is just its head.
-
-`canPublish` holds while the app has accepted the publisher and not suspended it, the publisher is not banned network-wide, and the app is neither taken down nor past its subscription. It changes no head, so presentation follows it immediately, in both directions:
-
-- **A member publishes:** one `update` moves the head, and the app presents it.
-- **Anyone else publishes:** the update stands, and the app presents nothing of it. Hosted storage refuses its uploads.
-- **One wallet, several apps:** each app that has the publisher as a member presents its latest head, with its own exclusions.
-- **A member is suspended:** the app stops presenting the publisher entirely, earlier heads included. Its updates keep landing. Reinstated, the app presents its latest head again.
-- **The subscription lapses, or the admin takes the app down:** the app presents nobody until it is renewed or reinstated. Nothing is lost.
-- **The protocol admin bans a wallet:** no app presents or stores it.
-
-**Exclusions** are the owner's finer tool. `exclude` withdraws a publisher, one of its repos, or one record key from the app, for all of its past, until `restore`. They never touch the DataRegistry: the publisher's head, and every other app's view of it, are unchanged.
-
-There is no per-head acceptance: an app cannot hold a member at an older head, nor present a non-member.
+No contract calls another. A referrer in the SettlementRegistry is an address; clients pass an app's `payoutOf`.
 
 ## Layout
 
-| Path                                       | What                                                                                                         |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `solidity/src/AppRegistry.sol`             | AppRegistry                                                                                                  |
-| `solidity/src/DataRegistry.sol`            | DataRegistry                                                                                                 |
-| `solidity/src/MembershipRegistry.sol`      | MembershipRegistry                                                                                           |
-| `solidity/src/IERC5643.sol`                | The ERC-5643 subscription interface the Membership and App registries implement                              |
-| `solidity/test/`                           | Foundry tests and mocks                                                                                      |
-| `solidity/script/Deploy.s.sol`             | Deploys the contracts behind their own UUPS proxy                                                            |
-| `solidity/script/Upgrade.s.sol`            | Admin: upgrade a deployed contract in place                                                                  |
-| `solidity/script/SetSubscriptionFee.s.sol` | Admin: set the subscription fee on the AppRegistry                                                           |
-| `solidity/script/Deployments.sol`          | Each proxy's address, and what each contract is upgraded with                                                |
-| `solidity/script/Builds.sol`               | Writes and checks the builds in `deployed/`, for the two scripts above                                       |
-| `solidity/deployed/`                       | The build of each contract that is live. What an upgrade, and the upgrade-safety test, compare storage with. |
-| `solidity/lib/`                            | `forge-std`, `openzeppelin-contracts-upgradeable`, `openzeppelin-foundry-upgrades` (submodules)              |
+| Path                                | What                                                                                                         |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `solidity/src/DataRegistry.sol`     | DataRegistry                                                                                                 |
+| `solidity/src/SettlementRegistry.sol` | SettlementRegistry                                                                                         |
+| `solidity/src/AppRegistry.sol`      | AppRegistry                                                                                                  |
+| `solidity/test/`                    | Foundry tests and mocks                                                                                      |
+| `solidity/script/Deploy.s.sol`      | Deploys the contracts behind their own UUPS proxy                                                            |
+| `solidity/script/Upgrade.s.sol`     | Admin: upgrade a deployed contract in place                                                                  |
+| `solidity/script/RotateAdmin.s.sol` | Admin: move every registry's admin at once                                                                   |
+| `solidity/script/Deployments.sol`   | Each proxy's address, and what each contract is upgraded with                                                |
+| `solidity/script/Builds.sol`        | Writes and checks the builds in `deployed/`, for the scripts above                                           |
+| `solidity/deployed/`                | The build of each contract that is live. What an upgrade, and the upgrade-safety test, compare storage with. |
+| `solidity/lib/`                     | `forge-std`, `openzeppelin-contracts-upgradeable`, `openzeppelin-foundry-upgrades` (submodules)              |
 
 ## Common to the contracts
 
 - *Names.* Functions are `camelCase`. Arguments and event fields are `snake_case` (`app_id`, `repo_id`).
-- *Reentrancy.* Every function that moves funds is guarded with OpenZeppelin's `ReentrancyGuardTransient`, which keeps its flag in transient storage (EIP-1153) rather than a storage slot, and reverts `ReentrancyGuardReentrantCall()` if re-entered. Views are not guarded.
-- *Upgradeability.* Each contract takes its initial arguments through `initialize(…)` and has `upgradeToAndCall`, `proxiableUUID` and `UPGRADE_INTERFACE_VERSION`, the `Initialized` and `Upgraded` events, and
-  OpenZeppelin's proxy errors.
-- *Admin.* One address per contract. It is also who may upgrade it. `setAdmin(new_admin)` hands the role over and emits `AdminChanged`. Setting the zero address **renounces the role and permanently stops upgrades**.
-
-## AppRegistry
-
-Apps, who may publish under them, and who pays for their storage. **An app is synonymous to a storage subscription** so data availability has stronger guarantees.
-
-**Each app is an ERC-721 token** (`FANGAPP`), id `uint256(app_id)`, minted to its owner at claim, and **its subscription follows [ERC-5643](https://eips.ethereum.org/EIPS/eip-5643)**. One payment of `subscriptionFee` (USDC) buys `subscriptionPeriod` seconds. The token cannot be transferred or burned (`NotTransferable`), so its owner is always `getAppOwner`.
-
-- `registerApp(app_id, max_subscription_fee)`: claim an app id, first-come-first-served. Pulls the subscription fee in **USDC** via `IERC20.transferFrom` (**approve this contract first**; a refused pull reverts `SubscriptionFeeRequired`). If the fee is above `max_subscription_fee` when the claim lands, it reverts `SubscriptionFeeTooHigh` instead, so a fee raised above what the caller wanted to pay isn't charged. Then it mints the app's token to the claimer, sets its expiry one period from now, and makes the claimer the app's first accepted publisher (`PublisherAccepted`). The claimer must not be banned network-wide (`PublisherSuspendedGlobal` otherwise). The zero id cannot be claimed (`ZeroAppId`), nor an id another app goes by (`AppAlreadyRegistered`).
-- `renewSubscription(token_id, duration)`: ERC-5643. The owner, or an address they approved for the token, pays the fee for one more period (USDC; approve this contract first). `duration` must be `subscriptionPeriod` (`DurationMismatch`), and the app must be renewable (`SubscriptionNotRenewable`). The renewal call will succeed only when less than one period is left, so nobody pays more than a period ahead. The period is added to the expiry, or to now if it has passed. Sends no ETH (`EthNotAccepted`). Emits `SubscriptionUpdate(token_id, expiry)`. The standard fixes the arguments, so there is no maximum fee making the payer's allowance the cap. Approve exactly `subscriptionFee()`, and a fee raised in the meantime makes the renewal revert.
-- `cancelSubscription(token_id)`: ERC-5643, the owner only (`Unauthorized` otherwise, approved addresses included). Ends the subscription now, as the standard does: the expiry becomes `0`, with no refund, and `SubscriptionUpdate(token_id, 0)` is emitted. The app stays claimed and a renewal starts a new period from now.
-- `expiresAt(token_id)`, `isRenewable(token_id)`: ERC-5643. Both revert for a token that does not exist (`ERC721NonexistentToken`). `isRenewable` is true once less than one period is left.
-- ERC-721: `ownerOf`, `balanceOf`, `approve`, `getApproved`, `setApprovalForAll`, `isApprovedForAll`, `name`, `symbol`, `tokenURI` (empty), `supportsInterface` (ERC-165, ERC-721, its metadata, and ERC-5643's `0x8c65f84d`). The transfer functions revert.
-- `acceptPublisher(app_id, publisher)`: owner-only. The whole membership: status goes `None → Active`, and from then the publisher uploads with the app's storage and the app includes its data, while `canPublish` holds. No invitation, terms or fee. Emits `PublisherAccepted`. Reverts `AlreadyAccepted` for a publisher the app has accepted, suspended or not (reinstate a suspended one with `setPublisherSuspended(…, false)`). Neither the owner nor the publisher may be banned network-wide (`PublisherSuspendedGlobal`).
-- `setAppAgentUri(app_id, agent_uri)`: owner-only. Moving the agent card leaves the app's publishers alone.
-- `renameApp(app_id, new_id)`: owner-only, and not for an owner banned network-wide (`PublisherSuspendedGlobal`). Gives the app a new id. Nothing moves: `new_id` becomes an alias of the id the app was claimed under (its *canonical* id), so its publishers, exclusions, subscription and token carry on, and **every function taking an `app_id` accepts any id the app has gone by**. Old ids stay the app's, so nobody can claim one and pass as the app to clients still using it; renaming back to one is allowed. `new_id` held by another app reverts `AppAlreadyRegistered`, zero reverts `ZeroAppId`. Emits `AppRenamed(app_id, new_id)` with the canonical id. The token id, the listings (`appsPage`, `appsOf`) and every event keep the canonical id; `currentAppId(app_id)` gives the id the app goes by now, `canonicalAppId(app_id)` the one it was claimed under (both return an id that is no app's unchanged).
-- `setPublisherSuspended(app_id, publisher, bool)`: owner-only. Change the suspension status of one member in one app. Emits `PublisherSuspensionChanged`. Only a publisher the app accepted can be suspended (`NotAccepted` otherwise), so lifting a suspension always makes them a member again. Lifting a suspension that is not there reverts `PublisherNotSuspended`. The owner cannot suspend themselves (`CannotSuspendOwner`).
-- `setAppSuspended(app_id, bool)`: admin-only takedown of a whole app. Memberships are left intact. Emits `AppSuspensionChanged`.
-- `setGlobalSuspension(wallet, bool)`: admin-only network-wide ban of any address, including one that has never published. Emits `GlobalSuspensionChanged`.
-- `exclude(app_id, publisher, repo_id, key_id)` / `restore(…)`: owner-only. Withdraws from the app a publisher (`repo_id` and `key_id` zero), one of its repos (`key_id` zero), or one record key, for all of its past, or lifts it. Each exclusion is a counter, `exclusionCount(app_id, exclusionId(publisher, repo_id, key_id))`, odd while in force: `exclude` needs it even (`AlreadyExcluded`), `restore` odd (`NotExcluded`). Names stay hashed. Emits `ExclusionChanged`.
-- `access(app_id, publisher) → (bool can_publish, address owner, uint64 expires_at)`: the off-chain upload gate's single read. `can_publish` is `canPublish`, so it is false once the subscription has expired; `expires_at` is the subscription's expiry, `0` for an unclaimed app or a cancelled subscription.
-- Views (each `app_id` may be any id the app goes by): `canPublish`, `exclusionCount`, `exclusionId`, `statusForApp` (`0` none, `1` accepted, `2` suspended), `getAppOwner`, `currentAppId`, `canonicalAppId`, `subscriptionFee`, `subscriptionPeriod`, `usdc`, `dataRegistry`, `globalSuspensions`, `appAgentUri`, `isAppSuspended`, `admin`.
-- Admin: `setSubscriptionFee`, `setSubscriptionPeriod` (not zero, `ZeroPeriod`; applies from each app's next payment, emits `SubscriptionPeriodChanged`), `setDataRegistry` (emits `DataRegistryChanged`), `withdrawToken(token, to, amount)` (the protocol's USDC, or any ERC-20 sent here by mistake; emits `TokenWithdrawn`). The fee token is fixed at `initialize`. Every token transfer goes through OpenZeppelin's `SafeERC20`, so tokens that return no value from `transfer` work too.
-- Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
-- `appCount()`, `appsPage(offset, limit)`, `appsOf(owner)`: every claimed app id, and each owner's, oldest first. What clients list apps from instead of scanning `AppRegistered` logs. Expired and suspended apps stay listed; the per-app reads say which. `appsPage` returns fewer ids, or none, past the end.
-- `initialize(admin, usdc, subscription_fee, subscription_period)`.
-
-**Global bans.** A wallet the protocol admin has banned can't claim an app or be accepted into one. A wallet banned later cannot publish in any app (`canPublish` is false), so no app presents it or sponsors its uploads. An *owner* banned later keeps the app, and its other publishers keep publishing, but the owner cannot accept anyone (which would let them keep publishing through new wallets) or move its agent card: `acceptPublisher` and `setAppAgentUri` revert `PublisherSuspendedGlobal`. The app can be taken down with `setAppSuspended`.
-
-**Expiry is enforced on-chain.** Once an app's subscription has expired or been cancelled, it sponsors and includes nothing (`canPublish` is false). Managing publishers (accepting, suspending) stays open, and nothing is lost. Renewing the app returns functionality to normal. There is no grace period when an app expires.
+- *Reentrancy.* Functions that move funds use OpenZeppelin's `ReentrancyGuardTransient`.
+- *Upgradeability.* Each contract takes its initial arguments through `initialize(…)` and has `upgradeToAndCall`, `proxiableUUID` and `UPGRADE_INTERFACE_VERSION`.
+- *Admin.* One address per contract, which is also who may upgrade it. `setAdmin(new_admin)` hands the role over and emits `AdminChanged`. Setting zero **renounces the role and permanently stops upgrades**.
 
 ## DataRegistry
 
-The heads of every repo, and the update log as events.
+The head of every repo, and the update log.
 
-State: `admin`, `heads` (`publisher → keccak256(repo) → (pos, head)`).
-
-- `update(repo, parent, head)`: move the sender's `repo` from `parent` to `head` (`StaleStateRoot` unless `parent` is the head; `ZeroHead` for a zero head). Any address, for its own repos: no app, fee or registration. Emits `Updated(publisher, repo_id, repo, pos, parent, head)`, with the name in clear.
-- Views: `getHead(publisher, repo_id) → (pos, head)`, `admin`.
-- Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
+- `update(repo, epoch, parent, root, car)`: moves the sender's `repo` from `parent` to the commit `(epoch, parent, root, repo, car)`, whose head the contract computes (`commitHead`): the sha256 digest of the commit's dag-cbor block. Reverts `StaleStateRoot` unless `parent` is the head, and `EpochOutOfWindow` unless `epoch` is within `WINDOW` (24) one-hour epochs of `currentEpoch()`. Emits `Updated(publisher, repo_id, repo, pos, parent, head)`.
+- `updateBySig(publisher, repo, epoch, parent, root, car, signature)`: the same, authorized by the publisher's EIP-712 `Update` signature (or ERC-1271 for a contract wallet), so anyone may submit it. The parent check stops replays.
+- The update log is a Merkle mountain range kept as `peaks` and `logLength`; `logRoot()` computes its root. Leaf `keccak256(abi.encode("leaf", publisher, repo_id, pos, head, timestamp))`.
+- Views: `getHead(publisher, repo_id) → (pos, head)`, `repoIds(publisher, i)`, `repoCount(publisher)`, `commitHead`, `currentEpoch`, `domainSeparator`, `admin`.
 - `initialize(admin)`.
 
-`update` does not verify that `head` is a well-formed commit, nor the commit's epoch; it only checks the CAS. It only moves a `bytes32`, and clients define what that value means.
+## SettlementRegistry
 
-## MembershipRegistry
+Sells read access to a *subject* `(publisher, repo, key)`: `repo` is `keccak256` of the repo's name, and key zero is the whole repo. Prices are terms the publisher signs off-chain.
 
-Time-limited access to an app's paid records, held by an address nobody can tie to the
-wallet that paid. It reads one thing from the AppRegistry: who owns an app. That address
-is fixed at deployment; there is no setter for it.
+- `register(terms, signature, commitment, referrer, salt, payment)`: checks the publisher's EIP-712 `Terms(publisher, repo, key, price, shareBps, generation, deadline)` (or ERC-1271), takes `price` in USDC by ERC-3009 `receiveWithAuthorization` with nonce `registerNonce(subject, commitment, referrer, salt)`, pays the referrer `shareBps` unless it is denied or is the publisher, and the publisher the rest, and adds the Semaphore `commitment` to the subject's group. Free subjects move no money.
+- `settle(publisher, repo, key, proof, reader)`: a Semaphore proof of membership in the subject's group, scoped to the subject, with `reader` as its message. One settle per payment.
+- `canRead(reader, publisher, repo, key)`: true if the reader settled the record or the whole repo, and neither is disabled. What the access worker reads.
+- Publisher: `raiseGeneration(repo)` voids every older terms for the repo; `setDenied(referrer, bool)`; `setDisabled(publisher, repo, key, bool)` (publisher or admin).
+- Views: `subjectOf`, `registerNonce`, `hashTerms`, `generationOf`, `isDenied`, `isDisabled`, `groupOf`, `isRegistered`, `isSettled`, `usdc`, `semaphore`, `admin`.
+- `initialize(admin, usdc, semaphore)`.
 
-- `setPlan(app_id, price, period)` — app owner only. What one period of membership
-  costs, in USDC base units, and how long a period is. Price zero means the app offers
-  none. Changing `period` renumbers epochs, so do it rarely.
-- `join(app_id, commitment, salt, pay)` — anyone may submit it. `pay` is the payer's
-  signed ERC-3009 `receiveWithAuthorization` for exactly the plan's price. The USDC goes
-  to the app's owner, and the Semaphore identity `commitment` joins the group of
-  (app, current epoch), which the contract creates on first use. The signature's nonce
-  must be `joinNonce(app_id, epoch, commitment, salt)`, so whoever submits it cannot
-  swap in another commitment, and only this contract can redeem it.
-- `claim(app_id, epoch, holder, merkleTreeDepth, merkleTreeRoot, nullifier, points)` —
-  a Semaphore proof of membership in that group, with `holder` as its message. Mints the
-  holder's membership, or extends it by one period: from its expiry if still current,
-  from now if lapsed. One claim per payment (`AlreadyClaimed` on a reused nullifier).
-- `canRead(tokenId, who) → (app_id, until)` — the access gate's read: the membership's
-  expiry for its holder, the user's expiry for its user, otherwise zero.
-- `setUser(tokenId, user, expires)` — the holder names one user, typically an agent,
-  never past the membership's own expiry. `setUserBySig` takes the holder's signature
-  (EIP-712, or ERC-1271 for a contract wallet) so a holder with no gas can do it.
-- Views: `planOf`, `currentEpoch`, `joinNonce`, `scopeOf`, `groupOf`, `tokenIdOf`,
-  `appOfToken`, `expiresAt`, `isRenewable`, `userOf`, `userExpires`, `userNonces`,
-  `locked`, `usdc`, `semaphore`, `appRegistry`, `admin`.
-- Admin: `setAdmin`, and `upgradeToAndCall` through `script/Upgrade.s.sol`.
-- `initialize(admin, usdc, semaphore, app_registry)`.
+## AppRegistry
 
-The membership is an ERC-721 with one token per (app, holder): `tokenIdOf(app_id,
-holder)`. It is locked (ERC-5192): it can be minted, and every transfer and burn reverts
-`NotTransferable`. It expires (the reads of ERC-5643) and has one user (ERC-4907).
-`renewSubscription` and `cancelSubscription` revert `UseJoinAndClaim`: renewing is
-another `join` and `claim`, which keeps the payer unlinked from the holder, and a
-membership ends by not renewing.
+Names apps. An app is a curator's repo of citations in the DataRegistry; this contract maps a short id to that repo, to the address paid when the app refers a sale, and to its ERC-8004 agent card. It decides nothing about data. Registering is free.
+
+- `registerApp(app_id)`: first come, first served. Reverts `ZeroAppId`, or `AppAlreadyRegistered` for an id any app goes by.
+- `setCurator(app_id, curator, repo)`, `setPayout(app_id, payout)`, `setAppAgentUri(app_id, uri)`: owner only. `curatorOf` and `payoutOf` fall back to the owner when unset.
+- `renameApp(app_id, new_id)`: owner only. `new_id` becomes an alias of the id the app was registered under, and **every function taking an `app_id` accepts any id the app has gone by**. Events and listings keep the canonical id; `currentAppId` gives the id it goes by now, `canonicalAppId` the one it was registered under.
+- Views: `getAppOwner`, `curatorOf`, `payoutOf`, `appAgentUri`, `isAppSuspended`, `appCount`, `appsPage(offset, limit)`, `appsOf(owner)`, `dataRegistry`, `admin`.
+- Admin: `setAppSuspended(app_id, bool)` (takedown of the name), `setDataRegistry`, `withdrawToken`.
+- `initialize(admin)`.
+
+Storage from earlier versions is kept, unused, so the deployed proxy upgrades in place.
 
 ## Build and test
 
@@ -177,7 +102,7 @@ Needs [Foundry](https://getfoundry.sh) and [Node.js](https://nodejs.org). The li
 
 Node.js is for that plugin: it checks upgrade safety by running `npx @openzeppelin/upgrades-core`, which is why `foundry.toml` turns on `ffi`. One test, `UpgradeSafety`, runs the check on every contract, and compares its storage with the build of that contract that is live (`solidity/deployed/`), so the first `forge test` needs internet access to download that npm package. The check needs a full build so if it fails with "not from a full compilation", run `forge clean` and try again.
 
-The tests check, among the rest, that only the owner accepts publishers, that join fees still owed reach the app owner and stay out of the admin's reach, that a revert unwinds state, and that every way out of an app (`canPublish` false) is also a refusal at the upload gate (`access`). The AppRegistry tests run against the real DataRegistry rather than a mock. USDC and Semaphore are mocks. Every test deploys its contracts behind a proxy, as the deploy script does, and each suite checks that only the admin can upgrade.
+USDC and Semaphore are mocks. Every test deploys its contracts behind a proxy, as the deploy script does, and each suite checks that only the admin can upgrade.
 
 **The tests never touch a real network.** `forge test` runs every test on a local chain that Forge simulates in memory. The contracts are deployed there, the ETH and tokens the tests use are made up (`vm.deal`, the mocks), and the chain is thrown away when the test ends. Nothing is deployed to Base Sepolia or any other network, and no test ETH is spent. The only commands that send real transactions are scripts run with `--broadcast` (see *Deploy and upgrade*).
 
@@ -207,8 +132,7 @@ Then commit what it wrote under `deployed/` and `broadcast/`. Leave off `--broad
 | What                                  | Command (add `--rpc-url <rpc> --account <keystore> --sender <admin> --broadcast`) |
 | ------------------------------------- | --------------------------------------------------------------------------------- |
 | Upgrade one contract only             | `forge script script/Upgrade.s.sol --force --sig "upgrade(string)" DataRegistry`  |
-| Set the subscription fee (USDC, 6 dp) | `forge script script/SetSubscriptionFee.s.sol --sig "run(uint256)" 5000000`       |
-| Rotate the admin of all three         | `forge script script/RotateAdmin.s.sol --sig "run(address)" <new admin>`          |
+| Rotate the admin of every registry    | `forge script script/RotateAdmin.s.sol --sig "run(address)" <new admin>`          |
 | First deployment on a new chain       | `forge script script/Deploy.s.sol --force --sig "all()"` (see *First deployment*) |
 | Check `deployed/` is the live code    | `forge script script/Upgrade.s.sol --sig "check()" --rpc-url <rpc>` (no signer)   |
 
@@ -230,7 +154,7 @@ Each chain has its own admin, and every call except a first deployment must be s
 
 ### Rotating the admin
 
-Each registry keeps its own admin. `RotateAdmin.s.sol` moves all three at once, and first checks that all three still have the admin it records for the chain, so they cannot quietly drift apart. It refuses the zero address. After it runs, update the address it records.
+Each registry keeps its own admin. `RotateAdmin.s.sol` moves every deployed one at once, and first checks that they all still have the admin it records for the chain, so they cannot quietly drift apart. It refuses the zero address. After it runs, update the address it records.
 
 ### How an upgrade works
 
@@ -251,7 +175,7 @@ Between merging a change and running its upgrade, `src/` is ahead of the chain. 
 
 The plugin enforces the first two, and also refuses constructors, `selfdestruct` and `delegatecall` in a new version. A change that cannot keep the layout must be a full redeploy.
 
-The contracts inherit OpenZeppelin's upgradeable variants (`ERC721Upgradeable`, `EIP712Upgradeable`), which keep their state in namespaced storage and set it in `initialize`, so the plugin needs no exemption for any of them.
+The contracts inherit OpenZeppelin's upgradeable variants (`EIP712Upgradeable`), which keep their state in namespaced storage and set it in `initialize`, so the plugin needs no exemption for any of them.
 
 **Rehearse first.** Fork the chain locally and run the same command against the fork, signing as the admin's address without its key:
 
@@ -274,17 +198,15 @@ forge script script/Deploy.s.sol --force --sig "all()" \
 
 | `--sig`                                       | Deploys                                                                                |
 | --------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `"all()"`                                     | All three registries, the AppRegistry naming the DataRegistry                          |
+| `"all()"`                                     | Every registry, the AppRegistry naming the DataRegistry                                |
 | `"appRegistry(address)" <DataRegistry>`       | A new AppRegistry naming an existing DataRegistry                                      |
 | `"dataRegistry(address)" <AppRegistry>`       | A new DataRegistry, which an existing AppRegistry is repointed at                      |
-| `"membershipRegistry(address)" <AppRegistry>` | A MembershipRegistry. The AppRegistry it reads app owners from cannot be changed later |
+| `"settlementRegistry()"`                      | A SettlementRegistry                                                                   |
 
 Parameters are environment variables, with defaults in `solidity/.env.example` (Forge reads `solidity/.env`):
 
 - `ADMIN_ADDR`: required. For `all()`, `appRegistry()` and `dataRegistry()` it must be the signer, because the wiring calls are admin-only.
 - `USDC_ADDR`, `SEMAPHORE_ADDR`: default to Base Sepolia's; required on any other chain.
-- `SUBSCRIPTION_FEE`: what claiming or renewing an app costs, in USDC base units. Default 0.
-- `SUBSCRIPTION_PERIOD`: how long one payment lasts, in seconds. Default 30 days.
 
 Afterwards:
 
