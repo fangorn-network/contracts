@@ -1,14 +1,18 @@
 # Fangorn contracts
 
-The two core Fangorn contracts, in Solidity: the DataRegistry and the SettlementRegistry. Sources, tests and scripts are in `solidity/`.
+This repo contains the core contracts required for the Fangorn protocol. See [Fangorn SDK](https://github.com/fangorn-network/fangorn).
+
+> ⚠️ This code is not audited. Use at your own risk.
+
+ <!-- the DataRegistry and the SettlementRegistry. Sources, tests and scripts are in `solidity/`.
 
 **The contracts are upgradeable.** Each is behind its own ERC-1967 proxy (UUPS). See *Deploy and upgrade*.
 
-Almost nothing lives on-chain. A publisher's repo is `(publisher, name)`, and its head is one `bytes32` in the DataRegistry: the name of its latest commit. The data is content-addressed and stored off-chain.
+Almost nothing lives on-chain. A publisher's repo is `(publisher, name)`, and its head is one `bytes32` in the DataRegistry: the name of its latest commit. The data is content-addressed and stored off-chain. -->
 
-## Deployed
+## Deployed Contracts
 
-Use the proxy addresses: an upgrade only changes the implementation behind them. `solidity/script/Deployments.sol` is the source of truth.
+The latest contracts are deployed to Base Sepolia:
 
 | Contract           | Base Sepolia (84532)                         |
 | ------------------ | -------------------------------------------- |
@@ -16,62 +20,6 @@ Use the proxy addresses: an upgrade only changes the implementation behind them.
 | SettlementRegistry | `0x61A5A195B54F57ada786Ba6689CdB04553cf7fBc` |
 | Admin (wallet)     | `0x7b16387C5A8c514880E48bcacd52782FCF9Da936` |
 | RPC                | `https://sepolia.base.org`                   |
-
-## Architecture
-
-```
-  Publisher ── update / updateBySig ──▶ DataRegistry        (P, keccak(repo)) → (pos, head)
-               own repos only                                update log: MMR peaks
-
-  Buyer ── register(terms, sig, pay) ──▶ SettlementRegistry  USDC split publisher / referrer
-       ── settle(proof, reader)                               Semaphore group per subject
-  Access worker ── canRead(reader, P, repo, key)
-```
-
-No contract calls another. A referrer in the SettlementRegistry is an address.
-
-## Layout
-
-| Path                                | What                                                                                                         |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `solidity/src/DataRegistry.sol`     | DataRegistry                                                                                                 |
-| `solidity/src/SettlementRegistry.sol` | SettlementRegistry                                                                                         |
-| `solidity/test/`                    | Foundry tests and mocks                                                                                      |
-| `solidity/script/Deploy.s.sol`      | Deploys the contracts behind their own UUPS proxy                                                            |
-| `solidity/script/Upgrade.s.sol`     | Admin: upgrade a deployed contract in place                                                                  |
-| `solidity/script/RotateAdmin.s.sol` | Admin: move every registry's admin at once                                                                   |
-| `solidity/script/Deployments.sol`   | Each proxy's address, and what each contract is upgraded with                                                |
-| `solidity/script/Builds.sol`        | Writes and checks the builds in `deployed/`, for the scripts above                                           |
-| `solidity/deployed/`                | The build of each contract that is live. What an upgrade, and the upgrade-safety test, compare storage with. |
-| `solidity/lib/`                     | `forge-std`, `openzeppelin-contracts-upgradeable`, `openzeppelin-foundry-upgrades` (submodules)              |
-
-## Common to the contracts
-
-- *Names.* Functions are `camelCase`. Arguments and event fields are `snake_case` (`repo_id`, `new_admin`).
-- *Reentrancy.* Functions that move funds use OpenZeppelin's `ReentrancyGuardTransient`.
-- *Upgradeability.* Each contract takes its initial arguments through `initialize(…)` and has `upgradeToAndCall`, `proxiableUUID` and `UPGRADE_INTERFACE_VERSION`.
-- *Admin.* One address per contract, which is also who may upgrade it. `setAdmin(new_admin)` hands the role over and emits `AdminChanged`. Setting zero **renounces the role and permanently stops upgrades**.
-
-## DataRegistry
-
-The head of every repo, and the update log.
-
-- `update(repo, epoch, parent, root, car)`: moves the sender's `repo` from `parent` to the commit `(epoch, parent, root, repo, car)`, whose head the contract computes (`commitHead`): the sha256 digest of the commit's dag-cbor block. Reverts `StaleStateRoot` unless `parent` is the head, and `EpochOutOfWindow` unless `epoch` is within `WINDOW` (24) one-hour epochs of `currentEpoch()`. Emits `Updated(publisher, repo_id, repo, pos, parent, head)`.
-- `updateBySig(publisher, repo, epoch, parent, root, car, signature)`: the same, authorized by the publisher's EIP-712 `Update` signature (or ERC-1271 for a contract wallet), so anyone may submit it. The parent check stops replays.
-- The update log is a Merkle mountain range kept as `peaks` and `logLength`; `logRoot()` computes its root. Leaf `keccak256(abi.encode("leaf", publisher, repo_id, pos, head, timestamp))`.
-- Views: `getHead(publisher, repo_id) → (pos, head)`, `repoIds(publisher, i)`, `repoCount(publisher)`, `commitHead`, `currentEpoch`, `domainSeparator`, `admin`.
-- `initialize(admin)`.
-
-## SettlementRegistry
-
-Sells read access to a *subject* `(publisher, repo, key)`: `repo` is `keccak256` of the repo's name, and key zero is the whole repo. Prices are terms the publisher signs off-chain.
-
-- `register(terms, signature, commitment, referrer, salt, payment)`: checks the publisher's EIP-712 `Terms(publisher, repo, key, price, shareBps, generation, deadline)` (or ERC-1271), takes `price` in USDC by ERC-3009 `receiveWithAuthorization` with nonce `registerNonce(subject, commitment, referrer, salt)`, pays the referrer `shareBps` unless it is denied or is the publisher, and the publisher the rest, and adds the Semaphore `commitment` to the subject's group. Free subjects move no money.
-- `settle(publisher, repo, key, proof, reader)`: a Semaphore proof of membership in the subject's group, scoped to the subject, with `reader` as its message. One settle per payment.
-- `canRead(reader, publisher, repo, key)`: true if the reader settled the record or the whole repo, and neither is disabled. What the access worker reads.
-- Publisher: `raiseGeneration(repo)` voids every older terms for the repo; `setDenied(referrer, bool)`; `setDisabled(publisher, repo, key, bool)` (publisher or admin).
-- Views: `subjectOf`, `registerNonce`, `hashTerms`, `generationOf`, `isDenied`, `isDisabled`, `groupOf`, `isRegistered`, `isSettled`, `usdc`, `semaphore`, `admin`.
-- `initialize(admin, usdc, semaphore)`.
 
 ## Build and test
 
@@ -196,4 +144,34 @@ Afterwards:
 2. Commit the builds the script wrote under `deployed/<chain id>/`, along with the broadcast log. The first upgrade is checked against them. `UpgradeSafety` fails while the builds and `Deployments.sol` disagree.
 3. Add the admin to `script/RotateAdmin.s.sol` and the chain to *Deployed* above.
 
-MVP, not audited.
+## Architecture
+
+```
+  Publisher ── update / updateBySig ──▶ DataRegistry        (P, keccak(repo)) → (pos, head)
+               own repos only                                update log: MMR peaks
+
+  Buyer ── register(terms, sig, pay) ──▶ SettlementRegistry  USDC split publisher / referrer
+       ── settle(proof, reader)                               Semaphore group per subject
+  Access worker ── canRead(reader, P, repo, key)
+```
+
+## DataRegistry
+
+The head of every repo, and the update log.
+
+- `update(repo, epoch, parent, root, car)`: moves the sender's `repo` from `parent` to the commit `(epoch, parent, root, repo, car)`, whose head the contract computes (`commitHead`): the sha256 digest of the commit's dag-cbor block. Reverts `StaleStateRoot` unless `parent` is the head, and `EpochOutOfWindow` unless `epoch` is within `WINDOW` (24) one-hour epochs of `currentEpoch()`. Emits `Updated(publisher, repo_id, repo, pos, parent, head)`.
+- `updateBySig(publisher, repo, epoch, parent, root, car, signature)`: the same, authorized by the publisher's EIP-712 `Update` signature (or ERC-1271 for a contract wallet), so anyone may submit it. The parent check stops replays.
+- The update log is a Merkle mountain range kept as `peaks` and `logLength`; `logRoot()` computes its root. Leaf `keccak256(abi.encode("leaf", publisher, repo_id, pos, head, timestamp))`.
+- Views: `getHead(publisher, repo_id) → (pos, head)`, `repoIds(publisher, i)`, `repoCount(publisher)`, `commitHead`, `currentEpoch`, `domainSeparator`, `admin`.
+- `initialize(admin)`.
+
+## SettlementRegistry
+
+Sells read access to a *subject* `(publisher, repo, key)`: `repo` is `keccak256` of the repo's name, and key zero is the whole repo. Prices are terms the publisher signs off-chain.
+
+- `register(terms, signature, commitment, referrer, salt, payment)`: checks the publisher's EIP-712 `Terms(publisher, repo, key, price, shareBps, generation, deadline)` (or ERC-1271), takes `price` in USDC by ERC-3009 `receiveWithAuthorization` with nonce `registerNonce(subject, commitment, referrer, salt)`, pays the referrer `shareBps` unless it is denied or is the publisher, and the publisher the rest, and adds the Semaphore `commitment` to the subject's group. Free subjects move no money.
+- `settle(publisher, repo, key, proof, reader)`: a Semaphore proof of membership in the subject's group, scoped to the subject, with `reader` as its message. One settle per payment.
+- `canRead(reader, publisher, repo, key)`: true if the reader settled the record or the whole repo, and neither is disabled. What the access worker reads.
+- Publisher: `raiseGeneration(repo)` voids every older terms for the repo; `setDenied(referrer, bool)`; `setDisabled(publisher, repo, key, bool)` (publisher or admin).
+- Views: `subjectOf`, `registerNonce`, `hashTerms`, `generationOf`, `isDenied`, `isDisabled`, `groupOf`, `isRegistered`, `isSettled`, `usdc`, `semaphore`, `admin`.
+- `initialize(admin, usdc, semaphore)`.

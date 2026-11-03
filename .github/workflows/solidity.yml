@@ -2,10 +2,10 @@ name: solidity
 
 on:
   pull_request:
-    paths: ["solidity/**", ".github/workflows/solidity.yml"]
+    paths: ["**", ".github/workflows/solidity.yml"]
   push:
     branches: [main]
-    paths: ["solidity/**", ".github/workflows/solidity.yml"]
+    paths: ["**", ".github/workflows/solidity.yml"]
 
 # The job runs pull request code with ffi on, and fetches the upgrade validator from npm.
 permissions:
