@@ -363,6 +363,41 @@ contract SettlementRegistryTest is Test {
         assertEq(sem.adds(), 3);
     }
 
+    function test_membersOf_inTheOrderAddedPerSubject() public {
+        bytes32 a = buy(terms(KEY, PRICE, SHARE), COMMIT, REFERRER);
+        buy(terms(KEY, PRICE, SHARE), COMMIT + 1, REFERRER);
+        bytes32 whole = buy(terms(bytes32(0), PRICE, SHARE), COMMIT + 2, REFERRER);
+        uint256[] memory ma = reg.membersOf(a);
+        assertEq(ma.length, 2);
+        assertEq(ma[0], COMMIT);
+        assertEq(ma[1], COMMIT + 1);
+        uint256[] memory mw = reg.membersOf(whole);
+        assertEq(mw.length, 1);
+        assertEq(mw[0], COMMIT + 2);
+        assertEq(sem.lastAddCommitment(), COMMIT + 2);
+    }
+
+    function test_membersOf_freeRegisterIsAMember() public {
+        SettlementRegistry.Terms memory t = terms(KEY, 0, SHARE);
+        SettlementRegistry.Payment memory none;
+        bytes32 subject = reg.register(t, sign(t, publisherKey), COMMIT, REFERRER, 0, none);
+        assertEq(reg.membersOf(subject).length, 1);
+    }
+
+    function test_membersOf_noneBeforeAnyRegister() public view {
+        assertEq(reg.membersOf(reg.subjectOf(publisher, REPO, KEY)).length, 0);
+    }
+
+    function test_membersOf_failedRegisterAddsNoOne() public {
+        sem.setFail(false, true, false);
+        SettlementRegistry.Terms memory t = terms(KEY, PRICE, SHARE);
+        SettlementRegistry.Payment memory p = pay(t, COMMIT, REFERRER);
+        bytes memory sig = sign(t, publisherKey);
+        vm.expectRevert();
+        reg.register(t, sig, COMMIT, REFERRER, bytes32(COMMIT), p);
+        assertEq(reg.membersOf(reg.subjectOf(publisher, REPO, KEY)).length, 0);
+    }
+
     function test_register_recordsHaveTheirOwnPrices() public {
         buy(terms(KEY, PRICE, 0), COMMIT, address(0));
         buy(terms(keccak256("photos/rare.jpg"), 5 * PRICE, 0), COMMIT, address(0));
