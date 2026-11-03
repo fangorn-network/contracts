@@ -21,6 +21,8 @@ The latest contracts are deployed to Base Sepolia:
 | Admin (wallet)     | `0x7b16387C5A8c514880E48bcacd52782FCF9Da936` |
 | RPC                | `https://sepolia.base.org`                   |
 
+See [spec.md](docs/spec.md) for more information on each contract and the overal architecture. 
+
 ## Build and test
 
 ```sh
@@ -29,49 +31,31 @@ forge build
 forge test
 ```
 
-Needs [Foundry](https://getfoundry.sh) and [Node.js](https://nodejs.org). The libraries are git submodules under `solidity/lib/`; after a fresh clone run `git submodule update --init --recursive`. OpenZeppelin Contracts (v5.7.0) is the copy inside `openzeppelin-contracts-upgradeable`, which is how the [OpenZeppelin Foundry Upgrades](https://docs.openzeppelin.com/upgrades-plugins/foundry/foundry-upgrades) plugin is set up.
+### Prerequisites
 
-Node.js is for that plugin: it checks upgrade safety by running `npx @openzeppelin/upgrades-core`, which is why `foundry.toml` turns on `ffi`. One test, `UpgradeSafety`, runs the check on every contract, and compares its storage with the build of that contract that is live (`solidity/deployed/`), so the first `forge test` needs internet access to download that npm package. The check needs a full build so if it fails with "not from a full compilation", run `forge clean` and try again.
-
-USDC and Semaphore are mocks. Every test deploys its contracts behind a proxy, as the deploy script does, and each suite checks that only the admin can upgrade.
-
-**The tests never touch a real network.** `forge test` runs every test on a local chain that Forge simulates in memory. The contracts are deployed there, the ETH and tokens the tests use are made up (`vm.deal`, the mocks), and the chain is thrown away when the test ends. Nothing is deployed to Base Sepolia or any other network, and no test ETH is spent. The only commands that send real transactions are scripts run with `--broadcast` (see *Deploy and upgrade*).
+You must install [Foundry](https://getfoundry.sh) and [Node.js](https://nodejs.org). Both libraries are git submodules under `solidity/lib/`. After a fresh clone run `git submodule update --init --recursive`. OpenZeppelin Contracts (v5.7.0) is the copy inside `openzeppelin-contracts-upgradeable`, which is how the [OpenZeppelin Foundry Upgrades](https://docs.openzeppelin.com/upgrades-plugins/foundry/foundry-upgrades) plugin is set up.
 
 ## Generate ABI
 
 ```sh
-(cd solidity && forge inspect src/DataRegistry.sol:DataRegistry abi --json)
+forge inspect src/DataRegistry.sol:DataRegistry abi --json
 ```
-
-When a contract's ABI changes, clients need the new ABI.
 
 ## Deploy and upgrade
 
-Everything here runs from `solidity/`. `<keystore>` and `<admin>` are explained under *Signing*; the RPCs and admins are in *Deployed*.
+All contracts are upgradeable using an ERC-1967 proxy (UUPS).
 
 ### Commands
 
-**Ship what `src/` says.** This is the usual one. It upgrades every contract whose code changed since it was deployed and leaves the rest:
-
-```sh
-forge script script/Upgrade.s.sol --force \
-  --rpc-url <rpc> --account <keystore> --sender <admin> --broadcast
-```
-
-Then commit what it wrote under `deployed/` and `broadcast/`. Leave off `--broadcast` to see what it would do: it prints `up to date` or the upgrade for each contract.
-
 | What                                  | Command (add `--rpc-url <rpc> --account <keystore> --sender <admin> --broadcast`) |
 | ------------------------------------- | --------------------------------------------------------------------------------- |
-| Upgrade one contract only             | `forge script script/Upgrade.s.sol --force --sig "upgrade(string)" DataRegistry`  |
-| Rotate the admin of every registry    | `forge script script/RotateAdmin.s.sol --sig "run(address)" <new admin>`          |
-| First deployment on a new chain       | `forge script script/Deploy.s.sol --force --sig "all()"` (see *First deployment*) |
-| Check `deployed/` is the live code    | `forge script script/Upgrade.s.sol --sig "check()" --rpc-url <rpc>` (no signer)   |
+| Upgrade a contract             | `forge script script/Upgrade.s.sol --force --sig "upgrade(string)" DataRegistry`  |
+| Deployment fresh proxy contracts       | `forge script script/Deploy.s.sol --force --sig "all()"` (see *First deployment*) |
+| Update a contracts a deployed proxy points to    | `forge script script/Upgrade.s.sol --sig "check()" --rpc-url <rpc>` (no signer)   |
 
-Every script simulates the whole run first and sends nothing unless all of it would succeed, so a wrong signer or a failed check costs nothing. `--force` is required wherever it is shown: the upgrade-safety check needs a full build.
+### Setup
 
-### Signing
-
-Scripts sign with a Foundry keystore: a private key stored encrypted under `~/.foundry/keystores/<name>`. `<keystore>` is that name. Import each key once:
+Setup a Foundry keystore in order to sign transactions. Keys are encrypted and stored under `~/.foundry/keystores/<name>`. `<keystore>`.
 
 ```sh
 cast wallet import admin-base --interactive   # paste the private key, then choose a password
@@ -79,15 +63,36 @@ cast wallet list                              # the names you have imported
 cast wallet address --account admin-base      # the address behind it: pass it as --sender
 ```
 
-Forge asks for the password when it signs. For a hardware wallet, pass `--ledger` instead of `--account`. No script reads a private key from the environment.
+> Pass `--ledger` instead of `--account` for a hardware wallet.
 
-Each chain has its own admin, and every call except a first deployment must be signed by it. Import one keystore per admin (e.g. `admin-arb`, `admin-base`).
+### First deployment
 
-### Rotating the admin
+Only for a chain with nothing on it yet: a redeploy starts empty at a new address. To change a deployed contract, upgrade it.
 
-Each registry keeps its own admin. `RotateAdmin.s.sol` moves every deployed one at once, and first checks that they all still have the admin it records for the chain, so they cannot quietly drift apart. It refuses the zero address. After it runs, update the address it records.
+```sh
+forge script script/Deploy.s.sol --force --sig "all()" \
+  --rpc-url <rpc> --account <keystore> --sender <deployer> --broadcast
+```
 
-### How an upgrade works
+| `--sig`                  | Deploys              |
+| ------------------------ | -------------------- |
+| `"all()"`                | Every registry       |
+| `"dataRegistry()"`       | A DataRegistry       |
+| `"settlementRegistry()"` | A SettlementRegistry |
+
+Parameters are environment variables, with defaults in `solidity/.env.example` (Forge reads `solidity/.env`):
+
+- `ADMIN_ADDR`: required.
+- `USDC_ADDR`, `SEMAPHORE_ADDR`: default to Base Sepolia's; required on any other chain.
+
+Afterwards:
+
+1. Record each printed proxy address in `script/Deployments.sol`. The other scripts find the contracts there.
+2. Commit the builds the script wrote under `deployed/<chain id>/`, along with the broadcast log. The first upgrade is checked against them. `UpgradeSafety` fails while the builds and `Deployments.sol` disagree.
+3. Add the admin to `script/RotateAdmin.s.sol` and the chain to *Deployed* above.
+
+
+### Upgrading Contracts
 
 An upgrade replaces the code behind a proxy (`upgradeToAndCall`, admin-only). The address and all state stay, so nothing is migrated or repointed. If the ABI changed, clients need the new ABI.
 
@@ -118,60 +123,3 @@ forge script script/Upgrade.s.sol --force \
 
 A rehearsal writes a build under `deployed/`: delete it (`git clean -fd deployed`) or leave it for the real run to replace.
 
-### First deployment
-
-Only for a chain with nothing on it yet: a redeploy starts empty at a new address. To change a deployed contract, upgrade it.
-
-```sh
-forge script script/Deploy.s.sol --force --sig "all()" \
-  --rpc-url <rpc> --account <keystore> --sender <deployer> --broadcast
-```
-
-| `--sig`                  | Deploys              |
-| ------------------------ | -------------------- |
-| `"all()"`                | Every registry       |
-| `"dataRegistry()"`       | A DataRegistry       |
-| `"settlementRegistry()"` | A SettlementRegistry |
-
-Parameters are environment variables, with defaults in `solidity/.env.example` (Forge reads `solidity/.env`):
-
-- `ADMIN_ADDR`: required.
-- `USDC_ADDR`, `SEMAPHORE_ADDR`: default to Base Sepolia's; required on any other chain.
-
-Afterwards:
-
-1. Record each printed proxy address in `script/Deployments.sol`. The other scripts find the contracts there.
-2. Commit the builds the script wrote under `deployed/<chain id>/`, along with the broadcast log. The first upgrade is checked against them. `UpgradeSafety` fails while the builds and `Deployments.sol` disagree.
-3. Add the admin to `script/RotateAdmin.s.sol` and the chain to *Deployed* above.
-
-## Architecture
-
-```
-  Publisher ── update / updateBySig ──▶ DataRegistry        (P, keccak(repo)) → (pos, head)
-               own repos only                                update log: MMR peaks
-
-  Buyer ── register(terms, sig, pay) ──▶ SettlementRegistry  USDC split publisher / referrer
-       ── settle(proof, reader)                               Semaphore group per subject
-  Access worker ── canRead(reader, P, repo, key)
-```
-
-## DataRegistry
-
-The head of every repo, and the update log.
-
-- `update(repo, epoch, parent, root, car)`: moves the sender's `repo` from `parent` to the commit `(epoch, parent, root, repo, car)`, whose head the contract computes (`commitHead`): the sha256 digest of the commit's dag-cbor block. Reverts `StaleStateRoot` unless `parent` is the head, and `EpochOutOfWindow` unless `epoch` is within `WINDOW` (24) one-hour epochs of `currentEpoch()`. Emits `Updated(publisher, repo_id, repo, pos, parent, head)`.
-- `updateBySig(publisher, repo, epoch, parent, root, car, signature)`: the same, authorized by the publisher's EIP-712 `Update` signature (or ERC-1271 for a contract wallet), so anyone may submit it. The parent check stops replays.
-- The update log is a Merkle mountain range kept as `peaks` and `logLength`; `logRoot()` computes its root. Leaf `keccak256(abi.encode("leaf", publisher, repo_id, pos, head, timestamp))`.
-- Views: `getHead(publisher, repo_id) → (pos, head)`, `repoIds(publisher, i)`, `repoCount(publisher)`, `commitHead`, `currentEpoch`, `domainSeparator`, `admin`.
-- `initialize(admin)`.
-
-## SettlementRegistry
-
-Sells read access to a *subject* `(publisher, repo, key)`: `repo` is `keccak256` of the repo's name, and key zero is the whole repo. Prices are terms the publisher signs off-chain.
-
-- `register(terms, signature, commitment, referrer, salt, payment)`: checks the publisher's EIP-712 `Terms(publisher, repo, key, price, shareBps, generation, deadline)` (or ERC-1271), takes `price` in USDC by ERC-3009 `receiveWithAuthorization` with nonce `registerNonce(subject, commitment, referrer, salt)`, pays the referrer `shareBps` unless it is denied or is the publisher, and the publisher the rest, and adds the Semaphore `commitment` to the subject's group. Free subjects move no money.
-- `settle(publisher, repo, key, proof, reader)`: a Semaphore proof of membership in the subject's group, scoped to the subject, with `reader` as its message. One settle per payment.
-- `canRead(reader, publisher, repo, key)`: true if the reader settled the record or the whole repo, and neither is disabled. What the access worker reads.
-- Publisher: `raiseGeneration(repo)` voids every older terms for the repo; `setDenied(referrer, bool)`; `setDisabled(publisher, repo, key, bool)` (publisher or admin).
-- Views: `subjectOf`, `registerNonce`, `hashTerms`, `generationOf`, `isDenied`, `isDisabled`, `groupOf`, `isRegistered`, `isSettled`, `usdc`, `semaphore`, `admin`.
-- `initialize(admin, usdc, semaphore)`.
