@@ -125,6 +125,9 @@ contract SettlementRegistry is Initializable, UUPSUpgradeable, EIP712Upgradeable
     mapping(uint256 => bool) internal nullifiers;
     /// keccak256(reader, subject)
     mapping(bytes32 => bool) internal settled;
+    /// subject => its group's commitments, in the order they were added. A proof needs every
+    /// one; the chain keeps them so a buyer reads them in one call, not from the event log.
+    mapping(bytes32 => uint256[]) internal members;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -225,6 +228,7 @@ contract SettlementRegistry is Initializable, UUPSUpgradeable, EIP712Upgradeable
             groups[subject] = g;
         }
         ISemaphore(semaphore).addMember(g - 1, commitment);
+        members[subject].push(commitment);
         emit Registered(subject, t.publisher, referrer, commitment, t.price, cut);
     }
 
@@ -263,6 +267,13 @@ contract SettlementRegistry is Initializable, UUPSUpgradeable, EIP712Upgradeable
         uint256 g = groups[subject];
         if (g == 0) revert NoGroup();
         return g - 1;
+    }
+
+    /// Every commitment in `subject`'s group, in the order the group added them: what a buyer
+    /// builds its proof from. ponytail: the whole list in one call; page it if a record ever has
+    /// so many buyers that an RPC caps the response.
+    function membersOf(bytes32 subject) external view returns (uint256[] memory) {
+        return members[subject];
     }
 
     function isRegistered(bytes32 subject, uint256 commitment) external view returns (bool) {
