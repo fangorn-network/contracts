@@ -19,10 +19,11 @@ import {Options} from "openzeppelin-foundry-upgrades/Options.sol";
 ///      It records the build of the new version next to the old one. Commit it.
 library Deployments {
     uint256 internal constant BASE_SEPOLIA = 84532;
+    uint256 internal constant ARBITRUM_SEPOLIA = 421614;
 
     /// Every chain the contracts are deployed on, or may be.
-    function chains() internal pure returns (uint256[1] memory) {
-        return [BASE_SEPOLIA];
+    function chains() internal pure returns (uint256[2] memory) {
+        return [BASE_SEPOLIA, ARBITRUM_SEPOLIA];
     }
 
     /// Each contract's source: what a new proxy is deployed with, and what an existing
@@ -61,6 +62,11 @@ library Deployments {
             // Deployed with Deploy.s.sol all(), in blocks 53592845 to 53592851.
             if (n == keccak256("DataRegistry")) return 0x0F3eb0E62CF610dbaC6B3aD4Bf4cE38Ab50EBCC5;
             if (n == keccak256("SettlementRegistry")) return 0x61A5A195B54F57ada786Ba6689CdB04553cf7fBc;
+        }
+        if (chainId == ARBITRUM_SEPOLIA) {
+            // Deployed with Deploy.s.sol all(), in blocks 328303800 to 328303825.
+            if (n == keccak256("DataRegistry")) return 0x44B5a9C43F5905699747e062A126a588816436C4;
+            if (n == keccak256("SettlementRegistry")) return 0xC248Ef78e38bCa33708B3Fd9A21375E0AA10cf27;
         }
         return address(0);
     }

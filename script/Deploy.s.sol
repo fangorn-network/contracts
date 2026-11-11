@@ -35,10 +35,14 @@ import {Deployments} from "./Deployments.sol";
 /// Parameters are environment variables (Forge also reads a `.env` in this directory):
 ///   ADMIN_ADDR              required. Takedowns and upgrades.
 ///   USDC_ADDR, SEMAPHORE_ADDR
-///                           default to Base Sepolia's; required on any other chain
+///                           default to the chain's own on Base Sepolia and Arbitrum
+///                           Sepolia; required on any other chain
 contract Deploy is Builds {
+    /// Circle's USDC. Its EIP-712 name differs by chain ("USDC" on Base Sepolia, "USD Coin"
+    /// on Arbitrum Sepolia); clients read it from the token, the contracts never need it.
     address internal constant BASE_SEPOLIA_USDC = 0x036CbD53842c5426634e7929541eC2318f3dCF7e;
-    /// Semaphore v4
+    address internal constant ARBITRUM_SEPOLIA_USDC = 0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d;
+    /// Semaphore v4, at the same address (and the same code) on both chains.
     address internal constant SEMAPHORE = 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D;
 
     function all() external {
@@ -125,17 +129,20 @@ contract Deploy is Builds {
     }
 
     function _usdc() internal view returns (address) {
-        return _external("USDC_ADDR", BASE_SEPOLIA_USDC);
+        if (block.chainid == Deployments.BASE_SEPOLIA) return _external("USDC_ADDR", BASE_SEPOLIA_USDC);
+        if (block.chainid == Deployments.ARBITRUM_SEPOLIA) return _external("USDC_ADDR", ARBITRUM_SEPOLIA_USDC);
+        return _external("USDC_ADDR", address(0));
     }
 
     function _semaphore() internal view returns (address) {
-        return _external("SEMAPHORE_ADDR", SEMAPHORE);
+        bool known = block.chainid == Deployments.BASE_SEPOLIA || block.chainid == Deployments.ARBITRUM_SEPOLIA;
+        return _external("SEMAPHORE_ADDR", known ? SEMAPHORE : address(0));
     }
 
     /// An address this deployment depends on. The known ones are only defaults on the
-    /// chain they belong to; anywhere else it has to be given.
-    function _external(string memory name, address onBaseSepolia) private view returns (address) {
-        if (block.chainid == Deployments.BASE_SEPOLIA) return vm.envOr(name, onBaseSepolia);
+    /// chain they belong to (`onThisChain`, zero elsewhere); anywhere else it has to be given.
+    function _external(string memory name, address onThisChain) private view returns (address) {
+        if (onThisChain != address(0)) return vm.envOr(name, onThisChain);
         return vm.envAddress(name);
     }
 }

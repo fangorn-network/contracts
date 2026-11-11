@@ -12,14 +12,14 @@ Almost nothing lives on-chain. A publisher's repo is `(publisher, name)`, and it
 
 ## Deployed Contracts
 
-The latest contracts are deployed to Base Sepolia:
+The latest contracts are deployed to Base Sepolia and Arbitrum Sepolia (separate deployments; addresses are the proxies):
 
-| Contract           | Base Sepolia (84532)                         |
-| ------------------ | -------------------------------------------- |
-| DataRegistry       | `0x0F3eb0E62CF610dbaC6B3aD4Bf4cE38Ab50EBCC5` |
-| SettlementRegistry | `0x61A5A195B54F57ada786Ba6689CdB04553cf7fBc` |
-| Admin (wallet)     | `0x7b16387C5A8c514880E48bcacd52782FCF9Da936` |
-| RPC                | `https://sepolia.base.org`                   |
+| Contract           | Base Sepolia (84532)                         | Arbitrum Sepolia (421614)                    |
+| ------------------ | -------------------------------------------- | -------------------------------------------- |
+| DataRegistry       | `0x0F3eb0E62CF610dbaC6B3aD4Bf4cE38Ab50EBCC5` | `0x44B5a9C43F5905699747e062A126a588816436C4` |
+| SettlementRegistry | `0x61A5A195B54F57ada786Ba6689CdB04553cf7fBc` | `0xC248Ef78e38bCa33708B3Fd9A21375E0AA10cf27` |
+| Admin (wallet)     | `0x7b16387C5A8c514880E48bcacd52782FCF9Da936` | `0xB2F5361DBEF0715E1d6aa072284255dD7f1d43FC` |
+| RPC                | `https://sepolia.base.org`                   | `https://sepolia-rollup.arbitrum.io/rpc` |
 
 See [spec.md](docs/spec.md) for more information on each contract and the overal architecture. 
 
@@ -83,7 +83,7 @@ forge script script/Deploy.s.sol --force --sig "all()" \
 Parameters are environment variables, with defaults in `solidity/.env.example` (Forge reads `solidity/.env`):
 
 - `ADMIN_ADDR`: required.
-- `USDC_ADDR`, `SEMAPHORE_ADDR`: default to Base Sepolia's; required on any other chain.
+- `USDC_ADDR`, `SEMAPHORE_ADDR`: default to the chain's own on Base Sepolia and Arbitrum Sepolia (Circle's USDC; Semaphore v4 at `0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D` on both); required on any other chain.
 
 Afterwards:
 
