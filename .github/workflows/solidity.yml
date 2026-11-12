@@ -36,3 +36,37 @@ jobs:
           pct=$(grep -E '^\| Total' coverage.txt | grep -oE '[0-9]+\.[0-9]+%' | head -1 | tr -d %)
           echo "Line coverage: ${pct}%"
           awk -v p="$pct" 'BEGIN { exit !(p >= 85) }' || { echo "::error::Line coverage ${pct}% is below 85%"; exit 1; }
+
+  # On merge to main: upgrade every proxy whose code in src/ differs from the live code,
+  # then commit the new builds under deployed/ and the broadcast log back to main.
+  # Upgrade.s.sol decides what is out of date, so a merge that changes no contract sends nothing.
+  upgrade:
+    needs: forge
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Add required reviewers to this environment (Settings → Environments) to approve each upgrade by hand.
+    environment: base-sepolia
+    concurrency: { group: upgrade-base-sepolia, cancel-in-progress: false }
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Upgrade
+        env:
+          RPC_URL: ${{ vars.BASE_SEPOLIA_RPC_URL }}
+          ADMIN_PRIVATE_KEY: ${{ secrets.ADMIN_PRIVATE_KEY }}
+        run: forge script script/Upgrade.s.sol --force --rpc-url "$RPC_URL" --private-key "$ADMIN_PRIVATE_KEY" --broadcast
+
+      - name: Commit builds
+        run: |
+          git add deployed broadcast
+          git diff --cached --quiet && { echo "Nothing upgraded."; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Record upgrade builds for ${GITHUB_SHA::7}"
+          git push

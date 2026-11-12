@@ -32,18 +32,19 @@ contract DataRegistryTest is Test {
     address constant PUB = 0x2222222222222222222222222222222222222222;
 
     // Commits encoded by the SDK (`encodeBlock` in src/engine/records.ts): an empty MST
-    // root, and a raw CID of the bytes 0x010203 as the CAR.
+    // root, a diff of 0x11.., and a raw CID of the bytes 0x010203 as the CAR.
     bytes32 constant ROOT = 0xc3a75f27a0777dd37f80e7252ba50f882a088dd9b6e3e602281b9c217375cd9f;
+    bytes32 constant DIFF = 0x1111111111111111111111111111111111111111111111111111111111111111;
     bytes constant CAR = hex"01551220039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81";
     uint64 constant E = 493_000;
-    /// (E, no parent, ROOT, "photos", CAR)
-    bytes32 constant FIRST = 0x745133376af45492027c3773e51c69553b6c728af140de19e4b3489c0e789c94;
-    /// (E + 1, FIRST, ROOT, "photos", CAR)
-    bytes32 constant SECOND = 0x43eed88abf71cb580f34d4da9a0307977e54039e9a7c335f49040293328fb44e;
-    /// (7, FIRST, ROOT, 256 x "r", CAR)
-    bytes32 constant LONG = 0xc2d736394f98eeacb72b4f1f2d20961d558ec56ca6fa7a9a90fe3de736ed93f4;
-    /// (23, no parent, ROOT, "a", CAR)
-    bytes32 constant SMALL = 0xa9cbca8f0bd56bab838f43d0dfdb3bf460163017d793b3fe17798837173b6d0b;
+    /// (E, no parent, DIFF, ROOT, "photos", CAR)
+    bytes32 constant FIRST = 0x96e5fb518a2070784f5c2920494d35c7585a7c3ebf0e11c48138ff607d4f499f;
+    /// (E + 1, FIRST, DIFF, ROOT, "photos", CAR)
+    bytes32 constant SECOND = 0xd4d5aecb442c8e8c510ea16de16af34726babf069c375356b50468be21998242;
+    /// (7, FIRST, DIFF, ROOT, 256 x "r", CAR)
+    bytes32 constant LONG = 0x25028509d1c083e454d4dbc6840c45b88354603a44a96683298c26557bf6fd8a;
+    /// (23, no parent, DIFF, ROOT, "a", CAR)
+    bytes32 constant SMALL = 0xb3f8e42d45c2f0db59f96985b4528e253c855a01db88631ef84ed5182d584ef1;
 
     event Updated(
         address indexed publisher, bytes32 indexed repo_id, string repo, uint64 pos, bytes32 parent, bytes32 head
@@ -61,21 +62,25 @@ contract DataRegistryTest is Test {
 
     function update(address who, string memory repo, uint64 epoch, bytes32 parent) internal returns (bytes32) {
         vm.prank(who);
-        return registry.update(repo, epoch, parent, ROOT, CAR);
+        return registry.update(repo, epoch, parent, DIFF, ROOT, CAR);
     }
 
     function headOf(address who, string memory repo) internal view returns (uint64 pos, bytes32 head) {
         return registry.getHead(who, keccak256(bytes(repo)));
     }
 
-    function digest(address publisher, string memory repo, uint64 epoch, bytes32 parent, bytes32 root, bytes memory car)
-        internal
-        view
-        returns (bytes32)
-    {
+    function digest(
+        address publisher,
+        string memory repo,
+        uint64 epoch,
+        bytes32 parent,
+        bytes32 diff,
+        bytes32 root,
+        bytes memory car
+    ) internal view returns (bytes32) {
         bytes32 structHash = keccak256(
             abi.encode(
-                registry.UPDATE_TYPEHASH(), publisher, keccak256(bytes(repo)), epoch, parent, root, keccak256(car)
+                registry.UPDATE_TYPEHASH(), publisher, keccak256(bytes(repo)), epoch, parent, diff, root, keccak256(car)
             )
         );
         return keccak256(abi.encodePacked(hex"1901", registry.domainSeparator(), structHash));
@@ -94,14 +99,14 @@ contract DataRegistryTest is Test {
     // ── heads ─────────────────────────────────────────────────────────────────
 
     function test_commitHead_matches_the_sdk() public view {
-        assertEq(registry.commitHead("photos", E, bytes32(0), ROOT, CAR), FIRST);
-        assertEq(registry.commitHead("photos", E + 1, FIRST, ROOT, CAR), SECOND);
+        assertEq(registry.commitHead("photos", E, bytes32(0), DIFF, ROOT, CAR), FIRST);
+        assertEq(registry.commitHead("photos", E + 1, FIRST, DIFF, ROOT, CAR), SECOND);
         bytes memory longName = new bytes(256);
         for (uint256 i = 0; i < 256; i++) {
             longName[i] = "r";
         }
-        assertEq(registry.commitHead(string(longName), 7, FIRST, ROOT, CAR), LONG);
-        assertEq(registry.commitHead("a", 23, bytes32(0), ROOT, CAR), SMALL);
+        assertEq(registry.commitHead(string(longName), 7, FIRST, DIFF, ROOT, CAR), LONG);
+        assertEq(registry.commitHead("a", 23, bytes32(0), DIFF, ROOT, CAR), SMALL);
     }
 
     function test_update_sets_the_computed_head() public {
@@ -127,7 +132,7 @@ contract DataRegistryTest is Test {
         assertEq(pos, 0);
         assertEq(head, bytes32(0));
         bytes32 b = update(PUB, "b", E, bytes32(0));
-        bytes32 a1 = registry.commitHead("a", E, bytes32(0), ROOT, CAR);
+        bytes32 a1 = registry.commitHead("a", E, bytes32(0), DIFF, ROOT, CAR);
         update(PUB, "a", E, a1);
         (pos,) = headOf(PUB, "a");
         assertEq(pos, 2);
@@ -141,11 +146,11 @@ contract DataRegistryTest is Test {
     function test_a_stale_parent_is_rejected() public {
         vm.prank(PUB);
         vm.expectRevert(DataRegistry.StaleStateRoot.selector);
-        registry.update("photos", E, FIRST, ROOT, CAR);
+        registry.update("photos", E, FIRST, DIFF, ROOT, CAR);
         update(PUB, "photos", E, bytes32(0));
         vm.prank(PUB);
         vm.expectRevert(DataRegistry.StaleStateRoot.selector);
-        registry.update("photos", E, bytes32(0), ROOT, CAR);
+        registry.update("photos", E, bytes32(0), DIFF, ROOT, CAR);
     }
 
     function test_epoch_window() public {
@@ -155,11 +160,11 @@ contract DataRegistryTest is Test {
 
         vm.prank(PUB);
         vm.expectRevert(DataRegistry.EpochOutOfWindow.selector);
-        registry.update("a", now_ + 1, bytes32(0), ROOT, CAR);
+        registry.update("a", now_ + 1, bytes32(0), DIFF, ROOT, CAR);
 
         vm.prank(PUB);
         vm.expectRevert(DataRegistry.EpochOutOfWindow.selector);
-        registry.update("a", now_ - w - 1, bytes32(0), ROOT, CAR);
+        registry.update("a", now_ - w - 1, bytes32(0), DIFF, ROOT, CAR);
 
         update(PUB, "a", now_ - w, bytes32(0));
         update(PUB, "b", now_, bytes32(0));
@@ -168,7 +173,7 @@ contract DataRegistryTest is Test {
     function test_repo_ids_are_listed_once_in_first_write_order() public {
         update(PUB, "b", E, bytes32(0));
         update(PUB, "a", E, bytes32(0));
-        update(PUB, "b", E, registry.commitHead("b", E, bytes32(0), ROOT, CAR));
+        update(PUB, "b", E, registry.commitHead("b", E, bytes32(0), DIFF, ROOT, CAR));
         assertEq(registry.repoCount(PUB), 2);
         assertEq(registry.repoIds(PUB, 0), keccak256("b"));
         assertEq(registry.repoIds(PUB, 1), keccak256("a"));
@@ -178,9 +183,9 @@ contract DataRegistryTest is Test {
     // ── updateBySig ───────────────────────────────────────────────────────────
 
     function test_updateBySig_moves_the_signers_repo() public {
-        bytes memory sig = sign(digest(signer, "photos", E, bytes32(0), ROOT, CAR));
+        bytes memory sig = sign(digest(signer, "photos", E, bytes32(0), DIFF, ROOT, CAR));
         vm.prank(PUB);
-        registry.updateBySig(signer, "photos", E, bytes32(0), ROOT, CAR, sig);
+        registry.updateBySig(signer, "photos", E, bytes32(0), DIFF, ROOT, CAR, sig);
         (uint64 pos, bytes32 head) = headOf(signer, "photos");
         assertEq(pos, 1);
         assertEq(head, FIRST);
@@ -189,56 +194,60 @@ contract DataRegistryTest is Test {
     }
 
     function test_updateBySig_cannot_be_replayed() public {
-        bytes memory sig = sign(digest(signer, "photos", E, bytes32(0), ROOT, CAR));
-        registry.updateBySig(signer, "photos", E, bytes32(0), ROOT, CAR, sig);
+        bytes memory sig = sign(digest(signer, "photos", E, bytes32(0), DIFF, ROOT, CAR));
+        registry.updateBySig(signer, "photos", E, bytes32(0), DIFF, ROOT, CAR, sig);
         vm.expectRevert(DataRegistry.StaleStateRoot.selector);
-        registry.updateBySig(signer, "photos", E, bytes32(0), ROOT, CAR, sig);
+        registry.updateBySig(signer, "photos", E, bytes32(0), DIFF, ROOT, CAR, sig);
     }
 
     function test_updateBySig_rejects_another_signer() public {
         (, uint256 other) = makeAddrAndKey("other");
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(other, digest(signer, "photos", E, bytes32(0), ROOT, CAR));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(other, digest(signer, "photos", E, bytes32(0), DIFF, ROOT, CAR));
         vm.expectRevert(DataRegistry.BadSignature.selector);
-        registry.updateBySig(signer, "photos", E, bytes32(0), ROOT, CAR, abi.encodePacked(r, s, v));
+        registry.updateBySig(signer, "photos", E, bytes32(0), DIFF, ROOT, CAR, abi.encodePacked(r, s, v));
     }
 
     function test_updateBySig_rejects_any_changed_field() public {
-        bytes memory sig = sign(digest(signer, "photos", E, bytes32(0), ROOT, CAR));
+        bytes memory sig = sign(digest(signer, "photos", E, bytes32(0), DIFF, ROOT, CAR));
         vm.expectRevert(DataRegistry.BadSignature.selector);
-        registry.updateBySig(signer, "videos", E, bytes32(0), ROOT, CAR, sig);
+        registry.updateBySig(signer, "videos", E, bytes32(0), DIFF, ROOT, CAR, sig);
         vm.expectRevert(DataRegistry.BadSignature.selector);
-        registry.updateBySig(signer, "photos", E + 1, bytes32(0), ROOT, CAR, sig);
+        registry.updateBySig(signer, "photos", E + 1, bytes32(0), DIFF, ROOT, CAR, sig);
         vm.expectRevert(DataRegistry.BadSignature.selector);
-        registry.updateBySig(signer, "photos", E, bytes32(0), bytes32(uint256(1)), CAR, sig);
+        registry.updateBySig(signer, "photos", E, bytes32(0), DIFF, bytes32(uint256(1)), CAR, sig);
         vm.expectRevert(DataRegistry.BadSignature.selector);
-        registry.updateBySig(signer, "photos", E, bytes32(0), ROOT, hex"0155", sig);
+        registry.updateBySig(signer, "photos", E, bytes32(0), bytes32(uint256(2)), ROOT, CAR, sig);
         vm.expectRevert(DataRegistry.BadSignature.selector);
-        registry.updateBySig(PUB, "photos", E, bytes32(0), ROOT, CAR, sig);
+        registry.updateBySig(signer, "photos", E, bytes32(0), DIFF, ROOT, hex"0155", sig);
+        vm.expectRevert(DataRegistry.BadSignature.selector);
+        registry.updateBySig(PUB, "photos", E, bytes32(0), DIFF, ROOT, CAR, sig);
     }
 
     function test_updateBySig_is_bound_to_this_registry() public {
         DataRegistry other = Proxied.dataRegistry(ADMIN);
         bytes32 structHash = keccak256(
-            abi.encode(registry.UPDATE_TYPEHASH(), signer, keccak256("photos"), E, bytes32(0), ROOT, keccak256(CAR))
+            abi.encode(
+                registry.UPDATE_TYPEHASH(), signer, keccak256("photos"), E, bytes32(0), DIFF, ROOT, keccak256(CAR)
+            )
         );
         bytes memory sig = sign(keccak256(abi.encodePacked(hex"1901", other.domainSeparator(), structHash)));
         vm.expectRevert(DataRegistry.BadSignature.selector);
-        registry.updateBySig(signer, "photos", E, bytes32(0), ROOT, CAR, sig);
+        registry.updateBySig(signer, "photos", E, bytes32(0), DIFF, ROOT, CAR, sig);
     }
 
     function test_updateBySig_from_a_contract_wallet() public {
         DataWallet wallet = new DataWallet();
-        wallet.approve(digest(address(wallet), "photos", E, bytes32(0), ROOT, CAR));
-        registry.updateBySig(address(wallet), "photos", E, bytes32(0), ROOT, CAR, "");
+        wallet.approve(digest(address(wallet), "photos", E, bytes32(0), DIFF, ROOT, CAR));
+        registry.updateBySig(address(wallet), "photos", E, bytes32(0), DIFF, ROOT, CAR, "");
         (uint64 pos,) = headOf(address(wallet), "photos");
         assertEq(pos, 1);
     }
 
     function test_updateBySig_checks_the_epoch_window() public {
         uint64 late = registry.currentEpoch() - registry.WINDOW() - 1;
-        bytes memory sig = sign(digest(signer, "photos", late, bytes32(0), ROOT, CAR));
+        bytes memory sig = sign(digest(signer, "photos", late, bytes32(0), DIFF, ROOT, CAR));
         vm.expectRevert(DataRegistry.EpochOutOfWindow.selector);
-        registry.updateBySig(signer, "photos", late, bytes32(0), ROOT, CAR, sig);
+        registry.updateBySig(signer, "photos", late, bytes32(0), DIFF, ROOT, CAR, sig);
     }
 
     // ── log ───────────────────────────────────────────────────────────────────
@@ -294,7 +303,7 @@ contract DataRegistryTest is Test {
         update(PUB, "a", E, bytes32(0));
         vm.prank(PUB);
         vm.expectRevert(DataRegistry.StaleStateRoot.selector);
-        registry.update("a", E, bytes32(0), ROOT, CAR);
+        registry.update("a", E, bytes32(0), DIFF, ROOT, CAR);
         assertEq(registry.logLength(), 1);
     }
 
