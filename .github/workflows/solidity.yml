@@ -38,7 +38,8 @@ jobs:
           awk -v p="$pct" 'BEGIN { exit !(p >= 85) }' || { echo "::error::Line coverage ${pct}% is below 85%"; exit 1; }
 
   # On merge to main: upgrade every proxy whose code in src/ differs from the live code,
-  # then commit the new builds under deployed/ and the broadcast log back to main.
+  # then open a PR with the new builds under deployed/ and the broadcast log (main only takes PRs).
+  # Merge it before the next upgrade: until deployed/ holds the live build, Upgrade.s.sol refuses to run.
   # Upgrade.s.sol decides what is out of date, so a merge that changes no contract sends nothing.
   upgrade:
     needs: forge
@@ -49,6 +50,7 @@ jobs:
     concurrency: { group: upgrade-base-sepolia, cancel-in-progress: false }
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,11 +64,17 @@ jobs:
           ADMIN_PRIVATE_KEY: ${{ secrets.ADMIN_PRIVATE_KEY }}
         run: forge script script/Upgrade.s.sol --force --rpc-url "$RPC_URL" --private-key "$ADMIN_PRIVATE_KEY" --broadcast
 
-      - name: Commit builds
+      - name: Open PR with builds
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git add deployed broadcast
           git diff --cached --quiet && { echo "Nothing upgraded."; exit 0; }
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          branch="upgrade-builds/${GITHUB_SHA::7}"
+          git switch -c "$branch"
           git commit -m "Record upgrade builds for ${GITHUB_SHA::7}"
-          git push
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" --title "Record upgrade builds for ${GITHUB_SHA::7}" \
+            --body "The upgrade from ${GITHUB_SHA} is already live on base-sepolia. Merge this before the next upgrade."
