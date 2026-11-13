@@ -362,4 +362,33 @@ contract DataRegistryTest is Test {
         vm.prank(PUB);
         registry.upgradeToAndCall(v2, "");
     }
+
+    /// The SDK sends every write with `estimate * 1.3 + APPEND_ALLOWANCE` gas (src/contracts/write.ts).
+    /// The estimate goes stale when other updates land first, and the costliest way it can is
+    /// this update appending at length 2^63 - 1: 63 merges and a first write to peaks[63].
+    /// If `_append` grows costlier than this, raise APPEND_ALLOWANCE in the SDK with it, or
+    /// such a write runs out of gas.
+    uint256 constant SDK_APPEND_ALLOWANCE = 200_000;
+
+    function test_append_worst_case_fits_sdk_allowance() public {
+        uint256 snap = vm.snapshotState();
+        uint256 cheapest = appendGasAt(uint64(1) << 63); // no merges, peaks[0] already written
+        vm.revertToState(snap);
+        uint256 worst = appendGasAt(type(uint64).max >> 1); // 2^63 - 1
+        assertLe(worst - cheapest, SDK_APPEND_ALLOWANCE);
+    }
+
+    /// Gas for a first update when the log has `n` entries and every peak below the top bit
+    /// has been written before, as it has on a real chain.
+    function appendGasAt(uint64 n) internal returns (uint256 used) {
+        vm.store(address(registry), bytes32(uint256(2)), bytes32(uint256(n))); // logLength
+        for (uint256 h = 0; h < 63; h++) {
+            vm.store(address(registry), keccak256(abi.encode(h, uint256(3))), bytes32(uint256(1))); // peaks[h]
+        }
+        vm.cool(address(registry));
+        vm.prank(PUB);
+        used = gasleft();
+        registry.update("photos", E, bytes32(0), DIFF, ROOT, CAR);
+        used -= gasleft();
+    }
 }
