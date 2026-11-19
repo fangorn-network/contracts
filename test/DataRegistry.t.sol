@@ -47,7 +47,14 @@ contract DataRegistryTest is Test {
     bytes32 constant SMALL = 0xb3f8e42d45c2f0db59f96985b4528e253c855a01db88631ef84ed5182d584ef1;
 
     event Updated(
-        address indexed publisher, bytes32 indexed repo_id, string repo, uint64 pos, bytes32 parent, bytes32 head
+        address indexed publisher,
+        bytes32 indexed repo_id,
+        string repo,
+        uint64 pos,
+        bytes32 parent,
+        bytes32 head,
+        uint64 index,
+        uint64 timestamp
     );
 
     DataRegistry registry;
@@ -111,7 +118,7 @@ contract DataRegistryTest is Test {
 
     function test_update_sets_the_computed_head() public {
         vm.expectEmit(true, true, true, true, address(registry));
-        emit Updated(PUB, keccak256("photos"), "photos", 1, bytes32(0), FIRST);
+        emit Updated(PUB, keccak256("photos"), "photos", 1, bytes32(0), FIRST, 0, uint64(block.timestamp));
         assertEq(update(PUB, "photos", E, bytes32(0)), FIRST);
         update(PUB, "photos", E + 1, FIRST);
         (uint64 pos, bytes32 head) = headOf(PUB, "photos");
@@ -299,6 +306,24 @@ contract DataRegistryTest is Test {
         }
     }
 
+    /// The event carries everything in the leaf, so a client rebuilds the log from events alone.
+    function test_event_carries_the_leaf() public {
+        update(PUB, "a", E, bytes32(0));
+        vm.warp(block.timestamp + 7);
+        vm.expectEmit(true, true, true, true, address(registry));
+        emit Updated(
+            PUB,
+            keccak256("b"),
+            "b",
+            1,
+            bytes32(0),
+            registry.commitHead("b", E, bytes32(0), DIFF, ROOT, CAR),
+            1,
+            uint64(block.timestamp)
+        );
+        update(PUB, "b", E, bytes32(0));
+    }
+
     function test_log_counts_only_valid_updates() public {
         update(PUB, "a", E, bytes32(0));
         vm.prank(PUB);
@@ -344,7 +369,7 @@ contract DataRegistryTest is Test {
         implementation.initialize(PUB);
     }
 
-    /// The admin role moves, and the right to upgrade moves with it.
+    /// The admin role moves only once the new admin accepts, and the right to upgrade moves with it.
     function test_the_admin_role_can_be_handed_over() public {
         address v2 = address(new DataRegistryUpgradeMock());
 
@@ -354,13 +379,35 @@ contract DataRegistryTest is Test {
 
         vm.prank(ADMIN);
         registry.setAdmin(PUB);
+        assertEq(registry.admin(), ADMIN);
+        assertEq(registry.pendingAdmin(), PUB);
+
+        vm.prank(signer);
+        vm.expectRevert(DataRegistry.Unauthorized.selector);
+        registry.acceptAdmin();
+
+        vm.prank(PUB);
+        registry.acceptAdmin();
         assertEq(registry.admin(), PUB);
+        assertEq(registry.pendingAdmin(), address(0));
 
         vm.prank(ADMIN);
         vm.expectRevert(DataRegistry.Unauthorized.selector);
         registry.upgradeToAndCall(v2, "");
         vm.prank(PUB);
         registry.upgradeToAndCall(v2, "");
+    }
+
+    /// A mistyped handover is cancelled by proposing again; zero can never accept.
+    function test_a_handover_can_be_cancelled() public {
+        vm.startPrank(ADMIN);
+        registry.setAdmin(PUB);
+        registry.setAdmin(address(0));
+        vm.stopPrank();
+        vm.prank(PUB);
+        vm.expectRevert(DataRegistry.Unauthorized.selector);
+        registry.acceptAdmin();
+        assertEq(registry.admin(), ADMIN);
     }
 
     /// The SDK sends every write with `estimate * 1.3 + APPEND_ALLOWANCE` gas (src/contracts/write.ts).

@@ -20,10 +20,20 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
     error EpochOutOfWindow();
     error BadSignature();
 
+    event AdminProposed(address admin, address pending_admin);
     event AdminChanged(address previous_admin, address new_admin);
     /// a `publisher` updated a `repo` from `parent` to `head`, the repo's `pos`-th head.
+    /// It is entry `index` of the log, at `timestamp`: with these the event holds its whole
+    /// log leaf, so the log rebuilds from events alone, with no block reads.
     event Updated(
-        address indexed publisher, bytes32 indexed repo_id, string repo, uint64 pos, bytes32 parent, bytes32 head
+        address indexed publisher,
+        bytes32 indexed repo_id,
+        string repo,
+        uint64 pos,
+        bytes32 parent,
+        bytes32 head,
+        uint64 index,
+        uint64 timestamp
     );
 
     // the latest (pos, commitment) for a repo
@@ -59,6 +69,8 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
     mapping(uint256 => bytes32) public peaks;
     /// publisher => repo ids, in the order first written
     mapping(address => bytes32[]) public repoIds;
+    /// proposed by the admin, it becomes admin once it accepts; zero while none is proposed
+    address public pendingAdmin;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -71,7 +83,7 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
 
     // Update a repo state
     //
-    // For the caller's repo named `repo`, update the previous state, identified by parent, 
+    // For the caller's repo named `repo`, update the previous state, identified by parent,
     // by applying a diff, identified by its content identifier, and the root of the new Merkle clock
     //
     function update(string calldata repo, uint64 epoch, bytes32 parent, bytes32 diff, bytes32 root, bytes calldata car)
@@ -124,8 +136,17 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
         uint64 pos = h.pos + 1;
         h.pos = pos;
         h.head = head;
-        _append(keccak256(abi.encode(LEAF, publisher, repo_id, pos, head, uint64(block.timestamp))));
-        emit Updated(publisher, repo_id, repo, pos, parent, head);
+        _log(publisher, repo_id, repo, pos, parent, head);
+    }
+
+    /// Append the update's leaf to the log and announce it. Its own function for the stack.
+    function _log(address publisher, bytes32 repo_id, string calldata repo, uint64 pos, bytes32 parent, bytes32 head)
+        private
+    {
+        uint64 index = logLength;
+        uint64 timestamp = uint64(block.timestamp);
+        _append(keccak256(abi.encode(LEAF, publisher, repo_id, pos, head, timestamp)));
+        emit Updated(publisher, repo_id, repo, pos, parent, head, index, timestamp);
     }
 
     // ── Commits ───────────────────────────────────────────────────────────────
@@ -288,11 +309,18 @@ contract DataRegistry is Initializable, UUPSUpgradeable {
 
     //  admin functions
 
-    // as the current admin, set a new one
-    // TODO: this should be a 'propose' and 'accept' instead (new admin must accept the role, is cancellable, etc)
+    // as the admin, propose a new one. It takes over once it calls `acceptAdmin`, so a
+    // mistyped address never gets the role; proposing again (zero included) cancels.
     function setAdmin(address new_admin) external onlyAdmin {
-        emit AdminChanged(admin, new_admin);
-        admin = new_admin;
+        pendingAdmin = new_admin;
+        emit AdminProposed(admin, new_admin);
+    }
+
+    function acceptAdmin() external {
+        if (msg.sender != pendingAdmin) revert Unauthorized();
+        emit AdminChanged(admin, msg.sender);
+        admin = msg.sender;
+        pendingAdmin = address(0);
     }
 
     function _authorizeUpgrade(address) internal override onlyAdmin {}

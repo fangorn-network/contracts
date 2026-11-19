@@ -19,10 +19,11 @@ import {Options} from "openzeppelin-foundry-upgrades/Options.sol";
 ///      It records the build of the new version next to the old one. Commit it.
 library Deployments {
     uint256 internal constant BASE_SEPOLIA = 84532;
+    uint256 internal constant BASE = 8453;
 
     /// Every chain the contracts are deployed on, or may be.
-    function chains() internal pure returns (uint256[1] memory) {
-        return [BASE_SEPOLIA];
+    function chains() internal pure returns (uint256[2] memory) {
+        return [BASE_SEPOLIA, BASE];
     }
 
     /// Each contract's source: what a new proxy is deployed with, and what an existing

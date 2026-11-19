@@ -35,10 +35,13 @@ import {Deployments} from "./Deployments.sol";
 /// Parameters are environment variables (Forge also reads a `.env` in this directory):
 ///   ADMIN_ADDR              required. Takedowns and upgrades.
 ///   USDC_ADDR, SEMAPHORE_ADDR
-///                           default to Base Sepolia's; required on any other chain
+///                           default to the chain's own on Base and Base Sepolia;
+///                           required on any other chain
 contract Deploy is Builds {
+    /// Circle's native USDC.
     address internal constant BASE_SEPOLIA_USDC = 0x036CbD53842c5426634e7929541eC2318f3dCF7e;
-    /// Semaphore v4
+    address internal constant BASE_USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+    /// Semaphore v4: the same address, and the same code, on Base and Base Sepolia.
     address internal constant SEMAPHORE = 0x8A1fd199516489B0Fb7153EB5f075cDAC83c693D;
 
     function all() external {
@@ -125,17 +128,23 @@ contract Deploy is Builds {
     }
 
     function _usdc() internal view returns (address) {
-        return _external("USDC_ADDR", BASE_SEPOLIA_USDC);
+        return _external("USDC_ADDR", BASE_SEPOLIA_USDC, BASE_USDC);
     }
 
     function _semaphore() internal view returns (address) {
-        return _external("SEMAPHORE_ADDR", SEMAPHORE);
+        return _external("SEMAPHORE_ADDR", SEMAPHORE, SEMAPHORE);
     }
 
     /// An address this deployment depends on. The known ones are only defaults on the
-    /// chain they belong to; anywhere else it has to be given.
-    function _external(string memory name, address onBaseSepolia) private view returns (address) {
-        if (block.chainid == Deployments.BASE_SEPOLIA) return vm.envOr(name, onBaseSepolia);
-        return vm.envAddress(name);
+    /// chain they belong to; anywhere else it has to be given. Either way it must hold code.
+    function _external(string memory name, address onBaseSepolia, address onBase)
+        private
+        view
+        returns (address a)
+    {
+        if (block.chainid == Deployments.BASE_SEPOLIA) a = vm.envOr(name, onBaseSepolia);
+        else if (block.chainid == Deployments.BASE) a = vm.envOr(name, onBase);
+        else a = vm.envAddress(name);
+        require(a.code.length != 0, string.concat(name, " has no code on this chain"));
     }
 }
