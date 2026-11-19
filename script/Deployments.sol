@@ -63,6 +63,10 @@ library Deployments {
             if (n == keccak256("DataRegistry")) return 0x0F3eb0E62CF610dbaC6B3aD4Bf4cE38Ab50EBCC5;
             if (n == keccak256("SettlementRegistry")) return 0x61A5A195B54F57ada786Ba6689CdB04553cf7fBc;
         }
+        if (chainId == BASE) {
+            // Deployed with Deploy.s.sol dataRegistry(), in block 59598762.
+            if (n == keccak256("DataRegistry")) return 0x543D559Cf7583FE7003d4A19E26BF3A4DB75fbC8;
+        }
         return address(0);
     }
 
