@@ -83,7 +83,22 @@ forge script script/Deploy.s.sol --force --sig "all()" \
 Parameters are environment variables, with defaults in `solidity/.env.example` (Forge reads `solidity/.env`):
 
 - `ADMIN_ADDR`: required.
-- `USDC_ADDR`, `SEMAPHORE_ADDR`: default to Base Sepolia's; required on any other chain.
+- `USDC_ADDR`, `SEMAPHORE_ADDR`: default to the chain's own on Base and Base Sepolia; required on any other chain.
+
+#### Base mainnet
+
+```sh
+# 1. Rehearse: simulates everything, sends nothing.
+forge script script/Deploy.s.sol --force --sig "all()" \
+  --rpc-url base --account <keystore> --sender <deployer>
+
+# 2. Deploy and verify on Basescan (ETHERSCAN_API_KEY: an Etherscan v2 key).
+forge script script/Deploy.s.sol --force --sig "all()" \
+  --rpc-url base --account <keystore> --sender <deployer> --broadcast \
+  --verify --etherscan-api-key "$ETHERSCAN_API_KEY"
+```
+
+On mainnet, `ADMIN_ADDR` should be a multisig: it can take subjects down and upgrade both contracts.
 
 Afterwards:
 
