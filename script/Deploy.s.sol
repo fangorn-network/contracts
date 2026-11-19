@@ -71,7 +71,6 @@ contract Deploy is Builds {
         address proxy = _deploySettlementRegistry(admin);
         vm.stopBroadcast();
         _reportSettlement(proxy, admin);
-        console.log("Record it in script/Deployments.sol.");
         _recordBuild("SettlementRegistry", proxy);
     }
 
@@ -97,8 +96,7 @@ contract Deploy is Builds {
 
     function _report(DataRegistry data) internal view {
         require(data.admin() == _admin(), "DataRegistry admin");
-        console.log("DataRegistry: %s", address(data));
-        console.log("Record the new address(es) in script/Deployments.sol.");
+        _addresses("DataRegistry", address(data));
     }
 
     function _reportSettlement(address proxy, address admin) internal view {
@@ -106,7 +104,18 @@ contract Deploy is Builds {
         require(settlement.admin() == admin, "SettlementRegistry admin");
         require(settlement.usdc() == _usdc(), "SettlementRegistry usdc");
         require(settlement.semaphore() == _semaphore(), "SettlementRegistry semaphore");
-        console.log("SettlementRegistry: %s", proxy);
+        _addresses("SettlementRegistry", proxy);
+    }
+
+    /// Forge's receipt summary has printed these swapped (Base, block 59598762: the
+    /// proxy labelled DataRegistry), so this is the record to copy from.
+    function _addresses(string memory name, address proxy) internal view {
+        console.log("");
+        console.log("%s", name);
+        console.log("  proxy (use this):     %s", proxy);
+        console.log("  implementation:       %s", Upgrades.getImplementationAddress(proxy));
+        console.log("  Forge's receipt list below can swap these labels. Trust these.");
+        console.log("  Record the proxy in script/Deployments.sol.");
     }
 
     /// With --broadcast, writes the build of `proxy`'s implementation under `deployed/`
